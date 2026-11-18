@@ -1,0 +1,43 @@
+<resources>
+    <string name="app_name">Azril Clas</string>
+    <string name="app_tagline">Manage Your Class, Simplify Your Academic Life.</string>
+    <string name="stage_1_preview_badge">Tahap 1 • Fondasi UI</string>
+    <string name="stage_1_preview_notice">Mode Pratinjau Tahap 1 — Autentikasi dan database cloud dihubungkan pada Tahap 2.</string>
+
+    <!-- Auth -->
+    <string name="login_title">Masuk ke Azril Clas</string>
+    <string name="login_subtitle">Gunakan akun akademik resmi yang terdaftar pada institusi Anda.</string>
+    <string name="login_email_label">Email Akademik</string>
+    <string name="login_email_placeholder">nama@kampus.ac.id</string>
+    <string name="login_password_label">Kata Sandi</string>
+    <string name="login_password_placeholder">Masukkan kata sandi</string>
+    <string name="login_remember_session">Pertahankan sesi masuk</string>
+    <string name="login_forgot_password">Lupa kata sandi?</string>
+    <string name="login_submit">Masuk</string>
+    <string name="login_activate_student">Aktivasi akun mahasiswa baru</string>
+    <string name="login_no_public_admin_note">Pendaftaran publik dinonaktifkan demi keamanan. Akun mahasiswa dibuat oleh Admin.</string>
+    <string name="preview_section_title">Pratinjau Layout Tahap 1</string>
+    <string name="preview_admin_button">Masuk Pratinjau Admin</string>
+    <string name="preview_student_button">Masuk Pratinjau Mahasiswa</string>
+    <string name="logout_label">Keluar</string>
+
+    <!-- Common Actions & States -->
+    <string name="action_add">Tambah</string>
+    <string name="action_save">Simpan</string>
+    <string name="action_cancel">Batal</string>
+    <string name="action_delete">Hapus</string>
+    <string name="action_edit">Edit</string>
+    <string name="action_detail">Detail</string>
+    <string name="action_close">Tutup</string>
+    <string name="action_retry">Coba Lagi</string>
+    <string name="action_reset_filter">Reset Filter</string>
+    <string name="action_refresh">Muat Ulang</string>
+    <string name="cd_open_drawer">Buka menu navigasi</string>
+    <string name="cd_notifications">Notifikasi</string>
+    <string name="cd_app_logo">Logo Azril Clas</string>
+    <string name="cd_toggle_password">Tampilkan atau sembunyikan kata sandi</string>
+    <string name="cd_search">Cari data</string>
+    <string name="cd_clear_search">Hapus pencarian</string>
+    <string name="cd_banner_illustration">Ilustrasi kampus modern Azril Clas</string>
+    <string name="cd_empty_illustration">Ilustrasi data akademik kosong</string>
+</resources>

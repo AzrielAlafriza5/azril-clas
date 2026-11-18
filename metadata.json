@@ -1,0 +1,6 @@
+{
+  "name": "Azril Clas",
+  "description": "Manage Your Class, Simplify Your Academic Life — student management, assignment, attendance, and AI review academic platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
