@@ -12,6 +12,11 @@ import com.example.ui.state.AuthPortalMode
 import com.example.ui.state.AzrilViewModel
 import com.example.ui.state.RouteAccessResult
 import kotlinx.coroutines.test.runTest
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -216,5 +221,71 @@ class AdminAuthSecurityTest {
         vm.logout()
         assertNull(vm.uiState.value.currentUser)
         assertEquals(AuthPortalMode.STUDENT_LOGIN, vm.uiState.value.authPortalMode)
+    }
+
+    @Test
+    fun supabaseConfiguredAdminLoginFallbackOnlyWhenBackendNotProvisioned() = runTest {
+        val fakeSupabaseUrl = "https://exampleproject.supabase.co"
+        val fakeAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiJ9.signature123456"
+        val jsonMedia = "application/json; charset=utf-8".toMediaType()
+        val now = 1_795_000_000_000L
+
+        // Case 1: Supabase connected, but Edge Function `admin-auth-login` and RPC `resolve_admin_login_email` return 404
+        val unprovisionedClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(404)
+                    .message("Not Found")
+                    .body("""{"code":"NOT_FOUND","message":"Not found"}""".toResponseBody(jsonMedia))
+                    .build()
+            }
+            .build()
+
+        val storeUnprovisioned = InMemoryAuthStore()
+        val repoUnprovisioned = AzrilAuthRepository(
+            store = storeUnprovisioned,
+            supabaseUrl = fakeSupabaseUrl,
+            supabaseAnonKey = fakeAnonKey,
+            httpClient = unprovisionedClient
+        )
+        assertTrue(repoUnprovisioned.isSupabaseConfigured())
+
+        // Wrong password (e.g. typo with trailing 0: Azril23admin70) MUST still be rejected
+        val typoResult = repoUnprovisioned.loginAdmin("Azril12v", "Azril23admin70", rememberMe = true, nowMillis = now)
+        assertTrue(typoResult is AuthResult.Failure)
+
+        // Exact admin credentials succeed cleanly via salted PBKDF2 verifier while Supabase migration 006 is pending
+        val okResult = repoUnprovisioned.loginAdmin("Azril12v", "Azril23admin7", rememberMe = true, nowMillis = now)
+        assertTrue(okResult is AuthResult.Success)
+        assertEquals(UserRole.ADMIN, (okResult as AuthResult.Success).profile.role)
+
+        // Session restores cleanly before expiry even when Supabase RPC is not yet deployed
+        val restored = repoUnprovisioned.restoreSession(nowMillis = now + 60_000L)
+        assertNotNull(restored.profile)
+        assertEquals(UserRole.ADMIN, restored.profile?.role)
+
+        // Case 2: Edge Function `admin-auth-login` IS deployed and explicitly rejects with 401 -> MUST NOT fall back!
+        val provisionedRejectClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(401)
+                    .message("Unauthorized")
+                    .body("""{"error":"Username atau password administrator tidak valid."}""".toResponseBody(jsonMedia))
+                    .build()
+            }
+            .build()
+
+        val repoProvisioned = AzrilAuthRepository(
+            store = InMemoryAuthStore(),
+            supabaseUrl = fakeSupabaseUrl,
+            supabaseAnonKey = fakeAnonKey,
+            httpClient = provisionedRejectClient
+        )
+        val backendRejected = repoProvisioned.loginAdmin("Azril12v", "Azril23admin7", rememberMe = false, nowMillis = now)
+        assertTrue(backendRejected is AuthResult.Failure)
     }
 }

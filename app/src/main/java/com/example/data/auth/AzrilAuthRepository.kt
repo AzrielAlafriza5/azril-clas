@@ -314,6 +314,9 @@ class AzrilAuthRepository(
             !cleanKey.contains("YOUR_SUPABASE_ANON_KEY")
     }
 
+    private fun isLocalSessionToken(token: String?): Boolean =
+        token.isNullOrBlank() || token.startsWith("azr_sess_") || token.startsWith("azr_admin_sess_")
+
     private fun nowIso(): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(Date())
 
@@ -564,7 +567,7 @@ class AzrilAuthRepository(
 
         if (isSupabaseConfigured()) {
             val jwt = store.getString(KEY_SESSION_TOKEN)
-            if (!jwt.isNullOrBlank() && !jwt.startsWith("azr_sess_")) {
+            if (!isLocalSessionToken(jwt)) {
                 val base = supabaseUrl.trimEnd('/')
                 val pwUpdateErr = runCatching {
                     val payload = JSONObject().apply { put("password", cleanPw) }
@@ -769,12 +772,23 @@ class AzrilAuthRepository(
         if (password.isEmpty()) return@withContext AuthResult.Failure("Password administrator wajib diisi.")
 
         if (isSupabaseConfigured()) {
-            return@withContext loginAdminViaSupabase(
-                username = cleanUsername,
-                password = password,
-                rememberMe = rememberMe,
-                nowMillis = nowMillis
-            )
+            when (
+                val remoteOutcome = loginAdminViaSupabase(
+                    username = cleanUsername,
+                    password = password,
+                    rememberMe = rememberMe,
+                    nowMillis = nowMillis
+                )
+            ) {
+                is SupabaseAdminLoginOutcome.Authenticated -> return@withContext remoteOutcome.result
+                is SupabaseAdminLoginOutcome.Rejected -> return@withContext remoteOutcome.result
+                SupabaseAdminLoginOutcome.BackendNotProvisioned -> {
+                    // Supabase project is connected, but migration 006 / Edge Function `admin-auth-login`
+                    // has not been deployed or primary admin has not been bootstrapped yet.
+                    // Fall through to salted PBKDF2-HMAC-SHA256 verifier (still strictly rejects wrong
+                    // passwords and all student accounts).
+                }
+            }
         }
 
         // Offline/local fallback: reject student accounts attempting Admin portal login
@@ -1086,7 +1100,7 @@ class AzrilAuthRepository(
     private suspend fun syncAdminEdgeActionIfConnected(payload: JSONObject) {
         if (!isSupabaseConfigured()) return
         val jwt = store.getString(KEY_SESSION_TOKEN) ?: return
-        if (jwt.startsWith("azr_sess_")) return
+        if (isLocalSessionToken(jwt)) return
         runCatching {
             val base = supabaseUrl.trimEnd('/')
             val req = Request.Builder()
@@ -1135,7 +1149,7 @@ class AzrilAuthRepository(
     suspend fun syncLoginStreakToSupabaseIfConnected() = withContext(Dispatchers.IO) {
         if (!isSupabaseConfigured()) return@withContext
         val jwt = store.getString(KEY_SESSION_TOKEN) ?: return@withContext
-        if (jwt.startsWith("azr_sess_")) return@withContext
+        if (isLocalSessionToken(jwt)) return@withContext
         runCatching {
             val base = supabaseUrl.trimEnd('/')
             val req = Request.Builder()
@@ -1157,7 +1171,7 @@ class AzrilAuthRepository(
     ) = withContext(Dispatchers.IO) {
         if (!isSupabaseConfigured()) return@withContext
         val jwt = store.getString(KEY_SESSION_TOKEN) ?: return@withContext
-        if (jwt.startsWith("azr_sess_")) return@withContext
+        if (isLocalSessionToken(jwt)) return@withContext
         runCatching {
             val base = supabaseUrl.trimEnd('/')
             val payload = JSONObject().apply {
@@ -1180,7 +1194,7 @@ class AzrilAuthRepository(
     private suspend fun syncStudentBadgeToSupabaseIfConnected(studentId: String, badgeStatus: StudentBadgeStatus) {
         if (!isSupabaseConfigured()) return
         val jwt = store.getString(KEY_SESSION_TOKEN) ?: return
-        if (jwt.startsWith("azr_sess_")) return
+        if (isLocalSessionToken(jwt)) return
         runCatching {
             val base = supabaseUrl.trimEnd('/')
             val body = JSONObject().apply {
@@ -1221,12 +1235,24 @@ class AzrilAuthRepository(
         }
     }
 
+    private sealed interface SupabaseAdminLoginOutcome {
+        data class Authenticated(val result: AuthResult.Success) : SupabaseAdminLoginOutcome
+        data class Rejected(val result: AuthResult.Failure) : SupabaseAdminLoginOutcome
+        data object BackendNotProvisioned : SupabaseAdminLoginOutcome
+    }
+
+    private sealed interface AdminEmailLookupResult {
+        data class Found(val email: String) : AdminEmailLookupResult
+        data object NotProvisionedOrMissing : AdminEmailLookupResult
+        data class Error(val message: String) : AdminEmailLookupResult
+    }
+
     private suspend fun loginAdminViaSupabase(
         username: String,
         password: String,
         rememberMe: Boolean,
         nowMillis: Long
-    ): AuthResult {
+    ): SupabaseAdminLoginOutcome {
         return try {
             val base = supabaseUrl.trimEnd('/')
 
@@ -1252,7 +1278,9 @@ class AzrilAuthRepository(
                     val profJson = json.optJSONObject("profile")
                     val roleStr = profJson?.optString("role", "")
                     if (accessToken.isBlank() || profJson == null || !roleStr.equals("admin", ignoreCase = true)) {
-                        return AuthResult.Failure("Verifikasi role administrator dari backend gagal.")
+                        return SupabaseAdminLoginOutcome.Rejected(
+                            AuthResult.Failure("Verifikasi role administrator dari backend gagal.")
+                        )
                     }
                     val adminProfile = UserProfile(
                         id = profJson.optString("id"),
@@ -1271,18 +1299,27 @@ class AzrilAuthRepository(
                         nowMillis + ADMIN_SESSION_DURATION_MS
                     }
                     persistSessionState(adminProfile, accessToken, username, rememberMe, expiresAt)
-                    return AuthResult.Success(profile = adminProfile, usingSupabase = true, sessionExpiresAt = expiresAt)
+                    return SupabaseAdminLoginOutcome.Authenticated(
+                        AuthResult.Success(profile = adminProfile, usingSupabase = true, sessionExpiresAt = expiresAt)
+                    )
                 } else if (resp.code != 404) {
                     val errMsg = runCatching { JSONObject(rawBody).optString("error") }.getOrNull()
-                    return AuthResult.Failure(
-                        errMsg?.takeIf { it.isNotBlank() } ?: "Username atau password administrator tidak valid."
+                    return SupabaseAdminLoginOutcome.Rejected(
+                        AuthResult.Failure(
+                            errMsg?.takeIf { it.isNotBlank() } ?: "Username atau password administrator tidak valid."
+                        )
                     )
                 }
             }
 
             // 2. Fallback path when Edge Function is not yet deployed: secure DB RPC `resolve_admin_login_email`
-            val resolvedEmail = resolveAdminEmailFromSupabase(base, username)
-                ?: return AuthResult.Failure("Username atau password administrator tidak valid.")
+            val resolvedEmail = when (val lookup = resolveAdminEmailFromSupabase(base, username)) {
+                is AdminEmailLookupResult.Found -> lookup.email
+                AdminEmailLookupResult.NotProvisionedOrMissing ->
+                    return SupabaseAdminLoginOutcome.BackendNotProvisioned
+                is AdminEmailLookupResult.Error ->
+                    return SupabaseAdminLoginOutcome.Rejected(AuthResult.Failure(lookup.message))
+            }
 
             val authPayload = JSONObject().apply {
                 put("email", resolvedEmail)
@@ -1298,33 +1335,43 @@ class AzrilAuthRepository(
             httpClient.newCall(authReq).execute().use { response ->
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
-                    return AuthResult.Failure("Username atau password administrator tidak valid.")
+                    return SupabaseAdminLoginOutcome.Rejected(
+                        AuthResult.Failure("Username atau password administrator tidak valid.")
+                    )
                 }
                 val json = JSONObject(body)
                 val accessToken = json.optString("access_token")
                 val userId = json.optJSONObject("user")?.optString("id").orEmpty()
                 if (accessToken.isBlank() || userId.isBlank()) {
-                    return AuthResult.Failure("Token sesi administrator tidak valid.")
+                    return SupabaseAdminLoginOutcome.Rejected(
+                        AuthResult.Failure("Token sesi administrator tidak valid.")
+                    )
                 }
 
                 // Mandatory backend verification via verify_admin_session() + profiles.role == 'admin'
                 val backendVerified = verifyAdminSessionWithSupabase(accessToken)
                 val profile = fetchSupabaseProfile(base, accessToken, userId, resolvedEmail)
                 if (!backendVerified || profile == null || profile.role != UserRole.ADMIN || profile.status != AccountStatus.ACTIVE) {
-                    return AuthResult.Failure("Akses ditolak: akun ini tidak terverifikasi sebagai Administrator.")
+                    return SupabaseAdminLoginOutcome.Rejected(
+                        AuthResult.Failure("Akses ditolak: akun ini tidak terverifikasi sebagai Administrator.")
+                    )
                 }
 
                 val expiresInSec = json.optLong("expires_in", 3600L)
                 val expiresAt = minOf(nowMillis + expiresInSec * 1000L, nowMillis + ADMIN_SESSION_DURATION_MS)
                 persistSessionState(profile, accessToken, username, rememberMe, expiresAt)
-                AuthResult.Success(profile = profile, usingSupabase = true, sessionExpiresAt = expiresAt)
+                SupabaseAdminLoginOutcome.Authenticated(
+                    AuthResult.Success(profile = profile, usingSupabase = true, sessionExpiresAt = expiresAt)
+                )
             }
         } catch (e: Exception) {
-            AuthResult.Failure("Gagal terhubung ke Supabase Auth: ${e.localizedMessage ?: "kesalahan jaringan"}")
+            SupabaseAdminLoginOutcome.Rejected(
+                AuthResult.Failure("Gagal terhubung ke Supabase Auth: ${e.localizedMessage ?: "kesalahan jaringan"}")
+            )
         }
     }
 
-    private fun resolveAdminEmailFromSupabase(baseUrl: String, username: String): String? {
+    private fun resolveAdminEmailFromSupabase(baseUrl: String, username: String): AdminEmailLookupResult {
         val body = JSONObject().apply { put("p_username", username) }
         val req = Request.Builder()
             .url("$baseUrl/rest/v1/rpc/resolve_admin_login_email")
@@ -1333,8 +1380,19 @@ class AzrilAuthRepository(
             .addHeader("Content-Type", "application/json")
             .build()
         return httpClient.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            resp.body?.string()?.trim()?.removeSurrounding("\"")?.takeIf { it.contains("@") }
+            val raw = resp.body?.string()?.trim().orEmpty()
+            when {
+                resp.code == 404 -> AdminEmailLookupResult.NotProvisionedOrMissing
+                !resp.isSuccessful -> AdminEmailLookupResult.Error("Gagal memverifikasi akun administrator di Supabase.")
+                else -> {
+                    val email = raw.removeSurrounding("\"")
+                    if (email.contains("@")) {
+                        AdminEmailLookupResult.Found(email)
+                    } else {
+                        AdminEmailLookupResult.NotProvisionedOrMissing
+                    }
+                }
+            }
         }
     }
 
