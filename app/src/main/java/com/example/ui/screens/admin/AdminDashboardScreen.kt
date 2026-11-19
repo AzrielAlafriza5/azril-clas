@@ -29,6 +29,7 @@ import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Class
 import androidx.compose.material.icons.rounded.FactCheck
+import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.HourglassTop
 import androidx.compose.material.icons.rounded.PersonAdd
@@ -54,6 +55,7 @@ import androidx.compose.ui.unit.dp
 import com.example.ui.components.AzrilCard
 import com.example.ui.components.AzrilDarkCard
 import com.example.ui.components.AzrilEmptyState
+import com.example.ui.components.AzrilOfficialLogoMark
 import com.example.ui.components.AzrilPageHeader
 import com.example.ui.components.AzrilSkeletonList
 import com.example.ui.components.AzrilStatCard
@@ -134,6 +136,8 @@ fun AdminDashboardScreen(
                         color = OnDarkMuted
                     )
                 }
+                Spacer(modifier = Modifier.width(12.dp))
+                AzrilOfficialLogoMark(size = if (isExpanded) 56.dp else 44.dp)
             }
             Spacer(modifier = Modifier.height(16.dp))
             FlowRow(
@@ -145,6 +149,7 @@ fun AdminDashboardScreen(
                     Triple("Beri XP Keaktifan", Icons.Rounded.Bolt, AdminDestination.XP_KEAKTIFAN),
                     Triple("Buka Absensi", Icons.Rounded.FactCheck, AdminDestination.ATTENDANCE),
                     Triple("Buat Tugas", Icons.Rounded.Add, AdminDestination.ASSIGNMENTS),
+                    Triple("Pusat Ekspor Data", Icons.Rounded.FileDownload, AdminDestination.EXPORT_CENTER),
                     Triple("Buat Jadwal", Icons.Rounded.CalendarMonth, AdminDestination.SCHEDULES),
                     Triple("Tambah Kelas", Icons.Rounded.Class, AdminDestination.CLASSES)
                 )

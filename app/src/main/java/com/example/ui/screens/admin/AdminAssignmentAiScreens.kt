@@ -26,10 +26,12 @@ import androidx.compose.material.icons.automirrored.rounded.Assignment
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Checklist
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Grade
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -40,6 +42,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -48,6 +51,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,6 +59,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -72,6 +78,8 @@ import com.example.ui.model.StudyProgram
 import com.example.ui.model.SubmissionMethod
 import com.example.ui.model.SubmissionRecord
 import com.example.ui.model.SubmissionStatus
+import com.example.ui.model.TaskCompletionStatus
+import com.example.ui.model.resolveTaskCompletionStatus
 import com.example.ui.state.AzrilUiState
 import com.example.ui.state.AzrilViewModel
 import com.example.ui.theme.Amber50
@@ -111,6 +119,25 @@ fun AdminAssignmentsScreen(
 ) {
     var showCreateDialog by rememberSaveable { mutableStateOf(false) }
     var deletingAssignment by remember { mutableStateOf<Assignment?>(null) }
+    var selectedAssignmentId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        viewModel.syncAssignmentsAndChecklists(showToastOnComplete = false)
+    }
+
+    val selectedAssignment = uiState.assignments.find { it.id == selectedAssignmentId }
+    if (selectedAssignment != null) {
+        AdminAssignmentDetailScreen(
+            assignment = selectedAssignment,
+            uiState = uiState,
+            viewModel = viewModel,
+            isExpanded = isExpanded,
+            onBack = { selectedAssignmentId = null }
+        )
+        return
+    }
+
+    val effectiveNow = viewModel.currentEffectiveNowMillis()
 
     Column(
         modifier = Modifier
@@ -120,18 +147,31 @@ fun AdminAssignmentsScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         AzrilPageHeader(
-            title = "Manajemen Penugasan",
-            subtitle = "Buat penugasan untuk beberapa kelas sekaligus atau per program studi, sertakan 2 file tugas, panduan panjang, dan deadline.",
+            title = "Manajemen & Monitoring Tugas",
+            subtitle = "Kelola seluruh tugas, buka detail untuk memantau progres tiap mahasiswa, periksa jawaban, dan berikan checklist penyelesaian.",
             action = {
-                Button(
-                    onClick = { showCreateDialog = true },
-                    shape = RoundedCornerShape(999.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
-                    modifier = Modifier.testTag("add_assignment_button")
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Buat Tugas")
+                    OutlinedButton(
+                        onClick = { viewModel.syncAssignmentsAndChecklists(showToastOnComplete = true) },
+                        shape = RoundedCornerShape(999.dp),
+                        border = BorderStroke(1.dp, BorderMint),
+                        modifier = Modifier.testTag("admin_sync_assignments_button")
+                    ) {
+                        Icon(Icons.Rounded.Refresh, contentDescription = "Sinkronkan tugas", modifier = Modifier.size(16.dp))
+                    }
+                    Button(
+                        onClick = { showCreateDialog = true },
+                        shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
+                        modifier = Modifier.testTag("add_assignment_button")
+                    ) {
+                        Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Buat Tugas")
+                    }
                 }
             }
         )
@@ -146,10 +186,57 @@ fun AdminAssignmentsScreen(
                 onAction = { showCreateDialog = true }
             )
         } else {
+            // Overview Banner
+            val totalAssignments = uiState.assignments.size
+            val activeAssignmentsCount = uiState.assignments.count { it.isActive }
+            AzrilDarkCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        AzrilStatusBadge("PUSAT MONITORING TUGAS", LimePrimary, DarkCardBg)
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "$totalAssignments Total Tugas ($activeAssignmentsCount Aktif)",
+                            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                            color = PureWhite
+                        )
+                        Text(
+                            text = "Pilih salah satu tugas di bawah untuk melihat daftar mahasiswa target, memeriksa jawaban, dan memberi checklist selesai.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = OnDarkMuted
+                        )
+                    }
+                }
+            }
+
             uiState.assignments.forEach { assignment ->
-                val subCount = uiState.submissions.count { it.assignmentId == assignment.id }
-                val isOverdue = assignment.isDeadlinePassed()
-                AzrilCard {
+                val targetStudents = AzrilViewModel.getTargetStudentsForAssignment(assignment, uiState.students, uiState.classes)
+                val targetIds = targetStudents.map { it.id }.toSet()
+                val assignmentSubs = uiState.submissions.filter { it.assignmentId == assignment.id }
+                val subCount = if (targetIds.isEmpty()) assignmentSubs.size else assignmentSubs.count { it.studentId in targetIds }
+                val checklistsByStudent = uiState.assignmentChecklists
+                    .filter { it.assignmentId == assignment.id }
+                    .associateBy { it.studentId }
+                val subsByStudent = assignmentSubs.associateBy { it.studentId }
+                val completedCount = targetStudents.count { stu ->
+                    resolveTaskCompletionStatus(subsByStudent[stu.id], checklistsByStudent[stu.id]) == TaskCompletionStatus.COMPLETED
+                }
+                val awaitingCount = targetStudents.count { stu ->
+                    resolveTaskCompletionStatus(subsByStudent[stu.id], checklistsByStudent[stu.id]) == TaskCompletionStatus.AWAITING_VERIFICATION
+                }
+                val totalTargets = targetStudents.size
+                val completionRatio = if (totalTargets == 0) 0f else completedCount.toFloat() / totalTargets.toFloat()
+                val completionPercent = (completionRatio * 100f).toInt()
+                val isOverdue = assignment.isDeadlinePassed(effectiveNow)
+
+                AzrilCard(
+                    modifier = Modifier
+                        .clickable { selectedAssignmentId = assignment.id }
+                        .testTag("admin_assignment_card_${assignment.id}")
+                ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -168,7 +255,7 @@ fun AdminAssignmentsScreen(
                                     contentColor = LimeInk
                                 )
                                 if (isOverdue) {
-                                    AzrilStatusBadge("Deadline Terlewat", Rose50, Rose700)
+                                    AzrilStatusBadge("Deadline Berakhir", Rose50, Rose700)
                                 }
                             }
                             Text(assignment.title, style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold), color = InkText)
@@ -183,7 +270,7 @@ fun AdminAssignmentsScreen(
                                     text = assignment.description,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = InkMuted,
-                                    maxLines = 4
+                                    maxLines = 3
                                 )
                             }
                             val fileLabels = listOfNotNull(
@@ -205,10 +292,82 @@ fun AdminAssignmentsScreen(
                             }
                         }
                     }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    // Progress Bar & Monitoring Metrics
+                    Surface(
+                        color = SoftMintBg,
+                        shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(1.dp, BorderMint),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Progres Penyelesaian ($completedCount/$totalTargets selesai)",
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                    color = InkText
+                                )
+                                Text(
+                                    text = "$completionPercent%",
+                                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                    color = LimeInk
+                                )
+                            }
+                            LinearProgressIndicator(
+                                progress = { completionRatio },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(8.dp)
+                                    .clip(RoundedCornerShape(999.dp)),
+                                color = DarkCardBg,
+                                trackColor = LightGreenSecondary,
+                                strokeCap = StrokeCap.Round
+                            )
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                AzrilStatusBadge("Target: $totalTargets mhs", PureWhite, InkText)
+                                AzrilStatusBadge("Dikumpulkan: $subCount", RoyalBlue50, RoyalBlue700)
+                                if (awaitingCount > 0) {
+                                    AzrilStatusBadge("Menunggu Verifikasi: $awaitingCount", Amber50, Amber700)
+                                }
+                            }
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(10.dp))
                     HorizontalDivider(color = BorderLight)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("$subCount pengumpulan diterima • Format: ${assignment.allowedFormats.joinToString(", ")}", style = MaterialTheme.typography.labelMedium, color = Navy900)
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Format: ${assignment.allowedFormats.joinToString(", ")}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Slate500
+                        )
+                        Button(
+                            onClick = { selectedAssignmentId = assignment.id },
+                            shape = RoundedCornerShape(999.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
+                            modifier = Modifier.testTag("open_assignment_detail_${assignment.id}")
+                        ) {
+                            Icon(Icons.Rounded.Checklist, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Detail & Checklist")
+                        }
+                    }
                 }
             }
         }

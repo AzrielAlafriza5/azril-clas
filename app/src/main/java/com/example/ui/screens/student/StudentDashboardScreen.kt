@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import com.example.ui.components.AzrilCard
 import com.example.ui.components.AzrilEmptyState
 import com.example.ui.components.AzrilMintCard
+import com.example.ui.components.AzrilOfficialLogoMark
 import com.example.ui.components.AzrilSkeletonList
 import com.example.ui.components.AzrilStatCard
 import com.example.ui.components.AzrilStatusBadge
@@ -53,6 +54,8 @@ import com.example.ui.model.AttendanceSessionState
 import com.example.ui.model.AttendanceStatus
 import com.example.ui.model.ScreenLoadState
 import com.example.ui.model.StudentBadgeStatus
+import com.example.ui.model.TaskCompletionStatus
+import com.example.ui.model.resolveTaskCompletionStatus
 import com.example.ui.navigation.StudentDestination
 import com.example.ui.screens.ranking.StudentRankingDashboardWidget
 import com.example.ui.state.AzrilUiState
@@ -94,9 +97,20 @@ fun StudentDashboardScreen(
     val myStudentRecord = uiState.students.find { it.id == user.id }
     val myBadgeStatus = myStudentRecord?.badgeStatus ?: user.badgeStatus
     val activeAssignments = uiState.assignments.filter {
-        AzrilViewModel.isAssignmentForStudent(it, user, myStudentRecord)
+        AzrilViewModel.isAssignmentForStudent(it, user, myStudentRecord, uiState.classes)
     }
     val mySubmissions = uiState.submissions.filter { it.studentId == user.id }
+    val myChecklistMap = uiState.assignmentChecklists
+        .filter { it.studentId == user.id }
+        .associateBy { it.assignmentId }
+    val completedTasksCount = activeAssignments.count { a ->
+        val sub = mySubmissions.find { it.assignmentId == a.id }
+        resolveTaskCompletionStatus(sub, myChecklistMap[a.id]) == TaskCompletionStatus.COMPLETED
+    }
+    val awaitingVerificationCount = activeAssignments.count { a ->
+        val sub = mySubmissions.find { it.assignmentId == a.id }
+        resolveTaskCompletionStatus(sub, myChecklistMap[a.id]) == TaskCompletionStatus.AWAITING_VERIFICATION
+    }
     val pendingAssignments = activeAssignments.filter { a -> mySubmissions.none { it.assignmentId == a.id } }
     val openSessions = uiState.attendanceSessions.filter { it.state == AttendanceSessionState.OPEN }
     val myAttendance = uiState.attendanceRecords.filter { it.studentId == user.id }
@@ -121,11 +135,17 @@ fun StudentDashboardScreen(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text(
-                    text = "Halo, selamat belajar",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = InkSubtle
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    AzrilOfficialLogoMark(size = if (isExpanded) 32.dp else 26.dp)
+                    Text(
+                        text = "Halo, selamat belajar",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = InkSubtle
+                    )
+                }
                 Text(
                     text = user.fullName,
                     style = MaterialTheme.typography.headlineLarge,
@@ -229,7 +249,12 @@ fun StudentDashboardScreen(
         val cols = if (isExpanded) 4 else 2
         val statCards = listOf(
             StudentKpiSpec("Kehadiran", "$attendancePct%", "${myAttendance.size} pertemuan", Icons.Rounded.FactCheck, mint = true),
-            StudentKpiSpec("Tugas Aktif", "${activeAssignments.size}", "${mySubmissions.size} dikumpulkan", Icons.AutoMirrored.Rounded.Assignment),
+            StudentKpiSpec(
+                label = "Tugas Selesai",
+                value = "$completedTasksCount/${activeAssignments.size}",
+                helper = if (awaitingVerificationCount > 0) "$awaitingVerificationCount menunggu verifikasi" else "${mySubmissions.size} dikumpulkan",
+                icon = Icons.AutoMirrored.Rounded.Assignment
+            ),
             StudentKpiSpec("Belum Kumpul", "${pendingAssignments.size}", "Perlu diselesaikan", Icons.Rounded.WarningAmber, isAlert = pendingAssignments.isNotEmpty()),
             StudentKpiSpec("Sesi Aktif", "${openSessions.size}", "Absensi terbuka", Icons.Rounded.HourglassTop)
         )

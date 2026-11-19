@@ -41,6 +41,7 @@ import com.example.ui.screens.admin.AdminAssignmentsScreen
 import com.example.ui.screens.admin.AdminAttendanceScreen
 import com.example.ui.screens.admin.AdminClassesScreen
 import com.example.ui.screens.admin.AdminDashboardScreen
+import com.example.ui.screens.admin.AdminExportCenterScreen
 import com.example.ui.screens.admin.AdminGradingScreen
 import com.example.ui.screens.admin.AdminReportsScreen
 import com.example.ui.screens.admin.AdminSchedulesScreen
@@ -142,7 +143,7 @@ fun AzrilClasApp(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    com.example.ui.components.AzrilBrandLogo(showTagline = true, iconSize = 48.dp)
+                    com.example.ui.components.AzrilBrandLogo(showTagline = true, iconSize = 56.dp)
                     CircularProgressIndicator(
                         color = com.example.ui.theme.DarkCardBg,
                         trackColor = com.example.ui.theme.LightGreenSecondary
@@ -204,7 +205,8 @@ fun AzrilClasApp(
                         AdminDestination.GRADING -> AdminGradingScreen(uiState, viewModel, isExpanded)
                         AdminDestination.XP_KEAKTIFAN -> AdminXpParticipationScreen(uiState, viewModel, isExpanded)
                         AdminDestination.RANKING -> AdminRankingScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.REPORTS -> AdminReportsScreen(uiState, viewModel, isExpanded)
+                        AdminDestination.REPORTS -> AdminReportsScreen(uiState, viewModel, isExpanded) { viewModel.navigateAdmin(it) }
+                        AdminDestination.EXPORT_CENTER -> AdminExportCenterScreen(uiState, viewModel, isExpanded)
                         AdminDestination.NOTIFICATIONS -> RoleNotificationsScreen(uiState, UserRole.ADMIN, viewModel, isExpanded)
                         AdminDestination.SETTINGS -> AdminSettingsScreen(uiState, viewModel, isExpanded)
                     }

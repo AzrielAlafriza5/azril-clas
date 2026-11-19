@@ -1,29 +1,23 @@
 package com.example.ui.components
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.School
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
-import com.example.ui.theme.DarkCardBg
 import com.example.ui.theme.InkSubtle
 import com.example.ui.theme.InkText
 import com.example.ui.theme.LimeDeep
@@ -31,38 +25,36 @@ import com.example.ui.theme.LimePrimary
 import com.example.ui.theme.OnDarkMuted
 import com.example.ui.theme.PureWhite
 
+/**
+ * Single-source official Azril Clas logo mark.
+ * Preserves the logo's exact original colors, proportions, and silhouette via ContentScale.Fit.
+ */
+@Composable
+fun AzrilOfficialLogoMark(
+    modifier: Modifier = Modifier,
+    size: Dp = 42.dp
+) {
+    Image(
+        painter = painterResource(id = R.drawable.ic_azril_logo_mark),
+        contentDescription = stringResource(id = R.string.cd_app_logo),
+        contentScale = ContentScale.Fit,
+        modifier = modifier.size(size)
+    )
+}
+
 @Composable
 fun AzrilBrandLogo(
     modifier: Modifier = Modifier,
     darkSurface: Boolean = false,
     showTagline: Boolean = false,
-    iconSize: Dp = 42.dp
+    iconSize: Dp = 44.dp
 ) {
-    val badgeShape = RoundedCornerShape(14.dp)
     Row(
         modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Box(
-            modifier = Modifier
-                .size(iconSize)
-                .clip(badgeShape)
-                .background(if (darkSurface) LimePrimary else DarkCardBg)
-                .border(
-                    width = 1.dp,
-                    color = if (darkSurface) PureWhite.copy(alpha = 0.25f) else LimePrimary.copy(alpha = 0.45f),
-                    shape = badgeShape
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.School,
-                contentDescription = stringResource(id = R.string.cd_app_logo),
-                tint = if (darkSurface) DarkCardBg else LimePrimary,
-                modifier = Modifier.size(iconSize * 0.56f)
-            )
-        }
+        AzrilOfficialLogoMark(size = iconSize)
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,

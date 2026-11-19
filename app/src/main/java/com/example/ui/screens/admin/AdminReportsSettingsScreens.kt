@@ -46,6 +46,7 @@ import com.example.ui.components.AzrilPageHeader
 import com.example.ui.components.AzrilStatusBadge
 import com.example.ui.model.ToastType
 import com.example.ui.model.UserRole
+import com.example.ui.navigation.AdminDestination
 import com.example.ui.state.AzrilUiState
 import com.example.ui.state.AzrilViewModel
 import com.example.ui.theme.BorderLight
@@ -66,7 +67,8 @@ import com.example.ui.theme.SurfaceMuted
 fun AdminReportsScreen(
     uiState: AzrilUiState,
     viewModel: AzrilViewModel,
-    isExpanded: Boolean
+    isExpanded: Boolean,
+    onNavigate: (AdminDestination) -> Unit = {}
 ) {
     val reportTypes = listOf(
         "Rekap Mahasiswa",
@@ -93,21 +95,13 @@ fun AdminReportsScreen(
             subtitle = "Hasilkan rekap akademik berdasarkan program studi, kelas, semester, dan periode tanggal.",
             action = {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = { viewModel.showToast("Ekspor CSV '$selectedReport' disiapkan penuh pada Tahap 7.", ToastType.INFO) },
+                    Button(
+                        onClick = { onNavigate(AdminDestination.EXPORT_CENTER) },
                         shape = RoundedCornerShape(999.dp)
                     ) {
                         Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("CSV")
-                    }
-                    Button(
-                        onClick = { viewModel.showToast("Ekspor PDF '$selectedReport' disiapkan penuh pada Tahap 7.", ToastType.INFO) },
-                        shape = RoundedCornerShape(999.dp)
-                    ) {
-                        Icon(Icons.Rounded.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("PDF")
+                        Text("Pusat Ekspor Excel / CSV")
                     }
                 }
             }

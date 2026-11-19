@@ -32,8 +32,10 @@ import androidx.compose.material.icons.rounded.School
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.UploadFile
 import androidx.compose.material.icons.outlined.Bolt
+import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.ui.graphics.vector.ImageVector
 
@@ -67,6 +69,7 @@ enum class AdminDestination(
     XP_KEAKTIFAN("admin_xp_keaktifan", "XP Keaktifan", "XP Aktif", Icons.Rounded.Bolt, Icons.Outlined.Bolt, "Evaluasi"),
     RANKING("admin_ranking", "Ranking", "Ranking", Icons.Rounded.EmojiEvents, Icons.Outlined.EmojiEvents, "Evaluasi"),
     REPORTS("admin_reports", "Laporan", "Laporan", Icons.Rounded.Analytics, Icons.Outlined.Analytics, "Sistem"),
+    EXPORT_CENTER("admin_export_center", "Pusat Ekspor Data", "Ekspor", Icons.Rounded.FileDownload, Icons.Outlined.FileDownload, "Sistem"),
     NOTIFICATIONS("admin_notifications", "Notifikasi", "Notif", Icons.Rounded.Notifications, Icons.Outlined.Notifications, "Sistem"),
     SETTINGS("admin_settings", "Pengaturan", "Atur", Icons.Rounded.Settings, Icons.Outlined.Settings, "Sistem");
 

@@ -3,10 +3,18 @@ package com.example.ui.state
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.assignments.AssignmentSyncService
+import com.example.data.assignments.RemoteMutationResult
 import com.example.data.auth.AuthResult
 import com.example.data.auth.AzrilAuthRepository
 import com.example.data.auth.DataStoreAuthStorage
 import com.example.data.auth.OfficialStudyPrograms
+import com.example.data.export.AzrilDataExportService
+import com.example.data.export.ExportBuildResult
+import com.example.data.export.ExportDatasetSnapshot
+import com.example.data.export.ExportDatasetType
+import com.example.data.export.ExportFilterCriteria
+import com.example.data.export.ExportFormat
 import com.example.data.gamification.StreakReminderNotifier
 import com.example.data.gamification.XpAndStreakEngine
 import com.example.data.importer.ExcelStudentImportParser
@@ -15,6 +23,7 @@ import com.example.ui.model.AccountStatus
 import com.example.ui.model.AppNotification
 import com.example.ui.model.AppSettingsState
 import com.example.ui.model.Assignment
+import com.example.ui.model.AssignmentChecklistRecord
 import com.example.ui.model.AssignmentTargetType
 import com.example.ui.model.AttendanceRecord
 import com.example.ui.model.AttendanceSession
@@ -44,17 +53,20 @@ import com.example.ui.model.SubmissionMethod
 import com.example.ui.model.SubmissionRecord
 import com.example.ui.model.SubmissionStatus
 import com.example.ui.model.SubmissionTimeliness
+import com.example.ui.model.TaskCompletionStatus
 import com.example.ui.model.ToastMessage
 import com.example.ui.model.ToastType
 import com.example.ui.model.UserProfile
 import com.example.ui.model.UserRole
 import com.example.ui.model.XpCategory
 import com.example.ui.model.XpHistoryTimeRange
+import com.example.ui.model.resolveTaskCompletionStatus
 import com.example.ui.navigation.AdminDestination
 import com.example.ui.navigation.StudentDestination
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -100,6 +112,9 @@ data class AzrilUiState(
     val historicalAttendanceRecords: List<HistoricalAttendanceRecord> = emptyList(),
     val assignments: List<Assignment> = emptyList(),
     val submissions: List<SubmissionRecord> = emptyList(),
+    val assignmentChecklists: List<AssignmentChecklistRecord> = emptyList(),
+    val serverClockOffsetMillis: Long = 0L,
+    val isSyncingAssignments: Boolean = false,
     val rankingPoints: List<RankingPointTransaction> = emptyList(),
     val rankingAuditLogs: List<RankingPointAuditLog> = emptyList(),
     val studentStreaks: Map<String, StudentStreakState> = emptyMap(),
@@ -116,7 +131,10 @@ data class AzrilUiState(
 
 class AzrilViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val authRepository = AzrilAuthRepository(DataStoreAuthStorage(application))
+    private val authStorage = DataStoreAuthStorage(application)
+    private val authRepository = AzrilAuthRepository(authStorage)
+    private val assignmentSyncService = AssignmentSyncService(authStorage)
+    private val dataExportService = AzrilDataExportService(authStorage)
 
     private val _uiState = MutableStateFlow(
         AzrilUiState(isSupabaseConfigured = authRepository.isSupabaseConfigured())
@@ -130,6 +148,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     private fun restoreSavedSession() {
         viewModelScope.launch {
             val restored = authRepository.restoreSession()
+            val savedSubmissions = assignmentSyncService.loadLocalSubmissions()
+            val savedChecklists = assignmentSyncService.loadLocalChecklists()
             _uiState.update { state ->
                 val mergedStudents = mergeRegisteredStudents(state.students, restored.registeredStudents)
                 val restoredUser = restored.profile?.let { profile ->
@@ -164,6 +184,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                     students = mergedStudents,
                     classes = if (restored.savedClasses.isNotEmpty()) restored.savedClasses else state.classes,
                     assignments = if (restored.savedAssignments.isNotEmpty()) restored.savedAssignments else state.assignments,
+                    submissions = if (savedSubmissions.isNotEmpty()) savedSubmissions else state.submissions,
+                    assignmentChecklists = if (savedChecklists.isNotEmpty()) savedChecklists else state.assignmentChecklists,
                     rankingPoints = if (restored.savedXpTransactions.isNotEmpty()) restored.savedXpTransactions else state.rankingPoints,
                     attendanceRecords = if (restored.savedAttendanceRecords.isNotEmpty()) restored.savedAttendanceRecords else state.attendanceRecords,
                     historicalAttendanceRecords = if (restored.savedHistoricalAttendanceRecords.isNotEmpty()) restored.savedHistoricalAttendanceRecords else state.historicalAttendanceRecords,
@@ -175,8 +197,12 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             val current = _uiState.value.currentUser
             if (current?.role == UserRole.STUDENT && !current.mustChangePassword) {
                 recordStudentDailyLogin(current.id)
+                syncAssignmentsAndChecklists(showToastOnComplete = false)
             } else if (current == null || current.role == UserRole.ADMIN) {
                 evaluateStreakRemindersForInactiveStudents()
+                if (current?.role == UserRole.ADMIN) {
+                    syncAssignmentsAndChecklists(showToastOnComplete = false)
+                }
             }
         }
     }
@@ -271,6 +297,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                     val active = _uiState.value.currentUser
                     if (active?.role == UserRole.STUDENT && !active.mustChangePassword) {
                         recordStudentDailyLogin(active.id)
+                        syncAssignmentsAndChecklists(showToastOnComplete = false)
                     }
                 }
                 is AuthResult.Failure -> {
@@ -412,6 +439,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                     evaluateStreakRemindersForInactiveStudents()
+                    syncAssignmentsAndChecklists(showToastOnComplete = false)
                 }
                 is AuthResult.Failure -> {
                     _uiState.update {
@@ -562,6 +590,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         val exact = AdminDestination.entries.find { it.route.equals(normalized, ignoreCase = true) }
         if (exact != null) return exact
         val segment = normalized.removePrefix("admin/").removePrefix("admin_").replace("-", "_")
+        if (segment == "export" || segment == "ekspor" || segment == "export_data" || segment == "pusat_ekspor") {
+            return AdminDestination.EXPORT_CENTER
+        }
         return AdminDestination.entries.find {
             it.route.removePrefix("admin_").equals(segment, ignoreCase = true) ||
                 it.name.equals(segment, ignoreCase = true)
@@ -626,20 +657,135 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun triggerRefresh() {
+        syncAssignmentsAndChecklists(showToastOnComplete = true)
+    }
+
+    fun currentEffectiveNowMillis(localNowMillis: Long = System.currentTimeMillis()): Long =
+        localNowMillis + _uiState.value.serverClockOffsetMillis
+
+    /**
+     * Synchronizes existing assignments (including legacy Supabase records without duplicating),
+     * submissions, individual admin checklists, and server UTC clock from Supabase.
+     */
+    fun syncAssignmentsAndChecklists(showToastOnComplete: Boolean = false) {
         viewModelScope.launch {
-            _uiState.update { it.copy(loadState = ScreenLoadState.Loading) }
-            delay(420)
-            _uiState.update {
-                it.copy(
-                    loadState = ScreenLoadState.Ready,
-                    toastMessage = ToastMessage(
-                        message = "Tampilan diperbarui (Pratinjau lokal Tahap 1).",
-                        type = ToastType.INFO
-                    )
+            _uiState.update { it.copy(isSyncingAssignments = true) }
+            val current = _uiState.value
+            val snapshot = assignmentSyncService.fetchRemoteSnapshot(
+                knownClasses = current.classes,
+                knownStudyPrograms = current.studyPrograms,
+                knownStudents = current.students,
+                knownAssignments = current.assignments
+            )
+            _uiState.update { state ->
+                val mergedAssignments = mergeAssignmentsWithoutDuplicates(
+                    local = state.assignments,
+                    remote = snapshot.assignments
                 )
+                val mergedSubmissions = mergeSubmissionsWithoutDuplicates(
+                    local = state.submissions,
+                    remote = snapshot.submissions
+                )
+                val mergedChecklists = mergeChecklistsWithoutDuplicates(
+                    local = state.assignmentChecklists,
+                    remote = snapshot.checklists
+                )
+                val nextOffset = snapshot.serverTimeMillis?.let { serverMs ->
+                    serverMs - System.currentTimeMillis()
+                } ?: state.serverClockOffsetMillis
+
+                state.copy(
+                    assignments = mergedAssignments,
+                    submissions = mergedSubmissions,
+                    assignmentChecklists = mergedChecklists,
+                    serverClockOffsetMillis = nextOffset,
+                    isSyncingAssignments = false,
+                    loadState = ScreenLoadState.Ready,
+                    toastMessage = if (showToastOnComplete) {
+                        ToastMessage(
+                            message = if (snapshot.syncedFromSupabase) {
+                                "Data tugas, pengumpulan, & checklist tersinkronisasi dengan Supabase."
+                            } else {
+                                "Data tugas dan checklist diperbarui."
+                            },
+                            type = ToastType.INFO
+                        )
+                    } else state.toastMessage
+                )
+            }
+            if (snapshot.syncedFromSupabase) {
+                val updated = _uiState.value
+                authRepository.saveAssignments(updated.assignments)
+                assignmentSyncService.saveLocalSubmissions(updated.submissions)
+                assignmentSyncService.saveLocalChecklists(updated.assignmentChecklists)
             }
         }
     }
+
+    private fun mergeAssignmentsWithoutDuplicates(
+        local: List<Assignment>,
+        remote: List<Assignment>?
+    ): List<Assignment> {
+        if (remote == null) return local
+        val byId = linkedMapOf<String, Assignment>()
+        // Remote Supabase records are authoritative and preserved with full metadata
+        remote.forEach { byId[it.id] = it }
+        // Retain any local assignments not yet synced to Supabase without duplicating existing IDs
+        local.forEach { item ->
+            if (!byId.containsKey(item.id)) {
+                byId[item.id] = item
+            }
+        }
+        return byId.values.toList()
+    }
+
+    private fun mergeSubmissionsWithoutDuplicates(
+        local: List<SubmissionRecord>,
+        remote: List<SubmissionRecord>?
+    ): List<SubmissionRecord> {
+        if (remote == null) return local
+        val byPair = linkedMapOf<String, SubmissionRecord>()
+        remote.forEach { sub ->
+            byPair["${sub.assignmentId}::${sub.studentId}"] = sub
+        }
+        local.forEach { sub ->
+            val key = "${sub.assignmentId}::${sub.studentId}"
+            val existing = byPair[key]
+            if (existing == null || sub.lastUpdatedAtMillis > existing.lastUpdatedAtMillis) {
+                byPair[key] = sub
+            }
+        }
+        return byPair.values.sortedByDescending { it.lastUpdatedAtMillis }
+    }
+
+    private fun mergeChecklistsWithoutDuplicates(
+        local: List<AssignmentChecklistRecord>,
+        remote: List<AssignmentChecklistRecord>?
+    ): List<AssignmentChecklistRecord> {
+        if (remote == null) return local
+        val byKey = linkedMapOf<String, AssignmentChecklistRecord>()
+        remote.forEach { c -> byKey[c.compositeKey] = c }
+        local.forEach { c ->
+            val existing = byKey[c.compositeKey]
+            if (existing == null || c.updatedAtMillis > existing.updatedAtMillis) {
+                byKey[c.compositeKey] = c
+            }
+        }
+        return byKey.values.toList()
+    }
+
+    fun getVisibleSubmissionsForCurrentUser(): List<SubmissionRecord> {
+        val user = _uiState.value.currentUser ?: return emptyList()
+        return when (user.role) {
+            UserRole.ADMIN -> _uiState.value.submissions
+            UserRole.STUDENT -> _uiState.value.submissions.filter { it.studentId == user.id }
+        }
+    }
+
+    fun getChecklistFor(assignmentId: String, studentId: String): AssignmentChecklistRecord? =
+        _uiState.value.assignmentChecklists.find {
+            it.assignmentId == assignmentId && it.studentId == studentId
+        }
 
     // --- STUDY PROGRAMS ---
     fun addStudyProgram(code: String, name: String, faculty: String, description: String, isActive: Boolean): String? {
@@ -1880,13 +2026,23 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 toastMessage = ToastMessage("Penugasan '${assignment.title}' dipublikasikan ke ${assignment.targetSummaryLabel()}.", ToastType.SUCCESS)
             )
         }
-        viewModelScope.launch { authRepository.saveAssignments(nextAssignments) }
+        viewModelScope.launch {
+            authRepository.saveAssignments(nextAssignments)
+            assignmentSyncService.syncCreateAssignmentToSupabase(assignment)
+        }
         return null
     }
 
-    fun toggleAssignmentActive(id: String) {
+    fun toggleAssignmentActive(id: String): String? {
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) {
+            return "Akses ditolak: hanya Administrator yang dapat mengubah status tugas."
+        }
+        var updatedIsActive = true
         val nextAssignments = _uiState.value.assignments.map {
-            if (it.id == id) it.copy(isActive = !it.isActive) else it
+            if (it.id == id) {
+                updatedIsActive = !it.isActive
+                it.copy(isActive = updatedIsActive)
+            } else it
         }
         _uiState.update { state ->
             state.copy(
@@ -1894,102 +2050,310 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 toastMessage = ToastMessage("Status tugas diperbarui.", ToastType.INFO)
             )
         }
-        viewModelScope.launch { authRepository.saveAssignments(nextAssignments) }
+        viewModelScope.launch {
+            authRepository.saveAssignments(nextAssignments)
+            assignmentSyncService.syncToggleAssignmentActiveToSupabase(id, updatedIsActive)
+        }
+        return null
     }
 
-    fun deleteAssignment(id: String) {
+    fun updateAssignmentDeadline(
+        assignmentId: String,
+        deadlineDate: String,
+        deadlineTime: String
+    ): String? {
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) {
+            return "Akses ditolak: hanya Administrator yang dapat mengubah deadline tugas."
+        }
+        val deadlineMillis = parseDeadlineMillis(deadlineDate.trim(), deadlineTime.trim())
+            ?: return "Format deadline tidak valid (YYYY-MM-DD dan HH:mm WIB)."
+        val formatted = formatDeadlineDisplay(deadlineMillis, "${deadlineDate.trim()}, ${deadlineTime.trim()} WIB")
+        val target = _uiState.value.assignments.find { it.id == assignmentId }
+            ?: return "Tugas tidak ditemukan."
+        val updatedAssignment = target.copy(deadline = formatted, deadlineEpochMillis = deadlineMillis)
+        val nextAssignments = _uiState.value.assignments.map { if (it.id == assignmentId) updatedAssignment else it }
+        _uiState.update {
+            it.copy(
+                assignments = nextAssignments,
+                toastMessage = ToastMessage("Deadline tugas diperbarui menjadi $formatted.", ToastType.SUCCESS)
+            )
+        }
+        viewModelScope.launch {
+            authRepository.saveAssignments(nextAssignments)
+            assignmentSyncService.syncCreateAssignmentToSupabase(updatedAssignment)
+        }
+        return null
+    }
+
+    fun deleteAssignment(id: String): String? {
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) {
+            return "Akses ditolak: hanya Administrator yang dapat menghapus tugas."
+        }
         val hasSubmissions = _uiState.value.submissions.any { it.assignmentId == id }
         if (hasSubmissions) {
-            showToast("Tugas tidak dapat dihapus karena sudah memiliki pengumpulan mahasiswa.", ToastType.ERROR)
-            return
+            val msg = "Tugas tidak dapat dihapus karena sudah memiliki pengumpulan mahasiswa."
+            showToast(msg, ToastType.ERROR)
+            return msg
         }
         val nextAssignments = _uiState.value.assignments.filterNot { it.id == id }
         _uiState.update { state ->
             state.copy(
                 assignments = nextAssignments,
+                assignmentChecklists = state.assignmentChecklists.filterNot { it.assignmentId == id },
                 toastMessage = ToastMessage("Tugas dihapus.", ToastType.SUCCESS)
             )
         }
-        viewModelScope.launch { authRepository.saveAssignments(nextAssignments) }
+        viewModelScope.launch {
+            authRepository.saveAssignments(nextAssignments)
+            assignmentSyncService.saveLocalChecklists(_uiState.value.assignmentChecklists)
+            assignmentSyncService.syncDeleteAssignmentToSupabase(id)
+        }
+        return null
+    }
+
+    // --- ADMIN INDIVIDUAL COMPLETION CHECKLIST ---
+    /**
+     * Toggles individual task completion verification for a single (assignmentId, studentId).
+     * Strictly ADMIN-only: students or unauthenticated callers are ALWAYS rejected.
+     * Never affects any other student's checklist record.
+     */
+    fun toggleAdminAssignmentChecklist(
+        assignmentId: String,
+        studentId: String,
+        isCompleted: Boolean,
+        verificationNote: String? = null,
+        nowMillis: Long = System.currentTimeMillis()
+    ): String? {
+        val actor = _uiState.value.currentUser
+        if (actor?.role != UserRole.ADMIN) {
+            val msg = "Akses ditolak: hanya Administrator yang dapat mengubah checklist penyelesaian tugas."
+            showToast(msg, ToastType.ERROR)
+            return msg
+        }
+        val assignment = _uiState.value.assignments.find { it.id == assignmentId }
+            ?: return "Tugas tidak ditemukan."
+        val student = _uiState.value.students.find { it.id == studentId }
+        val nowLabel = XpAndStreakEngine.formatWibDateTimeLabel(nowMillis)
+        val previousChecklists = _uiState.value.assignmentChecklists
+
+        val entry = AssignmentChecklistRecord(
+            assignmentId = assignmentId,
+            studentId = studentId,
+            isCompleted = isCompleted,
+            verifiedById = if (isCompleted) actor.id else null,
+            verifiedByName = if (isCompleted) actor.fullName else null,
+            verifiedAt = if (isCompleted) nowLabel else null,
+            verificationNote = verificationNote?.trim()?.ifBlank { null },
+            updatedAtMillis = nowMillis
+        )
+
+        val nextChecklists = previousChecklists
+            .filterNot { it.assignmentId == assignmentId && it.studentId == studentId } + entry
+
+        val studentNotif = AppNotification(
+            targetRole = UserRole.STUDENT,
+            title = if (isCompleted) "Tugas Diverifikasi Selesai" else "Checklist Tugas Dibatalkan",
+            body = if (isCompleted) {
+                "Admin telah memverifikasi penyelesaian tugas '${assignment.title}'."
+            } else {
+                "Status verifikasi tugas '${assignment.title}' dikembalikan menjadi belum selesai."
+            },
+            category = "Verifikasi Tugas",
+            timestamp = nowLabel
+        )
+
+        _uiState.update { state ->
+            state.copy(
+                assignmentChecklists = nextChecklists,
+                notifications = listOf(studentNotif) + state.notifications,
+                toastMessage = ToastMessage(
+                    message = if (isCompleted) {
+                        "Checklist Selesai disimpan untuk ${student?.fullName ?: "mahasiswa"}."
+                    } else {
+                        "Checklist Selesai dibatalkan untuk ${student?.fullName ?: "mahasiswa"}."
+                    },
+                    type = ToastType.SUCCESS
+                )
+            )
+        }
+
+        viewModelScope.launch {
+            assignmentSyncService.saveLocalChecklists(nextChecklists)
+            val remote = assignmentSyncService.syncAdminChecklistToSupabase(
+                assignmentId = assignmentId,
+                studentId = studentId,
+                isCompleted = isCompleted,
+                note = verificationNote
+            )
+            if (remote is RemoteMutationResult.Rejected) {
+                _uiState.update { state ->
+                    state.copy(
+                        assignmentChecklists = previousChecklists,
+                        toastMessage = ToastMessage(remote.message, ToastType.ERROR)
+                    )
+                }
+                assignmentSyncService.saveLocalChecklists(previousChecklists)
+            }
+        }
+        return null
     }
 
     // --- SUBMISSIONS & GRADING ---
+    /**
+     * Submits or updates a student's own assignment answer BEFORE deadline (Asia/Jakarta WIB).
+     * - Strictly validates role = STUDENT, student targeting, and server-aligned deadline.
+     * - Updates single unique submission per (assignmentId, studentId) without duplicates.
+     * - Preserves firstSubmittedAt and updates lastUpdatedAt & revisionCount on edit.
+     * - NEVER auto-sets Admin verification checklist to Selesai.
+     * - Rejects any create/edit/re-upload after deadline passes (both locally and on Supabase backend).
+     */
     fun submitAssignment(
         assignmentId: String,
         driveLink: String?,
         uploadedFileName: String?,
         uploadedFileSizeLabel: String?,
-        isLate: Boolean? = null
+        isLate: Boolean? = null,
+        answerText: String? = null,
+        uploadedFileUrl: String? = null,
+        uploadedFileBytes: ByteArray? = null,
+        uploadedFileMimeType: String? = null,
+        nowMillis: Long = System.currentTimeMillis()
     ): String? {
         val user = _uiState.value.currentUser ?: return "Sesi pengguna tidak ditemukan."
+        if (user.role != UserRole.STUDENT) {
+            return "Hanya akun Mahasiswa yang dapat mengumpulkan jawaban tugas."
+        }
         val assignment = _uiState.value.assignments.find { it.id == assignmentId }
             ?: return "Tugas tidak ditemukan."
-        val cleanDrive = driveLink?.trim()?.ifBlank { null }
+        val myStudentRecord = _uiState.value.students.find { it.id == user.id }
+        if (!isAssignmentForStudent(assignment, user, myStudentRecord, _uiState.value.classes)) {
+            return "Akses ditolak: tugas ini tidak ditujukan untuk kelas atau program studi Anda."
+        }
+
+        val effectiveNow = currentEffectiveNowMillis(nowMillis)
+        val deadlinePassed = assignment.deadlineEpochMillis != null && effectiveNow > assignment.deadlineEpochMillis
+        if (deadlinePassed) {
+            return "Deadline tugas telah berakhir (${assignment.deadline}). Pengumpulan dan pengeditan jawaban tidak lagi diizinkan."
+        }
+
+        val cleanAnswer = answerText?.trim()?.ifBlank { null }
+        val cleanUrl = driveLink?.trim()?.ifBlank { null }
         val cleanFile = uploadedFileName?.trim()?.ifBlank { null }
-        if (cleanDrive == null && cleanFile == null) {
-            return "Lampirkan link Google Drive atau pilih file untuk dikumpulkan."
+        val cleanFileUrl = uploadedFileUrl?.trim()?.ifBlank { null }
+
+        if (cleanAnswer == null && cleanUrl == null && cleanFile == null) {
+            return "Isi jawaban teks, lampirkan tautan URL, atau pilih file tugas terlebih dahulu."
         }
-        if (cleanDrive != null && !cleanDrive.startsWith("https://drive.google.com/") && !cleanDrive.startsWith("https://docs.google.com/")) {
-            return "Link harus menggunakan URL Google Drive / Google Docs resmi (https://drive.google.com/...)."
+        if (cleanUrl != null && !cleanUrl.startsWith("https://") && !cleanUrl.startsWith("http://")) {
+            return "Tautan pengumpulan harus berupa URL valid (diawali https:// atau http://)."
         }
-        val nowMillis = System.currentTimeMillis()
+
         val timeliness = when (isLate) {
             true -> SubmissionTimeliness.LATE
             false -> SubmissionTimeliness.ON_TIME
-            null -> XpAndStreakEngine.determineSubmissionTimeliness(assignment, nowMillis)
+            null -> XpAndStreakEngine.determineSubmissionTimeliness(assignment, effectiveNow)
         }
         val effectiveIsLate = timeliness == SubmissionTimeliness.LATE
-        val now = XpAndStreakEngine.formatWibDateTimeLabel(nowMillis)
+        val nowLabel = XpAndStreakEngine.formatWibDateTimeLabel(effectiveNow)
         val semesterKey = _uiState.value.settings.activeSemesterKey
-        val existing = _uiState.value.submissions.find { it.assignmentId == assignmentId && it.studentId == user.id }
-        val submissionStatus = if (effectiveIsLate) SubmissionStatus.LATE else SubmissionStatus.AWAITING_ADMIN
+        val previousSubmissions = _uiState.value.submissions
+        val existing = previousSubmissions.find { it.assignmentId == assignmentId && it.studentId == user.id }
         val earnedXp = timeliness.xpAmount
+
         val record = SubmissionRecord(
             id = existing?.id ?: UUID.randomUUID().toString(),
             assignmentId = assignment.id,
             assignmentTitle = assignment.title,
-            className = assignment.targetSummaryLabel(),
+            className = myStudentRecord?.className ?: assignment.targetSummaryLabel(),
             studentId = user.id,
-            studentName = user.fullName,
-            studentNim = user.nim ?: "-",
-            driveLink = cleanDrive,
+            studentName = myStudentRecord?.fullName ?: user.fullName,
+            studentNim = myStudentRecord?.nim ?: user.nim ?: "-",
+            answerText = cleanAnswer,
+            driveLink = cleanUrl,
             uploadedFileName = cleanFile,
-            uploadedFileSizeLabel = uploadedFileSizeLabel,
-            submittedAt = now,
-            status = submissionStatus,
+            uploadedFileUrl = cleanFileUrl,
+            uploadedFileSizeLabel = uploadedFileSizeLabel?.takeIf { cleanFile != null },
+            submittedAt = nowLabel,
+            firstSubmittedAt = existing?.firstSubmittedAt ?: nowLabel,
+            lastUpdatedAt = nowLabel,
+            firstSubmittedAtMillis = existing?.firstSubmittedAtMillis?.takeIf { it > 0L } ?: effectiveNow,
+            lastUpdatedAtMillis = effectiveNow,
+            status = SubmissionStatus.AWAITING_ADMIN,
             isLate = effectiveIsLate,
-            revisionCount = if (existing != null) existing.revisionCount + 1 else 0
+            revisionCount = if (existing != null) existing.revisionCount + 1 else 0,
+            aiReview = existing?.aiReview,
+            finalScore = existing?.finalScore,
+            adminFeedback = existing?.adminFeedback,
+            gradeHistory = existing?.gradeHistory ?: emptyList()
         )
+
         val adminNotif = AppNotification(
             targetRole = UserRole.ADMIN,
-            title = if (effectiveIsLate) "Pengumpulan Terlambat: ${assignment.title}" else "Pengumpulan Baru: ${assignment.title}",
-            body = "${user.fullName} mengumpulkan tugas (${cleanFile ?: "Google Drive"}).",
+            title = if (existing != null) "Pembaruan Jawaban: ${assignment.title}" else "Pengumpulan Baru: ${assignment.title}",
+            body = "${record.studentName} (${record.studentNim}) ${if (existing != null) "memperbarui jawaban" else "mengumpulkan tugas"}.",
             category = "Pengumpulan",
-            timestamp = now
+            timestamp = nowLabel
         )
+
+        val nextSubmissions = listOf(record) + previousSubmissions.filterNot {
+            it.assignmentId == assignment.id && it.studentId == user.id
+        }
+
         _uiState.update { state ->
-            val filtered = state.submissions.filterNot { it.id == record.id }
             val updatedXp = XpAndStreakEngine.upsertAssignmentSubmissionXp(
                 existingTransactions = state.rankingPoints,
                 studentId = user.id,
                 assignment = assignment,
                 timeliness = timeliness,
                 semesterKey = semesterKey,
-                submittedAtMillis = nowMillis
+                submittedAtMillis = effectiveNow
             )
             state.copy(
-                submissions = listOf(record) + filtered,
+                submissions = nextSubmissions,
                 rankingPoints = updatedXp,
                 notifications = listOf(adminNotif) + state.notifications,
                 toastMessage = ToastMessage(
-                    if (existing != null) "Revisi tugas '${assignment.title}' disimpan (XP diperbarui tanpa duplikasi: +$earnedXp XP)."
-                    else "Tugas '${assignment.title}' berhasil dikirim (${timeliness.label}: +$earnedXp XP).",
+                    if (existing != null) {
+                        "Jawaban tugas '${assignment.title}' diperbarui (Menunggu Verifikasi Admin)."
+                    } else {
+                        "Jawaban tugas '${assignment.title}' berhasil dikirim (Menunggu Verifikasi Admin • +$earnedXp XP)."
+                    },
                     ToastType.SUCCESS
                 )
             )
         }
+
         viewModelScope.launch {
+            assignmentSyncService.saveLocalSubmissions(nextSubmissions)
             authRepository.saveXpTransactions(_uiState.value.rankingPoints)
+            val remote = assignmentSyncService.syncStudentSubmissionToSupabase(
+                submission = record,
+                fileBytes = uploadedFileBytes,
+                mimeType = uploadedFileMimeType
+            )
+            when (remote) {
+                is RemoteMutationResult.Rejected -> {
+                    // Backend server-time deadline or RLS rejected the mutation -> revert local state
+                    _uiState.update { state ->
+                        state.copy(
+                            submissions = previousSubmissions,
+                            toastMessage = ToastMessage(remote.message, ToastType.ERROR)
+                        )
+                    }
+                    assignmentSyncService.saveLocalSubmissions(previousSubmissions)
+                }
+                is RemoteMutationResult.Success -> {
+                    if (!remote.uploadedFileUrl.isNullOrBlank() && remote.uploadedFileUrl != record.uploadedFileUrl) {
+                        val withUrl = _uiState.value.submissions.map { s ->
+                            if (s.assignmentId == assignment.id && s.studentId == user.id) {
+                                s.copy(uploadedFileUrl = remote.uploadedFileUrl)
+                            } else s
+                        }
+                        _uiState.update { it.copy(submissions = withUrl) }
+                        assignmentSyncService.saveLocalSubmissions(withUrl)
+                    }
+                }
+            }
         }
         return null
     }
@@ -2002,6 +2366,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveGrade(submissionId: String, score: Int, feedback: String, requestRevision: Boolean): String? {
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) {
+            return "Akses ditolak: hanya Administrator yang dapat memberikan nilai atau revisi."
+        }
         if (score !in 0..100) return "Nilai harus berada pada rentang 0 - 100."
         if (feedback.trim().length < 3) return "Feedback wajib diisi minimal 3 karakter."
         val target = _uiState.value.submissions.find { it.id == submissionId } ?: return "Pengumpulan tidak ditemukan."
@@ -2019,18 +2386,19 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             category = "Penilaian",
             timestamp = currentTimeLabel()
         )
+        val nextSubmissions = _uiState.value.submissions.map { sub ->
+            if (sub.id == submissionId) {
+                sub.copy(
+                    finalScore = score,
+                    adminFeedback = feedback.trim(),
+                    status = nextStatus,
+                    gradeHistory = listOf(historyEntry) + sub.gradeHistory
+                )
+            } else sub
+        }
         _uiState.update { state ->
             state.copy(
-                submissions = state.submissions.map { sub ->
-                    if (sub.id == submissionId) {
-                        sub.copy(
-                            finalScore = score,
-                            adminFeedback = feedback.trim(),
-                            status = nextStatus,
-                            gradeHistory = listOf(historyEntry) + sub.gradeHistory
-                        )
-                    } else sub
-                },
+                submissions = nextSubmissions,
                 notifications = listOf(studentNotif) + state.notifications,
                 toastMessage = ToastMessage(
                     if (requestRevision) "Permintaan revisi dikirim ke mahasiswa."
@@ -2038,6 +2406,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                     ToastType.SUCCESS
                 )
             )
+        }
+        viewModelScope.launch {
+            assignmentSyncService.saveLocalSubmissions(nextSubmissions)
         }
         return null
     }
@@ -2070,6 +2441,87 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 toastMessage = ToastMessage("Pengaturan aplikasi diperbarui.", ToastType.SUCCESS)
             )
         }
+    }
+
+    // --- ADMIN DATA EXPORT CENTER (EXCEL .XLSX & CSV .CSV) ---
+
+    fun buildCurrentExportSnapshot(): ExportDatasetSnapshot {
+        val s = _uiState.value
+        return ExportDatasetSnapshot(
+            studyPrograms = s.studyPrograms,
+            classes = s.classes,
+            students = s.students,
+            attendanceRecords = s.attendanceRecords,
+            historicalAttendanceRecords = s.historicalAttendanceRecords,
+            assignments = s.assignments,
+            submissions = s.submissions,
+            checklists = s.assignmentChecklists,
+            xpTransactions = s.rankingPoints,
+            syncedFromSupabase = false
+        )
+    }
+
+    fun estimateExportRowCount(
+        type: ExportDatasetType,
+        filter: ExportFilterCriteria
+    ): Int {
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) return 0
+        return dataExportService.estimateRowCount(buildCurrentExportSnapshot(), type, filter)
+    }
+
+    /**
+     * Strictly Admin-only export builder.
+     * Fetches the freshest live snapshot directly from Supabase (paginated for large datasets),
+     * applies all selected filters, and builds a valid Excel (.xlsx) or CSV (.csv) payload.
+     */
+    suspend fun prepareAdminExport(
+        type: ExportDatasetType,
+        format: ExportFormat,
+        filter: ExportFilterCriteria
+    ): ExportBuildResult {
+        val user = _uiState.value.currentUser
+        if (user == null || user.role != UserRole.ADMIN || user.status != AccountStatus.ACTIVE) {
+            val msg = "Akses ditolak: hanya Administrator yang memiliki izin mengunduh data seluruh mahasiswa."
+            showToast(msg, ToastType.ERROR)
+            return ExportBuildResult.Error(msg)
+        }
+        if (isSessionExpired()) {
+            enforceSessionValidity()
+            return ExportBuildResult.Error("Sesi Administrator telah berakhir. Silakan login kembali.")
+        }
+
+        val fallback = buildCurrentExportSnapshot()
+        val liveSnapshot = dataExportService.fetchLiveSnapshotFromSupabase(fallback)
+
+        // Reflect any newly synced remote records into live UI state without losing local data
+        if (liveSnapshot.syncedFromSupabase) {
+            _uiState.update { state ->
+                state.copy(
+                    studyPrograms = liveSnapshot.studyPrograms,
+                    classes = liveSnapshot.classes,
+                    students = liveSnapshot.students,
+                    attendanceRecords = liveSnapshot.attendanceRecords,
+                    historicalAttendanceRecords = liveSnapshot.historicalAttendanceRecords,
+                    assignments = liveSnapshot.assignments,
+                    submissions = liveSnapshot.submissions,
+                    assignmentChecklists = liveSnapshot.checklists,
+                    rankingPoints = liveSnapshot.xpTransactions
+                )
+            }
+        }
+
+        val result = dataExportService.buildExport(
+            snapshot = liveSnapshot,
+            type = type,
+            format = format,
+            filter = filter
+        )
+        when (result) {
+            is ExportBuildResult.Empty -> showToast(result.message, ToastType.WARNING)
+            is ExportBuildResult.Error -> showToast(result.message, ToastType.ERROR)
+            is ExportBuildResult.Success -> Unit
+        }
+        return result
     }
 
     // --- GAMIFICATION: LOGIN STREAK (WIB), PARTICIPATION XP, IZIN QUOTA & STREAK REMINDERS ---
@@ -2311,12 +2763,17 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     companion object {
+        private val WIB_TZ: TimeZone = TimeZone.getTimeZone("Asia/Jakarta")
+
         fun parseDeadlineMillis(dateStr: String, timeStr: String): Long? {
             val combined = "${dateStr.trim()} ${timeStr.trim()}"
             val patterns = listOf("yyyy-MM-dd HH:mm", "dd-MM-yyyy HH:mm", "dd/MM/yyyy HH:mm")
             for (pattern in patterns) {
                 val parsed = runCatching {
-                    SimpleDateFormat(pattern, Locale.US).apply { isLenient = false }.parse(combined)?.time
+                    SimpleDateFormat(pattern, Locale.US).apply {
+                        isLenient = false
+                        timeZone = WIB_TZ
+                    }.parse(combined)?.time
                 }.getOrNull()
                 if (parsed != null) return parsed
             }
@@ -2325,7 +2782,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
 
         fun formatDeadlineDisplay(epochMillis: Long, fallback: String): String =
             runCatching {
-                SimpleDateFormat("dd MMM yyyy, HH:mm 'WIB'", Locale.forLanguageTag("id-ID")).format(Date(epochMillis))
+                SimpleDateFormat("dd MMM yyyy, HH:mm 'WIB'", Locale.forLanguageTag("id-ID")).apply {
+                    timeZone = WIB_TZ
+                }.format(Date(epochMillis))
             }.getOrDefault(fallback)
 
         fun resolveStudyProgramCode(
@@ -2346,16 +2805,22 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
 
         /**
          * Determines whether an assignment should be visible to a specific student.
-         * - CLASS target: student's classId MUST be in assignment.targetClassIds (or legacy classId).
-         * - STUDY_PROGRAM target: student's studyProgramId OR studyProgramCode MUST match assignment's targeted prodi(s).
+         * - CLASS target: matches student's classId OR normalized className OR class memberIds.
+         * - STUDY_PROGRAM target: matches student's studyProgramId OR studyProgramCode.
          */
         fun isAssignmentForStudent(
             assignment: Assignment,
             user: UserProfile?,
-            studentRecord: StudentRecord?
+            studentRecord: StudentRecord?,
+            classes: List<AcademicClass> = emptyList(),
+            includeInactiveForAdmin: Boolean = false
         ): Boolean {
-            if (!assignment.isActive) return false
+            if (!includeInactiveForAdmin && !assignment.isActive) return false
+            val studentId = studentRecord?.id ?: user?.id
             val studentClassId = studentRecord?.classId ?: user?.classId
+            val studentClassName = (studentRecord?.className ?: user?.className)
+                ?.trim()
+                ?.takeIf { it.isNotBlank() && !it.equals("Belum terdaftar di kelas", ignoreCase = true) }
             val studentProdiId = studentRecord?.studyProgramId ?: user?.studyProgramId
             val studentProdiCode = resolveStudyProgramCode(
                 studentProdiId,
@@ -2363,18 +2828,48 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             )
             return when (assignment.targetType) {
                 AssignmentTargetType.CLASS -> {
-                    val targets = assignment.targetClassIds.ifEmpty {
+                    val targetIds = assignment.targetClassIds.ifEmpty {
                         listOfNotNull(assignment.classId.ifBlank { null })
                     }
-                    studentClassId != null && targets.any { it == studentClassId }
+                    val targetNames = assignment.targetClassNames.ifEmpty {
+                        assignment.className.split(",").map { it.trim() }.filter { it.isNotBlank() }
+                    }
+                    val matchById = studentClassId != null && targetIds.any { it.equals(studentClassId, ignoreCase = true) }
+                    val matchByName = studentClassName != null && targetNames.any { it.equals(studentClassName, ignoreCase = true) }
+                    val matchByMember = studentId != null && classes.any { cls ->
+                        (targetIds.any { it.equals(cls.id, ignoreCase = true) } ||
+                            targetNames.any { it.equals(cls.name.trim(), ignoreCase = true) }) &&
+                            studentId in cls.memberIds
+                    }
+                    matchById || matchByName || matchByMember
                 }
                 AssignmentTargetType.STUDY_PROGRAM -> {
-                    val matchById = studentProdiId != null && assignment.targetStudyProgramIds.any { it == studentProdiId }
+                    val matchById = studentProdiId != null && assignment.targetStudyProgramIds.any { it.equals(studentProdiId, ignoreCase = true) }
                     val matchByCode = assignment.targetStudyProgramCodes.any { it.equals(studentProdiCode, ignoreCase = true) }
                     matchById || matchByCode
                 }
             }
         }
+
+        /**
+         * Returns all unique students targeted by [assignment], deterministically sorted by name & NIM.
+         */
+        fun getTargetStudentsForAssignment(
+            assignment: Assignment,
+            students: List<StudentRecord>,
+            classes: List<AcademicClass> = emptyList()
+        ): List<StudentRecord> = students
+            .filter { stu ->
+                isAssignmentForStudent(
+                    assignment = assignment,
+                    user = null,
+                    studentRecord = stu,
+                    classes = classes,
+                    includeInactiveForAdmin = true
+                )
+            }
+            .distinctBy { it.id }
+            .sortedWith(compareBy<StudentRecord>({ it.fullName.lowercase(Locale.US) }, { it.nim }))
 
         private fun buildStudentPool(state: AzrilUiState): Collection<StudentRecord> {
             val registeredMap = state.students.associateBy { it.id }.toMutableMap()

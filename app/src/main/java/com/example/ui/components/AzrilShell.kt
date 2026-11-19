@@ -121,6 +121,7 @@ fun <T : NavDestination> AzrilAdaptiveShell(
                             role = user.role,
                             unreadNotifications = unreadNotifications,
                             showMenuButton = false,
+                            showBrandLogo = false,
                             onMenuClick = {},
                             onNotificationsClick = onOpenNotifications,
                             onRefreshClick = onRefresh
@@ -170,15 +171,22 @@ fun <T : NavDestination> AzrilAdaptiveShell(
                             containerColor = DarkCardBg,
                             contentColor = PureWhite,
                             header = {
-                                IconButton(
-                                    onClick = { scope.launch { drawerState.open() } },
-                                    modifier = Modifier.statusBarsPadding().testTag("open_drawer_button")
+                                Column(
+                                    modifier = Modifier.statusBarsPadding().padding(top = 8.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    Icon(
-                                        Icons.Rounded.Menu,
-                                        contentDescription = stringResource(id = R.string.cd_open_drawer),
-                                        tint = LimePrimary
-                                    )
+                                    AzrilOfficialLogoMark(size = 34.dp)
+                                    IconButton(
+                                        onClick = { scope.launch { drawerState.open() } },
+                                        modifier = Modifier.testTag("open_drawer_button")
+                                    ) {
+                                        Icon(
+                                            Icons.Rounded.Menu,
+                                            contentDescription = stringResource(id = R.string.cd_open_drawer),
+                                            tint = LimePrimary
+                                        )
+                                    }
                                 }
                             }
                         ) {
@@ -214,6 +222,7 @@ fun <T : NavDestination> AzrilAdaptiveShell(
                                     role = user.role,
                                     unreadNotifications = unreadNotifications,
                                     showMenuButton = false,
+                                    showBrandLogo = true,
                                     onMenuClick = {},
                                     onNotificationsClick = onOpenNotifications,
                                     onRefreshClick = onRefresh
@@ -235,6 +244,7 @@ fun <T : NavDestination> AzrilAdaptiveShell(
                                 role = user.role,
                                 unreadNotifications = unreadNotifications,
                                 showMenuButton = true,
+                                showBrandLogo = true,
                                 onMenuClick = { scope.launch { drawerState.open() } },
                                 onNotificationsClick = onOpenNotifications,
                                 onRefreshClick = onRefresh
@@ -328,6 +338,7 @@ private fun AzrilShellTopBar(
     role: UserRole,
     unreadNotifications: Int,
     showMenuButton: Boolean,
+    showBrandLogo: Boolean = true,
     onMenuClick: () -> Unit,
     onNotificationsClick: () -> Unit,
     onRefreshClick: () -> Unit
@@ -361,14 +372,18 @@ private fun AzrilShellTopBar(
         title = {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                if (showBrandLogo) {
+                    AzrilOfficialLogoMark(size = 30.dp)
+                }
                 Text(
                     text = title,
                     style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
                     color = InkText,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
                 )
                 AzrilStatusBadge(
                     text = role.label,

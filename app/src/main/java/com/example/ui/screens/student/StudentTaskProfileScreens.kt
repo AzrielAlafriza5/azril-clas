@@ -29,18 +29,28 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Assignment
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.AttachFile
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Grade
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.UploadFile
+import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -48,6 +58,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,10 +67,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.ui.components.AzrilCard
 import com.example.ui.components.AzrilDarkCard
@@ -67,11 +80,16 @@ import com.example.ui.components.AzrilEmptyState
 import com.example.ui.components.AzrilPageHeader
 import com.example.ui.components.AzrilStatusBadge
 import com.example.ui.model.Assignment
+import com.example.ui.model.AssignmentChecklistRecord
 import com.example.ui.model.StudentBadgeStatus
 import com.example.ui.model.SubmissionMethod
+import com.example.ui.model.SubmissionRecord
+import com.example.ui.model.TaskCompletionStatus
 import com.example.ui.model.ToastType
+import com.example.ui.model.resolveTaskCompletionStatus
 import com.example.ui.state.AzrilUiState
 import com.example.ui.state.AzrilViewModel
+import kotlinx.coroutines.delay
 import com.example.ui.theme.Amber50
 import com.example.ui.theme.Amber700
 import com.example.ui.theme.BorderLight
@@ -107,10 +125,57 @@ fun StudentAssignmentsScreen(
 ) {
     val user = uiState.currentUser ?: return
     val myStudentRecord = uiState.students.find { it.id == user.id }
-    val targetedAssignments = uiState.assignments.filter {
-        AzrilViewModel.isAssignmentForStudent(it, user, myStudentRecord)
+    val targetedAssignments = remember(uiState.assignments, user, myStudentRecord, uiState.classes) {
+        uiState.assignments.filter {
+            AzrilViewModel.isAssignmentForStudent(it, user, myStudentRecord, uiState.classes)
+        }
     }
+
+    // Automatic initial sync + periodic polling while screen is open so Admin checklist updates appear automatically
+    LaunchedEffect(user.id) {
+        viewModel.syncAssignmentsAndChecklists(showToastOnComplete = false)
+        while (uiState.isSupabaseConfigured) {
+            delay(15_000L)
+            viewModel.syncAssignmentsAndChecklists(showToastOnComplete = false)
+        }
+    }
+
+    val mySubmissionsByAssignment = remember(uiState.submissions, user.id) {
+        uiState.submissions
+            .filter { it.studentId == user.id }
+            .associateBy { it.assignmentId }
+    }
+    val myChecklistsByAssignment = remember(uiState.assignmentChecklists, user.id) {
+        uiState.assignmentChecklists
+            .filter { it.studentId == user.id }
+            .associateBy { it.assignmentId }
+    }
+
+    val totalTargeted = targetedAssignments.size
+    val completedCount = targetedAssignments.count { a ->
+        resolveTaskCompletionStatus(mySubmissionsByAssignment[a.id], myChecklistsByAssignment[a.id]) == TaskCompletionStatus.COMPLETED
+    }
+    val awaitingCount = targetedAssignments.count { a ->
+        resolveTaskCompletionStatus(mySubmissionsByAssignment[a.id], myChecklistsByAssignment[a.id]) == TaskCompletionStatus.AWAITING_VERIFICATION
+    }
+    val notSubmittedCount = targetedAssignments.count { a ->
+        resolveTaskCompletionStatus(mySubmissionsByAssignment[a.id], myChecklistsByAssignment[a.id]) == TaskCompletionStatus.NOT_SUBMITTED
+    }
+    val progressRatio = if (totalTargeted == 0) 0f else completedCount.toFloat() / totalTargeted.toFloat()
+    val progressPercent = (progressRatio * 100f).toInt()
+    val effectiveNow = viewModel.currentEffectiveNowMillis()
+
+    var statusFilter by rememberSaveable { mutableStateOf("ALL") }
     var submittingTarget by remember { mutableStateOf<Assignment?>(null) }
+    var viewingSubmissionTarget by remember { mutableStateOf<Assignment?>(null) }
+
+    val filteredAssignments = remember(targetedAssignments, statusFilter, mySubmissionsByAssignment, myChecklistsByAssignment) {
+        targetedAssignments.filter { a ->
+            val st = resolveTaskCompletionStatus(mySubmissionsByAssignment[a.id], myChecklistsByAssignment[a.id])
+            statusFilter == "ALL" || st.name == statusFilter
+        }
+    }
+
     val uriHandler = LocalUriHandler.current
     val context = LocalContext.current
 
@@ -144,9 +209,85 @@ fun StudentAssignmentsScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         AzrilPageHeader(
-            title = "Daftar Tugas",
-            subtitle = "Menampilkan penugasan yang ditujukan khusus untuk kelas atau program studi Anda lengkap dengan file tugas, panduan, dan status deadline."
+            title = "Tugas Saya",
+            subtitle = "Lihat daftar tugas untuk kelas atau prodi Anda, kumpulkan atau perbarui jawaban sebelum deadline (WIB), dan pantau status verifikasi admin.",
+            action = {
+                OutlinedButton(
+                    onClick = { viewModel.syncAssignmentsAndChecklists(showToastOnComplete = true) },
+                    shape = RoundedCornerShape(999.dp),
+                    border = BorderStroke(1.dp, BorderMint),
+                    modifier = Modifier.testTag("student_sync_assignments_button")
+                ) {
+                    Icon(Icons.Rounded.Refresh, contentDescription = "Perbarui status tugas", modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Perbarui", color = InkText)
+                }
+            }
         )
+
+        // Personal Task Progress Hero Card
+        AzrilDarkCard {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    AzrilStatusBadge("PROGRES TUGAS PRIBADI", LimePrimary, DarkCardBg)
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = if (totalTargeted == 0) {
+                            "Belum ada tugas aktif"
+                        } else {
+                            "$completedCount dari $totalTargeted tugas telah selesai"
+                        },
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                        color = PureWhite,
+                        modifier = Modifier.testTag("student_task_progress_summary")
+                    )
+                    Text(
+                        text = "Status Selesai ditentukan berdasarkan verifikasi checklist dari Admin.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OnDarkMuted
+                    )
+                }
+                Spacer(modifier = Modifier.width(10.dp))
+                Box(
+                    modifier = Modifier
+                        .size(56.dp)
+                        .clip(CircleShape)
+                        .background(LimePrimary),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "$progressPercent%",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.ExtraBold),
+                        color = DarkCardBg
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(14.dp))
+            LinearProgressIndicator(
+                progress = { progressRatio },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(10.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .testTag("student_task_progress_bar"),
+                color = LimePrimary,
+                trackColor = DarkCardElevated,
+                strokeCap = StrokeCap.Round
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                AzrilStatusBadge("Selesai: $completedCount", Emerald50, Emerald700)
+                AzrilStatusBadge("Menunggu Verifikasi: $awaitingCount", Amber50, Amber700)
+                AzrilStatusBadge("Belum Mengumpulkan: $notSubmittedCount", DarkCardElevated, PureWhite)
+            }
+        }
 
         if (targetedAssignments.isEmpty()) {
             AzrilEmptyState(
@@ -156,136 +297,337 @@ fun StudentAssignmentsScreen(
                 showIllustration = true
             )
         } else {
-            targetedAssignments.forEach { assignment ->
-                val mySub = uiState.submissions.find { it.assignmentId == assignment.id && it.studentId == user.id }
-                val isDeadlinePassed = assignment.isDeadlinePassed()
+            // Status Filter Row
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                FilterChip(
+                    selected = statusFilter == "ALL",
+                    onClick = { statusFilter = "ALL" },
+                    label = { Text("Semua ($totalTargeted)") },
+                    shape = RoundedCornerShape(999.dp)
+                )
+                FilterChip(
+                    selected = statusFilter == TaskCompletionStatus.NOT_SUBMITTED.name,
+                    onClick = { statusFilter = TaskCompletionStatus.NOT_SUBMITTED.name },
+                    label = { Text("Belum Mengumpulkan ($notSubmittedCount)") },
+                    shape = RoundedCornerShape(999.dp)
+                )
+                FilterChip(
+                    selected = statusFilter == TaskCompletionStatus.AWAITING_VERIFICATION.name,
+                    onClick = { statusFilter = TaskCompletionStatus.AWAITING_VERIFICATION.name },
+                    label = { Text("Menunggu Verifikasi ($awaitingCount)") },
+                    shape = RoundedCornerShape(999.dp)
+                )
+                FilterChip(
+                    selected = statusFilter == TaskCompletionStatus.COMPLETED.name,
+                    onClick = { statusFilter = TaskCompletionStatus.COMPLETED.name },
+                    label = { Text("Selesai ($completedCount)") },
+                    shape = RoundedCornerShape(999.dp)
+                )
+            }
 
-                AzrilCard {
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        AzrilStatusBadge(
-                            text = mySub?.status?.label ?: "Belum Mengumpulkan",
-                            containerColor = if (mySub != null) Emerald50 else Amber50,
-                            contentColor = if (mySub != null) Emerald700 else Amber700
-                        )
-                        AzrilStatusBadge(
-                            text = if (isDeadlinePassed) "Deadline Terlewat" else "Masih Dibuka",
-                            containerColor = if (isDeadlinePassed) Rose50 else LightGreenSecondary,
-                            contentColor = if (isDeadlinePassed) Rose700 else LimeInk
-                        )
-                        AzrilStatusBadge(assignment.targetSummaryLabel(), SoftMintBg, InkText)
-                    }
+            if (filteredAssignments.isEmpty()) {
+                AzrilEmptyState(
+                    title = "Tidak Ada Tugas pada Filter Ini",
+                    description = "Pilih filter lain untuk melihat seluruh daftar tugas Anda.",
+                    icon = Icons.AutoMirrored.Rounded.Assignment
+                )
+            } else {
+                filteredAssignments.forEach { assignment ->
+                    val mySub = mySubmissionsByAssignment[assignment.id]
+                    val myChecklist = myChecklistsByAssignment[assignment.id]
+                    val completionStatus = resolveTaskCompletionStatus(mySub, myChecklist)
+                    val isVerifiedComplete = myChecklist?.isCompleted == true
+                    val isDeadlinePassed = assignment.isDeadlinePassed(effectiveNow)
 
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Text(
-                        text = assignment.title,
-                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-                        color = InkText
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    AzrilCard(
+                        modifier = Modifier.testTag("student_assignment_card_${assignment.id}")
                     ) {
-                        Icon(
-                            Icons.Rounded.Schedule,
-                            contentDescription = null,
-                            tint = if (isDeadlinePassed) Rose700 else Amber700,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = if (isDeadlinePassed) {
-                                "Batas Akhir: ${assignment.deadline} (Sudah Terlewati)"
-                            } else {
-                                "Batas Akhir: ${assignment.deadline}"
-                            },
-                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                            color = if (isDeadlinePassed) Rose700 else Amber700
-                        )
-                    }
-
-                    // Full unlimited description / guide
-                    val fullGuide = assignment.description.ifBlank { assignment.instructions }
-                    if (fullGuide.isNotBlank()) {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Surface(
-                            color = SoftMintBg,
-                            shape = RoundedCornerShape(16.dp),
-                            border = BorderStroke(1.dp, BorderMint),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(
-                                    text = "Deskripsi & Panduan Tugas",
-                                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                                    color = InkText
-                                )
-                                Text(
-                                    text = fullGuide,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = InkMuted
-                                )
+                        // Top Status Badges
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            val (statusBg, statusFg) = when (completionStatus) {
+                                TaskCompletionStatus.COMPLETED -> Emerald50 to Emerald700
+                                TaskCompletionStatus.AWAITING_VERIFICATION -> Amber50 to Amber700
+                                TaskCompletionStatus.NOT_SUBMITTED -> Rose50 to Rose700
                             }
+                            AzrilStatusBadge(
+                                text = completionStatus.label,
+                                containerColor = statusBg,
+                                contentColor = statusFg
+                            )
+                            AzrilStatusBadge(
+                                text = if (isDeadlinePassed) "Deadline Berakhir • Dikunci" else "Dibuka • Bisa Diedit",
+                                containerColor = if (isDeadlinePassed) SurfaceMuted else LightGreenSecondary,
+                                contentColor = if (isDeadlinePassed) Rose700 else LimeInk
+                            )
+                            AzrilStatusBadge(assignment.targetSummaryLabel(), SoftMintBg, InkText)
                         }
-                    }
 
-                    // Two Downloadable / Openable Assignment Files
-                    val hasFile1 = !assignment.file1Name.isNullOrBlank() || !assignment.file1Url.isNullOrBlank()
-                    val hasFile2 = !assignment.file2Name.isNullOrBlank() || !assignment.file2Url.isNullOrBlank()
-                    if (hasFile1 || hasFile2) {
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = "Berkas Tugas (Klik untuk Buka / Unduh)",
-                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                            text = assignment.title,
+                            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
                             color = InkText
                         )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (hasFile1) {
-                                val f1Label = assignment.file1Name ?: "File Tugas 1"
-                                AssignmentFileDownloadCard(
-                                    badgeLabel = "File 1",
-                                    fileName = f1Label,
-                                    fileUrl = assignment.file1Url,
-                                    onClick = { openAssignmentFile(f1Label, assignment.file1Url) },
-                                    modifier = Modifier.testTag("download_file1_${assignment.id}")
-                                )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                Icons.Rounded.Schedule,
+                                contentDescription = null,
+                                tint = if (isDeadlinePassed) Rose700 else Amber700,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = if (isDeadlinePassed) {
+                                    "Deadline: ${assignment.deadline} (Sudah Berakhir)"
+                                } else {
+                                    "Deadline: ${assignment.deadline}"
+                                },
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                color = if (isDeadlinePassed) Rose700 else Amber700
+                            )
+                        }
+
+                        // Full unlimited description / guide
+                        val fullGuide = assignment.description.ifBlank { assignment.instructions }
+                        if (fullGuide.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Surface(
+                                color = SoftMintBg,
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(1.dp, BorderMint),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(
+                                        text = "Deskripsi & Panduan Tugas",
+                                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                        color = InkText
+                                    )
+                                    Text(
+                                        text = fullGuide,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = InkMuted
+                                    )
+                                }
                             }
-                            if (hasFile2) {
-                                val f2Label = assignment.file2Name ?: "File Tugas 2"
-                                AssignmentFileDownloadCard(
-                                    badgeLabel = "File 2",
-                                    fileName = f2Label,
-                                    fileUrl = assignment.file2Url,
-                                    onClick = { openAssignmentFile(f2Label, assignment.file2Url) },
-                                    modifier = Modifier.testTag("download_file2_${assignment.id}")
+                        }
+
+                        // Two Downloadable / Openable Assignment Files
+                        val hasFile1 = !assignment.file1Name.isNullOrBlank() || !assignment.file1Url.isNullOrBlank()
+                        val hasFile2 = !assignment.file2Name.isNullOrBlank() || !assignment.file2Url.isNullOrBlank()
+                        if (hasFile1 || hasFile2) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "Tautan / Berkas Tugas (Klik untuk Buka)",
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                color = InkText
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                if (hasFile1) {
+                                    val f1Label = assignment.file1Name ?: "File Tugas 1"
+                                    AssignmentFileDownloadCard(
+                                        badgeLabel = "File 1",
+                                        fileName = f1Label,
+                                        fileUrl = assignment.file1Url,
+                                        onClick = { openAssignmentFile(f1Label, assignment.file1Url) },
+                                        modifier = Modifier.testTag("download_file1_${assignment.id}")
+                                    )
+                                }
+                                if (hasFile2) {
+                                    val f2Label = assignment.file2Name ?: "File Tugas 2"
+                                    AssignmentFileDownloadCard(
+                                        badgeLabel = "File 2",
+                                        fileName = f2Label,
+                                        fileUrl = assignment.file2Url,
+                                        onClick = { openAssignmentFile(f2Label, assignment.file2Url) },
+                                        modifier = Modifier.testTag("download_file2_${assignment.id}")
+                                    )
+                                }
+                            }
+                        }
+
+                        // READ-ONLY Admin Verification Checklist Indicator (strictly non-interactive!)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Surface(
+                            color = if (isVerifiedComplete) Emerald50 else SurfaceMuted,
+                            shape = RoundedCornerShape(16.dp),
+                            border = BorderStroke(1.dp, if (isVerifiedComplete) Emerald700.copy(alpha = 0.35f) else BorderLight),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("student_readonly_checklist_${assignment.id}")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Checkbox(
+                                    checked = isVerifiedComplete,
+                                    onCheckedChange = null, // Read-only indicator — students CANNOT toggle!
+                                    enabled = false,
+                                    colors = CheckboxDefaults.colors(
+                                        disabledCheckedColor = Emerald700,
+                                        disabledUncheckedColor = Slate500,
+                                        checkmarkColor = PureWhite
+                                    )
+                                )
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        text = when (completionStatus) {
+                                            TaskCompletionStatus.COMPLETED -> "Checklist Verifikasi Admin: Selesai"
+                                            TaskCompletionStatus.AWAITING_VERIFICATION -> "Checklist Verifikasi Admin: Menunggu Verifikasi"
+                                            TaskCompletionStatus.NOT_SUBMITTED -> "Checklist Verifikasi Admin: Belum Selesai"
+                                        },
+                                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                        color = if (isVerifiedComplete) Emerald700 else InkText
+                                    )
+                                    Text(
+                                        text = if (isVerifiedComplete && !myChecklist?.verifiedAt.isNullOrBlank()) {
+                                            "Diverifikasi oleh Admin pada ${myChecklist?.verifiedAt} (Hanya Baca)"
+                                        } else {
+                                            "Indikator hanya baca — penyelesaian diverifikasi langsung oleh Admin."
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isVerifiedComplete) Emerald700 else InkMuted
+                                    )
+                                }
+                                Icon(
+                                    imageVector = if (isVerifiedComplete) Icons.Rounded.CheckCircle else Icons.Rounded.Lock,
+                                    contentDescription = "Status checklist hanya baca",
+                                    tint = if (isVerifiedComplete) Emerald700 else Slate500,
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                         }
-                    }
 
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Text(
-                        "Format diizinkan: ${assignment.allowedFormats.joinToString(", ")} (maks ${assignment.maxFileSizeMb} MB) • Metode: ${assignment.submissionMethod.label}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Slate500
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = { submittingTarget = assignment },
-                        shape = RoundedCornerShape(999.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isDeadlinePassed) DarkCardBg else LimePrimary,
-                            contentColor = if (isDeadlinePassed) LimePrimary else InkText
-                        )
-                    ) {
+                        // Student's Own Submission Summary Box (if already submitted)
+                        if (mySub != null) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Surface(
+                                color = PureWhite,
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(1.dp, BorderMint),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Ringkasan Pengumpulan Anda",
+                                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                            color = InkText
+                                        )
+                                        AzrilStatusBadge(
+                                            text = if (mySub.revisionCount > 0) "Diperbarui ${mySub.revisionCount}x" else "Terkirim",
+                                            containerColor = RoyalBlue50,
+                                            contentColor = RoyalBlue700
+                                        )
+                                    }
+                                    Text("Pengumpulan pertama: ${mySub.firstSubmittedAt}", style = MaterialTheme.typography.labelSmall, color = Slate600)
+                                    Text("Pembaruan terakhir: ${mySub.lastUpdatedAt}", style = MaterialTheme.typography.labelSmall, color = Slate600)
+                                    mySub.uploadedFileName?.let {
+                                        Text("File: $it (${mySub.uploadedFileSizeLabel ?: "-"})", style = MaterialTheme.typography.bodySmall, color = InkText)
+                                    }
+                                    mySub.driveLink?.let {
+                                        Text("Tautan: $it", style = MaterialTheme.typography.bodySmall, color = RoyalBlue700, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                    mySub.answerText?.let {
+                                        Text("Jawaban: $it", style = MaterialTheme.typography.bodySmall, color = InkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = when {
-                                mySub != null -> "Perbarui Pengumpulan"
-                                isDeadlinePassed -> "Kumpulkan (Terlambat)"
-                                else -> "Kumpulkan Tugas"
-                            },
-                            fontWeight = FontWeight.Bold
+                            "Format diizinkan: ${assignment.allowedFormats.joinToString(", ")} (maks ${assignment.maxFileSizeMb} MB) • Metode: ${assignment.submissionMethod.label}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Slate500
                         )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+                        if (isDeadlinePassed) {
+                            // After Deadline: Edit & Re-upload STRICTLY DISABLED; Student can still view saved submission!
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = {},
+                                    enabled = false,
+                                    shape = RoundedCornerShape(999.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("student_deadline_locked_button_${assignment.id}")
+                                ) {
+                                    Icon(Icons.Rounded.Lock, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Deadline Berakhir — Pengumpulan & Edit Ditutup")
+                                }
+                                if (mySub != null) {
+                                    OutlinedButton(
+                                        onClick = { viewingSubmissionTarget = assignment },
+                                        shape = RoundedCornerShape(999.dp),
+                                        border = BorderStroke(1.dp, BorderMint),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("student_view_locked_submission_${assignment.id}")
+                                    ) {
+                                        Icon(Icons.Rounded.Visibility, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("Lihat Jawaban Tersimpan", color = InkText)
+                                    }
+                                }
+                            }
+                        } else {
+                            // Before Deadline: Submit OR Edit / Replace File / Re-upload allowed
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = { submittingTarget = assignment },
+                                    shape = RoundedCornerShape(999.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (mySub != null) DarkCardBg else LimePrimary,
+                                        contentColor = if (mySub != null) LimePrimary else InkText
+                                    ),
+                                    modifier = Modifier.testTag("student_submit_or_edit_button_${assignment.id}")
+                                ) {
+                                    Icon(
+                                        imageVector = if (mySub != null) Icons.Rounded.Edit else Icons.Rounded.UploadFile,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (mySub != null) "Edit / Unggah Ulang Jawaban" else "Kumpulkan Jawaban",
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                if (mySub != null) {
+                                    OutlinedButton(
+                                        onClick = { viewingSubmissionTarget = assignment },
+                                        shape = RoundedCornerShape(999.dp),
+                                        border = BorderStroke(1.dp, BorderMint)
+                                    ) {
+                                        Icon(Icons.Rounded.Visibility, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("Lihat Jawaban", color = InkText)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -293,15 +635,42 @@ fun StudentAssignmentsScreen(
     }
 
     submittingTarget?.let { assignment ->
+        val existingSub = mySubmissionsByAssignment[assignment.id]
         SubmitAssignmentDialog(
             assignment = assignment,
+            existingSubmission = existingSub,
             onDismiss = { submittingTarget = null },
-            onSubmit = { driveUrl, fileName, fileSize ->
-                val err = viewModel.submitAssignment(assignment.id, driveUrl, fileName, fileSize)
+            onSubmit = { answerText, submissionUrl, fileName, fileUrl, fileSize, fileBytes, mimeType ->
+                val err = viewModel.submitAssignment(
+                    assignmentId = assignment.id,
+                    driveLink = submissionUrl,
+                    uploadedFileName = fileName,
+                    uploadedFileSizeLabel = fileSize,
+                    answerText = answerText,
+                    uploadedFileUrl = fileUrl,
+                    uploadedFileBytes = fileBytes,
+                    uploadedFileMimeType = mimeType
+                )
                 if (err == null) submittingTarget = null
                 err
             }
         )
+    }
+
+    viewingSubmissionTarget?.let { assignment ->
+        val existingSub = mySubmissionsByAssignment[assignment.id]
+        val existingChecklist = myChecklistsByAssignment[assignment.id]
+        if (existingSub != null) {
+            StudentSubmissionReadOnlyDialog(
+                assignment = assignment,
+                submission = existingSub,
+                checklist = existingChecklist,
+                onOpenLink = { label, url -> openAssignmentFile(label, url) },
+                onDismiss = { viewingSubmissionTarget = null }
+            )
+        } else {
+            viewingSubmissionTarget = null
+        }
     }
 }
 
@@ -366,14 +735,28 @@ private fun AssignmentFileDownloadCard(
 @Composable
 private fun SubmitAssignmentDialog(
     assignment: Assignment,
+    existingSubmission: SubmissionRecord?,
     onDismiss: () -> Unit,
-    onSubmit: (String?, String?, String?) -> String?
+    onSubmit: (
+        answerText: String?,
+        submissionUrl: String?,
+        fileName: String?,
+        fileUrl: String?,
+        fileSize: String?,
+        fileBytes: ByteArray?,
+        mimeType: String?
+    ) -> String?
 ) {
     val context = LocalContext.current
-    var driveUrl by rememberSaveable { mutableStateOf("") }
-    var pickedFileName by rememberSaveable { mutableStateOf<String?>(null) }
-    var pickedFileSize by rememberSaveable { mutableStateOf<String?>(null) }
-    var error by rememberSaveable { mutableStateOf<String?>(null) }
+    val isEditing = existingSubmission != null
+    var answerText by rememberSaveable(assignment.id) { mutableStateOf(existingSubmission?.answerText.orEmpty()) }
+    var submissionUrl by rememberSaveable(assignment.id) { mutableStateOf(existingSubmission?.driveLink.orEmpty()) }
+    var pickedFileName by rememberSaveable(assignment.id) { mutableStateOf(existingSubmission?.uploadedFileName) }
+    var pickedFileUrl by rememberSaveable(assignment.id) { mutableStateOf(existingSubmission?.uploadedFileUrl) }
+    var pickedFileSize by rememberSaveable(assignment.id) { mutableStateOf(existingSubmission?.uploadedFileSizeLabel) }
+    var pickedFileBytes by remember(assignment.id) { mutableStateOf<ByteArray?>(null) }
+    var pickedMimeType by rememberSaveable(assignment.id) { mutableStateOf<String?>(null) }
+    var error by rememberSaveable(assignment.id) { mutableStateOf<String?>(null) }
 
     // Zero-permission Android Storage Access Framework Document Picker
     val filePicker = rememberLauncherForActivityResult(
@@ -382,6 +765,7 @@ private fun SubmitAssignmentDialog(
         if (uri != null) {
             var name = "berkas_tugas"
             var sizeLabel = "Ukuran terverifikasi"
+            var oversized = false
             context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
                     val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
@@ -393,56 +777,135 @@ private fun SubmitAssignmentDialog(
                         sizeLabel = String.format("%.2f MB", mb)
                         if (mb > assignment.maxFileSizeMb) {
                             error = "Ukuran file ($sizeLabel) melebihi batas maksimal ${assignment.maxFileSizeMb} MB."
-                            return@use
+                            oversized = true
                         }
                     }
                 }
             }
-            pickedFileName = name
-            pickedFileSize = sizeLabel
-            error = null
+            if (!oversized) {
+                val loadedBytes = runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                        val maxBytes = assignment.maxFileSizeMb.coerceIn(1, 50) * 1024 * 1024
+                        val raw = stream.readBytes()
+                        if (raw.size <= maxBytes) raw else null
+                    }
+                }.getOrNull()
+                pickedFileName = name
+                pickedFileUrl = uri.toString()
+                pickedFileSize = sizeLabel
+                pickedFileBytes = loadedBytes
+                pickedMimeType = context.contentResolver.getType(uri)
+                error = null
+            }
         }
     }
 
-    val allowDrive = assignment.submissionMethod != SubmissionMethod.DIRECT_UPLOAD
+    val allowUrl = assignment.submissionMethod != SubmissionMethod.DIRECT_UPLOAD
     val allowUpload = assignment.submissionMethod != SubmissionMethod.GOOGLE_DRIVE
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = PureWhite,
-        title = { Text("Kumpulkan Tugas", style = MaterialTheme.typography.titleLarge, color = Navy900) },
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = if (isEditing) "Edit / Unggah Ulang Jawaban" else "Kumpulkan Jawaban Tugas",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = Navy900
+                )
+                Text("Batas akhir: ${assignment.deadline}", style = MaterialTheme.typography.labelSmall, color = Amber700)
+            }
+        },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text(assignment.title, style = MaterialTheme.typography.titleSmall, color = Navy900)
-                if (assignment.isDeadlinePassed()) {
-                    AzrilStatusBadge("Perhatian: Deadline sudah terlewati (tercatat Terlambat)", Rose50, Rose700)
+                Text(assignment.title, style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold), color = Navy900)
+                if (existingSubmission != null) {
+                    Surface(
+                        color = SoftMintBg,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, BorderMint),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text("Pengumpulan pertama: ${existingSubmission.firstSubmittedAt}", style = MaterialTheme.typography.labelSmall, color = Slate600)
+                            Text("Pembaruan terakhir: ${existingSubmission.lastUpdatedAt}", style = MaterialTheme.typography.labelSmall, color = Slate600)
+                            Text("Pembaruan akan memperbarui data jawaban Anda (tanpa duplikasi).", style = MaterialTheme.typography.labelSmall, color = LimeInk)
+                        }
+                    }
                 }
-                if (allowDrive) {
+
+                // Written Answer / Notes
+                OutlinedTextField(
+                    value = answerText,
+                    onValueChange = { answerText = it; error = null },
+                    label = { Text("Jawaban / Catatan Pengumpulan") },
+                    placeholder = { Text("Tuliskan jawaban atau catatan singkat pengerjaan Anda...") },
+                    minLines = 3,
+                    maxLines = 8,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("student_submission_answer_input")
+                )
+
+                // URL Link Input
+                if (allowUrl) {
                     OutlinedTextField(
-                        value = driveUrl,
-                        onValueChange = { driveUrl = it; error = null },
-                        label = { Text("Link Google Drive") },
-                        placeholder = { Text("https://drive.google.com/file/d/...") },
+                        value = submissionUrl,
+                        onValueChange = { submissionUrl = it; error = null },
+                        label = { Text("Tautan Pengumpulan (URL / Google Drive / Docs)") },
+                        placeholder = { Text("https://drive.google.com/...") },
                         leadingIcon = { Icon(Icons.Rounded.Link, contentDescription = null) },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("student_submission_url_input")
                     )
                 }
+
+                // File Picker / Replace File
                 if (allowUpload) {
                     OutlinedButton(
                         onClick = { filePicker.launch(arrayOf("*/*")) },
                         shape = RoundedCornerShape(999.dp),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("student_submission_pick_file_button")
                     ) {
                         Icon(Icons.Rounded.AttachFile, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text(pickedFileName ?: "Pilih File dari Perangkat")
+                        Text(
+                            text = if (pickedFileName != null) "Ganti File: $pickedFileName" else "Pilih File Jawaban dari Perangkat",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
-                    pickedFileName?.let {
-                        Text("Terpilih: $it (${pickedFileSize ?: "-"})", style = MaterialTheme.typography.labelSmall, color = Emerald700)
+                    pickedFileName?.let { fName ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "File aktif: $fName (${pickedFileSize ?: "-"})",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Emerald700,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(
+                                onClick = {
+                                    pickedFileName = null
+                                    pickedFileUrl = null
+                                    pickedFileSize = null
+                                    pickedFileBytes = null
+                                    pickedMimeType = null
+                                }
+                            ) {
+                                Text("Hapus", color = Rose600)
+                            }
+                        }
                     }
                 }
                 error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose600) }
@@ -450,11 +913,105 @@ private fun SubmitAssignmentDialog(
         },
         confirmButton = {
             Button(
-                onClick = { error = onSubmit(driveUrl.ifBlank { null }, pickedFileName, pickedFileSize) },
-                shape = RoundedCornerShape(999.dp)
-            ) { Text("Kirim Tugas") }
+                onClick = {
+                    error = onSubmit(
+                        answerText.ifBlank { null },
+                        submissionUrl.ifBlank { null },
+                        pickedFileName,
+                        pickedFileUrl,
+                        pickedFileSize,
+                        pickedFileBytes,
+                        pickedMimeType
+                    )
+                },
+                shape = RoundedCornerShape(999.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
+                modifier = Modifier.testTag("student_submission_confirm_button")
+            ) {
+                Text(if (isEditing) "Simpan Pembaruan" else "Kirim Jawaban")
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Batal") } }
+    )
+}
+
+@Composable
+private fun StudentSubmissionReadOnlyDialog(
+    assignment: Assignment,
+    submission: SubmissionRecord,
+    checklist: AssignmentChecklistRecord?,
+    onOpenLink: (String, String?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val completionStatus = resolveTaskCompletionStatus(submission, checklist)
+    val isVerified = checklist?.isCompleted == true
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("Jawaban Tersimpan Saya", style = MaterialTheme.typography.titleLarge, color = Navy900)
+                Text(assignment.title, style = MaterialTheme.typography.labelMedium, color = InkMuted)
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                AzrilStatusBadge(
+                    text = "Status: ${completionStatus.label}",
+                    containerColor = if (isVerified) Emerald50 else Amber50,
+                    contentColor = if (isVerified) Emerald700 else Amber700
+                )
+                Surface(
+                    color = SoftMintBg,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, BorderMint),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Pengumpulan pertama: ${submission.firstSubmittedAt}", style = MaterialTheme.typography.bodySmall, color = Slate600)
+                        Text("Pembaruan terakhir: ${submission.lastUpdatedAt}", style = MaterialTheme.typography.bodySmall, color = Slate600)
+                        Text("Jumlah revisi: ${submission.revisionCount}x", style = MaterialTheme.typography.labelSmall, color = InkMuted)
+                    }
+                }
+                if (!submission.answerText.isNullOrBlank()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Jawaban Teks", style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold), color = InkText)
+                        Text(submission.answerText, style = MaterialTheme.typography.bodyMedium, color = InkMuted)
+                    }
+                }
+                if (!submission.uploadedFileName.isNullOrBlank()) {
+                    OutlinedButton(
+                        onClick = { onOpenLink(submission.uploadedFileName, submission.uploadedFileUrl) },
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Rounded.AttachFile, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("${submission.uploadedFileName} (${submission.uploadedFileSizeLabel ?: "-"})", modifier = Modifier.weight(1f))
+                        Icon(Icons.Rounded.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
+                }
+                if (!submission.driveLink.isNullOrBlank()) {
+                    OutlinedButton(
+                        onClick = { onOpenLink("Tautan Jawaban", submission.driveLink) },
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Rounded.Link, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(submission.driveLink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        Icon(Icons.Rounded.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Tutup") }
+        }
     )
 }
 
@@ -465,6 +1022,9 @@ fun StudentSubmissionsScreen(
 ) {
     val user = uiState.currentUser ?: return
     val mySubs = uiState.submissions.filter { it.studentId == user.id }
+    val myChecklists = uiState.assignmentChecklists
+        .filter { it.studentId == user.id }
+        .associateBy { it.assignmentId }
 
     Column(
         modifier = Modifier
@@ -475,25 +1035,32 @@ fun StudentSubmissionsScreen(
     ) {
         AzrilPageHeader(
             title = "Pengumpulan Saya",
-            subtitle = "Riwayat tugas yang telah Anda kumpulkan, jumlah revisi, dan status pemeriksaan."
+            subtitle = "Riwayat tugas yang telah Anda kumpulkan, waktu pembaruan terakhir, dan status verifikasi admin."
         )
 
         if (mySubs.isEmpty()) {
             AzrilEmptyState(
                 title = "Belum Ada Riwayat Pengumpulan",
-                description = "Semua berkas dan link Google Drive yang Anda kirimkan akan tersimpan riwayatnya di sini.",
+                description = "Semua jawaban teks, berkas, dan tautan URL yang Anda kirimkan akan tersimpan riwayatnya di sini.",
                 icon = Icons.Rounded.UploadFile,
                 showIllustration = true
             )
         } else {
             mySubs.forEach { sub ->
+                val completion = resolveTaskCompletionStatus(sub, myChecklists[sub.assignmentId])
                 AzrilCard {
-                    AzrilStatusBadge(sub.status.label, RoyalBlue50, RoyalBlue700)
+                    AzrilStatusBadge(
+                        text = completion.label,
+                        containerColor = if (completion == TaskCompletionStatus.COMPLETED) Emerald50 else Amber50,
+                        contentColor = if (completion == TaskCompletionStatus.COMPLETED) Emerald700 else Amber700
+                    )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(sub.assignmentTitle, style = MaterialTheme.typography.titleMedium, color = Navy900)
-                    Text("Dikumpulkan: ${sub.submittedAt} • Revisi ke-${sub.revisionCount}", style = MaterialTheme.typography.bodySmall, color = Slate500)
-                    sub.driveLink?.let { Text("Drive: $it", style = MaterialTheme.typography.labelMedium, color = RoyalBlue700) }
+                    Text("Pengumpulan pertama: ${sub.firstSubmittedAt}", style = MaterialTheme.typography.bodySmall, color = Slate500)
+                    Text("Pembaruan terakhir: ${sub.lastUpdatedAt} • ${sub.revisionCount}x edit", style = MaterialTheme.typography.bodySmall, color = Slate500)
+                    sub.driveLink?.let { Text("Tautan: $it", style = MaterialTheme.typography.labelMedium, color = RoyalBlue700) }
                     sub.uploadedFileName?.let { Text("File: $it", style = MaterialTheme.typography.labelMedium, color = Navy900) }
+                    sub.answerText?.let { Text("Jawaban: $it", style = MaterialTheme.typography.bodySmall, color = InkMuted, maxLines = 2) }
                 }
             }
         }

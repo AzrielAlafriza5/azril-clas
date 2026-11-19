@@ -73,6 +73,41 @@ enum class SubmissionStatus(val label: String) {
     GRADED("Selesai Dinilai")
 }
 
+/**
+ * Unified 3-state task completion model strictly separating submission from admin verification:
+ * - NOT_SUBMITTED: student has not submitted and admin has not verified
+ * - AWAITING_VERIFICATION: student has submitted, waiting for admin checklist verification
+ * - COMPLETED: admin has checked/verified completion (never auto-set by submission alone)
+ */
+enum class TaskCompletionStatus(val label: String) {
+    NOT_SUBMITTED("Belum Mengumpulkan"),
+    AWAITING_VERIFICATION("Menunggu Verifikasi"),
+    COMPLETED("Selesai")
+}
+
+data class AssignmentChecklistRecord(
+    val assignmentId: String,
+    val studentId: String,
+    val isCompleted: Boolean = false,
+    val verifiedById: String? = null,
+    val verifiedByName: String? = null,
+    val verifiedAt: String? = null,
+    val verificationNote: String? = null,
+    val updatedAtMillis: Long = System.currentTimeMillis()
+) {
+    val compositeKey: String
+        get() = "$assignmentId::$studentId"
+}
+
+fun resolveTaskCompletionStatus(
+    submission: SubmissionRecord?,
+    checklist: AssignmentChecklistRecord?
+): TaskCompletionStatus = when {
+    checklist?.isCompleted == true -> TaskCompletionStatus.COMPLETED
+    submission != null -> TaskCompletionStatus.AWAITING_VERIFICATION
+    else -> TaskCompletionStatus.NOT_SUBMITTED
+}
+
 enum class AiReviewStatus(val label: String) {
     CONFORMING("Sesuai"),
     NEEDS_REVISION("Perlu Revisi"),
@@ -268,10 +303,16 @@ data class SubmissionRecord(
     val studentId: String,
     val studentName: String,
     val studentNim: String,
+    val answerText: String? = null,
     val driveLink: String? = null,
     val uploadedFileName: String? = null,
+    val uploadedFileUrl: String? = null,
     val uploadedFileSizeLabel: String? = null,
     val submittedAt: String,
+    val firstSubmittedAt: String = submittedAt,
+    val lastUpdatedAt: String = submittedAt,
+    val firstSubmittedAtMillis: Long = 0L,
+    val lastUpdatedAtMillis: Long = 0L,
     val status: SubmissionStatus,
     val isLate: Boolean = false,
     val revisionCount: Int = 0,
