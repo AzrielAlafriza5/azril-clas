@@ -30,7 +30,6 @@ import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Refresh
-import androidx.compose.material.icons.rounded.SwapHoriz
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.DrawerValue
@@ -89,7 +88,6 @@ fun <T : NavDestination> AzrilAdaptiveShell(
     onSelectDestination: (T) -> Unit,
     onOpenNotifications: () -> Unit,
     onRefresh: () -> Unit,
-    onSwitchRolePreview: () -> Unit,
     onLogout: () -> Unit,
     content: @Composable (isExpandedWidth: Boolean) -> Unit
 ) {
@@ -108,7 +106,6 @@ fun <T : NavDestination> AzrilAdaptiveShell(
                     destinations = destinations,
                     selectedDestination = selectedDestination,
                     onSelectDestination = onSelectDestination,
-                    onSwitchRolePreview = onSwitchRolePreview,
                     onLogout = onLogout,
                     modifier = Modifier
                         .width(240.dp)
@@ -157,10 +154,6 @@ fun <T : NavDestination> AzrilAdaptiveShell(
                             onSelectDestination = { dest ->
                                 onSelectDestination(dest)
                                 scope.launch { drawerState.close() }
-                            },
-                            onSwitchRolePreview = {
-                                scope.launch { drawerState.close() }
-                                onSwitchRolePreview()
                             },
                             onLogout = {
                                 scope.launch { drawerState.close() }
@@ -441,7 +434,6 @@ private fun <T : NavDestination> AzrilSidebarContent(
     destinations: List<T>,
     selectedDestination: T,
     onSelectDestination: (T) -> Unit,
-    onSwitchRolePreview: () -> Unit,
     onLogout: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -567,53 +559,29 @@ private fun <T : NavDestination> AzrilSidebarContent(
                     )
                 }
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            Surface(
+                onClick = onLogout,
+                color = Color(0xFF331B1E),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth().testTag("sidebar_logout")
             ) {
-                Surface(
-                    onClick = onSwitchRolePreview,
-                    color = DarkCardElevated,
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.weight(1f).testTag("sidebar_switch_role")
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        Icon(
-                            Icons.Rounded.SwapHoriz,
-                            contentDescription = "Ganti pratinjau role",
-                            tint = LimePrimary,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (user.role == UserRole.ADMIN) "Ke Mahasiswa" else "Ke Admin",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = PureWhite,
-                            maxLines = 1
-                        )
-                    }
-                }
-                Surface(
-                    onClick = onLogout,
-                    color = Color(0xFF331B1E),
-                    shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.testTag("sidebar_logout")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            Icons.AutoMirrored.Rounded.Logout,
-                            contentDescription = stringResource(id = R.string.logout_label),
-                            tint = Color(0xFFFCA5A5),
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
+                    Icon(
+                        Icons.AutoMirrored.Rounded.Logout,
+                        contentDescription = stringResource(id = R.string.logout_label),
+                        tint = Color(0xFFFCA5A5),
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (user.role == UserRole.ADMIN) "Keluar dari Admin" else "Keluar Akun",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                        color = Color(0xFFFCA5A5)
+                    )
                 }
             }
         }

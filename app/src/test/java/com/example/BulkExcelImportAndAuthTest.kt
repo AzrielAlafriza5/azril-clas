@@ -391,8 +391,10 @@ class BulkExcelImportAndAuthTest {
 
         waitUntil { !vm.uiState.value.isRestoringSession }
 
-        // Enter Admin session
-        vm.enterAdminPreview()
+        // Authenticate as Administrator with real credentials
+        vm.openAdminLoginPortal()
+        vm.loginAdminWithCredentials("Azril12v", "Azril23admin7", rememberMe = false)
+        waitUntil { vm.uiState.value.currentUser != null && !vm.uiState.value.authInProgress }
         assertEquals(UserRole.ADMIN, vm.uiState.value.currentUser?.role)
 
         // Parse multi-sheet workbook
@@ -401,14 +403,16 @@ class BulkExcelImportAndAuthTest {
             bytes = buildComprehensiveTestWorkbook()
         ).getOrThrow()
 
+        val initialStudentCount = vm.uiState.value.students.size
+
         // Commit import WITH historical attendance enabled
         val err = vm.commitExcelStudentImport(preview = preview, importHistoricalAttendance = true)
         assertNull(err)
 
         val stateAfterImport = vm.uiState.value
 
-        // 7 valid students in workbook without pre-existing (4 normal + 2 AFK + 250901090 since clean DB) = 7
-        assertEquals(7, stateAfterImport.students.size)
+        // Exactly 7 new valid students imported from workbook (4 normal + 2 AFK + 250901090)
+        assertEquals(initialStudentCount + 7, stateAfterImport.students.size)
         // Classes PJKR-3B, FARMASI-3, HES-3B auto-created
         assertTrue(stateAfterImport.classes.any { it.name == "PJKR-3B" && it.studyProgramName == "PJKR" })
         assertTrue(stateAfterImport.classes.any { it.name == "FARMASI-3" && it.studyProgramName == "FARMASI" })

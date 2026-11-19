@@ -63,8 +63,23 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+enum class AuthPortalMode {
+    STUDENT_LOGIN,
+    ADMIN_LOGIN
+}
+
+sealed interface RouteAccessResult {
+    data object Allowed : RouteAccessResult
+    data object RedirectToStudentLogin : RouteAccessResult
+    data object RedirectToAdminLogin : RouteAccessResult
+    data class AccessDenied(val reason: String) : RouteAccessResult
+    data class SessionExpired(val redirectPortal: AuthPortalMode) : RouteAccessResult
+}
+
 data class AzrilUiState(
     val currentUser: UserProfile? = null,
+    val authPortalMode: AuthPortalMode = AuthPortalMode.STUDENT_LOGIN,
+    val sessionExpiresAtMillis: Long? = null,
     val isRestoringSession: Boolean = true,
     val authInProgress: Boolean = false,
     val authErrorMessage: String? = null,
@@ -136,8 +151,12 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     } else profile
                 }
+                val expiredToast = if (restored.sessionExpired) {
+                    ToastMessage("Sesi login sebelumnya telah berakhir. Silakan masuk kembali.", ToastType.WARNING)
+                } else state.toastMessage
                 state.copy(
                     currentUser = restoredUser,
+                    sessionExpiresAtMillis = restored.sessionExpiresAt,
                     isRestoringSession = false,
                     rememberedIdentifier = restored.rememberedIdentifier,
                     rememberMeEnabled = restored.rememberMeEnabled,
@@ -149,7 +168,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                     attendanceRecords = if (restored.savedAttendanceRecords.isNotEmpty()) restored.savedAttendanceRecords else state.attendanceRecords,
                     historicalAttendanceRecords = if (restored.savedHistoricalAttendanceRecords.isNotEmpty()) restored.savedHistoricalAttendanceRecords else state.historicalAttendanceRecords,
                     studentStreaks = if (restored.savedStreaks.isNotEmpty()) restored.savedStreaks else state.studentStreaks,
-                    streakNotificationLogs = if (restored.savedStreakNotifications.isNotEmpty()) restored.savedStreakNotifications else state.streakNotificationLogs
+                    streakNotificationLogs = if (restored.savedStreakNotifications.isNotEmpty()) restored.savedStreakNotifications else state.streakNotificationLogs,
+                    toastMessage = expiredToast
                 )
             }
             val current = _uiState.value.currentUser
@@ -237,6 +257,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                             authInProgress = false,
                             authErrorMessage = null,
                             currentUser = enrichedProfile,
+                            authPortalMode = AuthPortalMode.STUDENT_LOGIN,
+                            sessionExpiresAtMillis = result.sessionExpiresAt.takeIf { it > 0L }
+                                ?: (System.currentTimeMillis() + AzrilAuthRepository.REMEMBER_SESSION_DURATION_MS),
                             adminDestination = AdminDestination.DASHBOARD,
                             studentDestination = StudentDestination.DASHBOARD,
                             rememberMeEnabled = rememberMe,
@@ -328,82 +351,278 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(toastMessage = null) }
     }
 
-    fun enterAdminPreview() {
+    fun openAdminLoginPortal() {
         _uiState.update {
             it.copy(
-                currentUser = UserProfile(
-                    id = "preview-admin",
-                    fullName = "Administrator Akademik",
-                    email = "admin@azrilclas.ac.id",
-                    role = UserRole.ADMIN,
-                    status = AccountStatus.ACTIVE
-                ),
+                authPortalMode = AuthPortalMode.ADMIN_LOGIN,
+                authErrorMessage = null
+            )
+        }
+    }
+
+    fun openStudentLoginPortal() {
+        _uiState.update {
+            it.copy(
+                authPortalMode = AuthPortalMode.STUDENT_LOGIN,
+                authErrorMessage = null
+            )
+        }
+    }
+
+    /**
+     * Authenticates an Administrator via username & password (strictly verified role = ADMIN).
+     * Students or unauthenticated users can NEVER enter the Admin dashboard through this or any route.
+     */
+    fun loginAdminWithCredentials(
+        username: String,
+        password: String,
+        rememberMe: Boolean = false,
+        nowMillis: Long = System.currentTimeMillis()
+    ) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(authInProgress = true, authErrorMessage = null) }
+            when (val result = authRepository.loginAdmin(username, password, rememberMe, nowMillis)) {
+                is AuthResult.Success -> {
+                    if (result.profile.role != UserRole.ADMIN) {
+                        authRepository.logout()
+                        _uiState.update {
+                            it.copy(
+                                authInProgress = false,
+                                currentUser = null,
+                                sessionExpiresAtMillis = null,
+                                authErrorMessage = "Akses ditolak: akun ini bukan Administrator.",
+                                toastMessage = ToastMessage("Akses ditolak: bukan akun Administrator.", ToastType.ERROR)
+                            )
+                        }
+                        return@launch
+                    }
+                    _uiState.update { state ->
+                        state.copy(
+                            authInProgress = false,
+                            authErrorMessage = null,
+                            currentUser = result.profile,
+                            authPortalMode = AuthPortalMode.ADMIN_LOGIN,
+                            sessionExpiresAtMillis = result.sessionExpiresAt.takeIf { it > 0L }
+                                ?: (nowMillis + AzrilAuthRepository.ADMIN_SESSION_DURATION_MS),
+                            adminDestination = AdminDestination.DASHBOARD,
+                            toastMessage = ToastMessage(
+                                message = "Autentikasi Administrator berhasil. Selamat datang, ${result.profile.fullName}.",
+                                type = ToastType.SUCCESS
+                            )
+                        )
+                    }
+                    evaluateStreakRemindersForInactiveStudents()
+                }
+                is AuthResult.Failure -> {
+                    _uiState.update {
+                        it.copy(
+                            authInProgress = false,
+                            authErrorMessage = result.message,
+                            toastMessage = ToastMessage(result.message, ToastType.ERROR)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun isSessionExpired(nowMillis: Long = System.currentTimeMillis()): Boolean {
+        val state = _uiState.value
+        val user = state.currentUser ?: return false
+        val expiresAt = state.sessionExpiresAtMillis ?: return false
+        return expiresAt > 0L && nowMillis >= expiresAt && user.id.isNotBlank()
+    }
+
+    /**
+     * Checks whether the active session has expired. If expired, immediately terminates the
+     * session and redirects to the corresponding login portal.
+     */
+    fun enforceSessionValidity(nowMillis: Long = System.currentTimeMillis()): Boolean {
+        val current = _uiState.value.currentUser ?: return false
+        if (isSessionExpired(nowMillis)) {
+            val redirectPortal = if (current.role == UserRole.ADMIN) {
+                AuthPortalMode.ADMIN_LOGIN
+            } else {
+                AuthPortalMode.STUDENT_LOGIN
+            }
+            logout(sessionExpired = true, targetPortal = redirectPortal)
+            return false
+        }
+        return true
+    }
+
+    /**
+     * Centralized Route & URL Protection Guard for all Admin and Student routes.
+     * - Unauthenticated users accessing `/admin*` or `admin_*` -> RedirectToAdminLogin.
+     * - Logged-in Students accessing `/admin*` or `admin_*` -> AccessDenied (NEVER renders Admin UI).
+     * - Expired Admin/Student sessions -> immediately terminated and redirected to login.
+     * - Never assumes Admin privileges merely from opening a URL or route.
+     */
+    fun navigateToRoute(
+        route: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): RouteAccessResult {
+        val normalized = route.trim().lowercase(Locale.US).trimStart('/')
+        val current = _uiState.value.currentUser
+
+        // Auth routes
+        if (normalized == "login/admin" || normalized == "admin/login" || normalized == "admin_login") {
+            if (current == null) {
+                openAdminLoginPortal()
+                return RouteAccessResult.Allowed
+            }
+            if (current.role == UserRole.STUDENT) {
+                val msg = "Anda sedang login sebagai Mahasiswa. Keluar terlebih dahulu untuk masuk sebagai Administrator."
+                showToast(msg, ToastType.WARNING)
+                return RouteAccessResult.AccessDenied(msg)
+            }
+            return RouteAccessResult.Allowed
+        }
+        if (normalized == "login" || normalized == "login/student" || normalized == "student_login") {
+            if (current == null) {
+                openStudentLoginPortal()
+                return RouteAccessResult.Allowed
+            }
+            return RouteAccessResult.Allowed
+        }
+
+        // Check expiration for any authenticated user
+        if (current != null && isSessionExpired(nowMillis)) {
+            val portal = if (current.role == UserRole.ADMIN || isAdminRoute(normalized)) {
+                AuthPortalMode.ADMIN_LOGIN
+            } else {
+                AuthPortalMode.STUDENT_LOGIN
+            }
+            logout(sessionExpired = true, targetPortal = portal)
+            return RouteAccessResult.SessionExpired(portal)
+        }
+
+        // Protected Admin routes (/admin, /admin/dashboard, /admin/*, admin_*)
+        if (isAdminRoute(normalized)) {
+            if (current == null) {
+                _uiState.update {
+                    it.copy(
+                        authPortalMode = AuthPortalMode.ADMIN_LOGIN,
+                        authErrorMessage = "Silakan autentikasi sebagai Administrator untuk membuka dashboard admin.",
+                        toastMessage = ToastMessage(
+                            "Akses dashboard admin membutuhkan autentikasi Administrator.",
+                            ToastType.WARNING
+                        )
+                    )
+                }
+                return RouteAccessResult.RedirectToAdminLogin
+            }
+            if (current.role != UserRole.ADMIN || current.status != AccountStatus.ACTIVE) {
+                val msg = "Akses ditolak: akun Mahasiswa tidak diizinkan mengakses dashboard Administrator."
+                _uiState.update {
+                    it.copy(toastMessage = ToastMessage(msg, ToastType.ERROR))
+                }
+                return RouteAccessResult.AccessDenied(msg)
+            }
+            val matchedDest = resolveAdminDestinationFromRoute(normalized)
+            _uiState.update { it.copy(adminDestination = matchedDest, loadState = ScreenLoadState.Ready) }
+            return RouteAccessResult.Allowed
+        }
+
+        // Protected Student routes (/student, /student/dashboard, /student/*, student_*)
+        if (isStudentRoute(normalized)) {
+            if (current == null) {
+                _uiState.update {
+                    it.copy(
+                        authPortalMode = AuthPortalMode.STUDENT_LOGIN,
+                        toastMessage = ToastMessage("Silakan login dengan NIM terlebih dahulu.", ToastType.WARNING)
+                    )
+                }
+                return RouteAccessResult.RedirectToStudentLogin
+            }
+            if (current.role != UserRole.STUDENT) {
+                val msg = "Sesi Administrator terpisah dari portal Mahasiswa. Gunakan akun Mahasiswa untuk membuka halaman ini."
+                showToast(msg, ToastType.WARNING)
+                return RouteAccessResult.AccessDenied(msg)
+            }
+            val matchedDest = resolveStudentDestinationFromRoute(normalized)
+            _uiState.update { it.copy(studentDestination = matchedDest, loadState = ScreenLoadState.Ready) }
+            return RouteAccessResult.Allowed
+        }
+
+        return RouteAccessResult.Allowed
+    }
+
+    private fun isAdminRoute(normalized: String): Boolean =
+        normalized == "admin" ||
+            normalized.startsWith("admin/") ||
+            normalized.startsWith("admin_")
+
+    private fun isStudentRoute(normalized: String): Boolean =
+        normalized == "student" ||
+            normalized.startsWith("student/") ||
+            normalized.startsWith("student_")
+
+    private fun resolveAdminDestinationFromRoute(normalized: String): AdminDestination {
+        val exact = AdminDestination.entries.find { it.route.equals(normalized, ignoreCase = true) }
+        if (exact != null) return exact
+        val segment = normalized.removePrefix("admin/").removePrefix("admin_").replace("-", "_")
+        return AdminDestination.entries.find {
+            it.route.removePrefix("admin_").equals(segment, ignoreCase = true) ||
+                it.name.equals(segment, ignoreCase = true)
+        } ?: AdminDestination.DASHBOARD
+    }
+
+    private fun resolveStudentDestinationFromRoute(normalized: String): StudentDestination {
+        val exact = StudentDestination.entries.find { it.route.equals(normalized, ignoreCase = true) }
+        if (exact != null) return exact
+        val segment = normalized.removePrefix("student/").removePrefix("student_").replace("-", "_")
+        return StudentDestination.entries.find {
+            it.route.removePrefix("student_").equals(segment, ignoreCase = true) ||
+                it.name.equals(segment, ignoreCase = true)
+        } ?: StudentDestination.DASHBOARD
+    }
+
+    fun logout(
+        sessionExpired: Boolean = false,
+        targetPortal: AuthPortalMode? = null
+    ) {
+        val previousRole = _uiState.value.currentUser?.role
+        val portal = targetPortal ?: if (previousRole == UserRole.ADMIN) {
+            AuthPortalMode.ADMIN_LOGIN
+        } else {
+            AuthPortalMode.STUDENT_LOGIN
+        }
+        val msg = if (sessionExpired) {
+            ToastMessage("Sesi telah berakhir. Silakan login kembali untuk melanjutkan.", ToastType.WARNING)
+        } else {
+            ToastMessage("Anda telah keluar dari akun. Sesi login berakhir dengan aman.", ToastType.SUCCESS)
+        }
+        // Clear in-memory session immediately so UI locks down synchronously before async store cleanup completes
+        _uiState.update {
+            it.copy(
+                currentUser = null,
+                sessionExpiresAtMillis = null,
+                authPortalMode = portal,
+                authErrorMessage = if (sessionExpired) "Sesi berakhir. Silakan autentikasi ulang." else null,
                 adminDestination = AdminDestination.DASHBOARD,
-                toastMessage = ToastMessage(
-                    message = "Masuk ke Panel Admin.",
-                    type = ToastType.INFO
-                )
-            )
-        }
-    }
-
-    fun enterStudentPreview() {
-        val activeStudent = _uiState.value.students.firstOrNull()
-        val previewStudentId = activeStudent?.id ?: "preview-student"
-        _uiState.update {
-            it.copy(
-                currentUser = UserProfile(
-                    id = previewStudentId,
-                    fullName = activeStudent?.fullName ?: "Mahasiswa (Pratinjau)",
-                    email = activeStudent?.email ?: "mahasiswa@azrilclas.ac.id",
-                    role = UserRole.STUDENT,
-                    nim = activeStudent?.nim ?: "Belum terdaftar",
-                    studyProgramId = activeStudent?.studyProgramId,
-                    studyProgramName = activeStudent?.studyProgramName ?: "HES",
-                    classId = activeStudent?.classId,
-                    className = activeStudent?.className ?: "Belum terdaftar di kelas",
-                    semester = activeStudent?.semester,
-                    cohortYear = activeStudent?.cohortYear,
-                    status = activeStudent?.status ?: AccountStatus.ACTIVE,
-                    badgeStatus = activeStudent?.badgeStatus ?: StudentBadgeStatus.NEUTRAL
-                ),
                 studentDestination = StudentDestination.DASHBOARD,
-                toastMessage = ToastMessage(
-                    message = "Masuk ke Panel Mahasiswa.",
-                    type = ToastType.INFO
-                )
+                toastMessage = msg
             )
         }
-        recordStudentDailyLogin(previewStudentId)
-    }
-
-    fun logout() {
         viewModelScope.launch {
             authRepository.logout()
             val restored = authRepository.restoreSession()
             _uiState.update {
                 it.copy(
-                    currentUser = null,
-                    authErrorMessage = null,
                     rememberedIdentifier = restored.rememberedIdentifier,
-                    rememberMeEnabled = restored.rememberMeEnabled,
-                    adminDestination = AdminDestination.DASHBOARD,
-                    studentDestination = StudentDestination.DASHBOARD,
-                    toastMessage = ToastMessage(
-                        message = "Anda telah keluar dari akun. Sesi login berakhir.",
-                        type = ToastType.SUCCESS
-                    )
+                    rememberMeEnabled = restored.rememberMeEnabled
                 )
             }
         }
     }
 
-    fun navigateAdmin(destination: AdminDestination) {
-        _uiState.update { it.copy(adminDestination = destination, loadState = ScreenLoadState.Ready) }
+    fun navigateAdmin(destination: AdminDestination, nowMillis: Long = System.currentTimeMillis()) {
+        navigateToRoute(destination.route, nowMillis)
     }
 
-    fun navigateStudent(destination: StudentDestination) {
-        _uiState.update { it.copy(studentDestination = destination, loadState = ScreenLoadState.Ready) }
+    fun navigateStudent(destination: StudentDestination, nowMillis: Long = System.currentTimeMillis()) {
+        navigateToRoute(destination.route, nowMillis)
     }
 
     fun triggerRefresh() {

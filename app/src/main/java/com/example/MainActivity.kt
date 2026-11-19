@@ -51,6 +51,7 @@ import com.example.ui.screens.admin.AdminStudyProgramsScreen
 import com.example.ui.screens.admin.AdminSubmissionsScreen
 import com.example.ui.screens.admin.AdminXpParticipationScreen
 import com.example.ui.screens.admin.RoleNotificationsScreen
+import com.example.ui.screens.auth.AdminLoginScreen
 import com.example.ui.screens.auth.ForceChangePasswordScreen
 import com.example.ui.screens.auth.LoginScreen
 import com.example.ui.screens.ranking.AdminRankingScreen
@@ -63,6 +64,7 @@ import com.example.ui.screens.student.StudentProfileScreen
 import com.example.ui.screens.student.StudentScheduleScreen
 import com.example.ui.screens.student.StudentSubmissionsScreen
 import com.example.ui.screens.student.StudentXpHistoryScreen
+import com.example.ui.state.AuthPortalMode
 import com.example.ui.state.AzrilViewModel
 import com.example.ui.theme.AzrilClasTheme
 import kotlinx.coroutines.delay
@@ -71,9 +73,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val requestedRoute = intent?.data?.path?.takeIf { it.isNotBlank() }
+            ?: intent?.getStringExtra("route")?.takeIf { it.isNotBlank() }
         setContent {
             AzrilClasTheme {
-                AzrilClasApp()
+                AzrilClasApp(initialRoute = requestedRoute)
             }
         }
     }
@@ -81,6 +85,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun AzrilClasApp(
+    initialRoute: String? = null,
     viewModel: AzrilViewModel = viewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -97,6 +102,26 @@ fun AzrilClasApp(
             !StreakReminderNotifier.hasNotificationPermission(context)
         ) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    LaunchedEffect(uiState.isRestoringSession, initialRoute) {
+        if (!uiState.isRestoringSession && !initialRoute.isNullOrBlank()) {
+            viewModel.navigateToRoute(initialRoute)
+        }
+    }
+
+    // Active session expiration watcher: terminates expired sessions and requires re-authentication
+    LaunchedEffect(user?.id, uiState.sessionExpiresAtMillis) {
+        val expiresAt = uiState.sessionExpiresAtMillis
+        if (user != null && expiresAt != null && expiresAt > 0L) {
+            val remaining = expiresAt - System.currentTimeMillis()
+            if (remaining <= 0L) {
+                viewModel.enforceSessionValidity()
+            } else {
+                delay(remaining.coerceAtMost(60_000L))
+                viewModel.enforceSessionValidity()
+            }
         }
     }
 
@@ -126,18 +151,30 @@ fun AzrilClasApp(
             }
         } else when (user?.role) {
             null -> {
-                LoginScreen(
-                    rememberedIdentifier = uiState.rememberedIdentifier,
-                    rememberMeDefault = uiState.rememberMeEnabled,
-                    authInProgress = uiState.authInProgress,
-                    authErrorMessage = uiState.authErrorMessage,
-                    isSupabaseConfigured = uiState.isSupabaseConfigured,
-                    onLogin = { identifier, password, rememberMe ->
-                        viewModel.loginWithCredentials(identifier, password, rememberMe)
-                    },
-                    onClearAuthError = { viewModel.clearAuthError() },
-                    onEnterAdminPreview = { viewModel.enterAdminPreview() }
-                )
+                when (uiState.authPortalMode) {
+                    AuthPortalMode.STUDENT_LOGIN -> LoginScreen(
+                        rememberedIdentifier = uiState.rememberedIdentifier,
+                        rememberMeDefault = uiState.rememberMeEnabled,
+                        authInProgress = uiState.authInProgress,
+                        authErrorMessage = uiState.authErrorMessage,
+                        isSupabaseConfigured = uiState.isSupabaseConfigured,
+                        onLogin = { identifier, password, rememberMe ->
+                            viewModel.loginWithCredentials(identifier, password, rememberMe)
+                        },
+                        onClearAuthError = { viewModel.clearAuthError() },
+                        onOpenAdminLogin = { viewModel.openAdminLoginPortal() }
+                    )
+                    AuthPortalMode.ADMIN_LOGIN -> AdminLoginScreen(
+                        authInProgress = uiState.authInProgress,
+                        authErrorMessage = uiState.authErrorMessage,
+                        isSupabaseConfigured = uiState.isSupabaseConfigured,
+                        onSubmitAdminLogin = { username, password, rememberMe ->
+                            viewModel.loginAdminWithCredentials(username, password, rememberMe)
+                        },
+                        onClearAuthError = { viewModel.clearAuthError() },
+                        onBackToStudentLogin = { viewModel.openStudentLoginPortal() }
+                    )
+                }
             }
             UserRole.ADMIN -> {
                 BackHandler(enabled = uiState.adminDestination != AdminDestination.DASHBOARD) {
@@ -152,7 +189,6 @@ fun AzrilClasApp(
                     onSelectDestination = { viewModel.navigateAdmin(it) },
                     onOpenNotifications = { viewModel.navigateAdmin(AdminDestination.NOTIFICATIONS) },
                     onRefresh = { viewModel.triggerRefresh() },
-                    onSwitchRolePreview = { viewModel.enterStudentPreview() },
                     onLogout = { viewModel.logout() }
                 ) { isExpanded ->
                     when (uiState.adminDestination) {
@@ -199,7 +235,6 @@ fun AzrilClasApp(
                         onSelectDestination = { viewModel.navigateStudent(it) },
                         onOpenNotifications = { viewModel.navigateStudent(StudentDestination.NOTIFICATIONS) },
                         onRefresh = { viewModel.triggerRefresh() },
-                        onSwitchRolePreview = { viewModel.enterAdminPreview() },
                         onLogout = { viewModel.logout() }
                     ) { isExpanded ->
                         when (uiState.studentDestination) {

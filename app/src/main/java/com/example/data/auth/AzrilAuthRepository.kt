@@ -177,7 +177,11 @@ class DataStoreAuthStorage(private val context: Context) : AuthKeyValueStore {
 }
 
 sealed interface AuthResult {
-    data class Success(val profile: UserProfile, val usingSupabase: Boolean) : AuthResult
+    data class Success(
+        val profile: UserProfile,
+        val usingSupabase: Boolean,
+        val sessionExpiresAt: Long = 0L
+    ) : AuthResult
     data class Failure(val message: String) : AuthResult
 }
 
@@ -193,7 +197,9 @@ data class RestoredSession(
     val savedHistoricalAttendanceRecords: List<HistoricalAttendanceRecord> = emptyList(),
     val savedStreaks: Map<String, StudentStreakState> = emptyMap(),
     val savedStreakNotifications: List<StreakNotificationLog> = emptyList(),
-    val isSupabaseConfigured: Boolean
+    val isSupabaseConfigured: Boolean,
+    val sessionExpired: Boolean = false,
+    val sessionExpiresAt: Long? = null
 )
 
 data class StoredAccountRecord(
@@ -262,6 +268,7 @@ class AzrilAuthRepository(
     companion object {
         private const val KEY_SESSION_TOKEN = "session_token"
         private const val KEY_SESSION_USER_ID = "session_user_id"
+        private const val KEY_SESSION_ROLE = "session_role"
         private const val KEY_SESSION_PROFILE_JSON = "session_profile_json"
         private const val KEY_SESSION_EXPIRES_AT = "session_expires_at"
         private const val KEY_REMEMBER_ME = "remember_me_enabled"
@@ -275,12 +282,26 @@ class AzrilAuthRepository(
         private const val KEY_STUDENT_STREAKS_JSON = "azril_student_streaks_v1"
         private const val KEY_STREAK_NOTIFS_JSON = "azril_streak_notifs_v1"
 
-        private const val REMEMBER_SESSION_DURATION_MS = 30L * 24 * 60 * 60 * 1000
+        const val PRIMARY_ADMIN_ID = "admin-primary-azril12v"
+        const val PRIMARY_ADMIN_USERNAME = "Azril12v"
+        private const val PRIMARY_ADMIN_EMAIL = "admin@azrilclas.ac.id"
+        // One-way salted PBKDF2-HMAC-SHA256 verifier (65,536 iterations) used ONLY when Supabase
+        // is not yet configured. Plaintext password is NEVER embedded in source code or storage.
+        private const val PRIMARY_ADMIN_VERIFIER_HASH =
+            "pbkdf2_sha256\$65536\$FO/pZfq2Hy2ECpIGssCCYw==\$RTgrE7uY6SqeKqa78yvtTY6byHMPwKHMPAT4n5KN9kA="
+
+        const val REMEMBER_SESSION_DURATION_MS = 30L * 24 * 60 * 60 * 1000
+        const val ADMIN_SESSION_DURATION_MS = 8L * 60 * 60 * 1000
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         fun internalAuthEmailForNim(nim: String): String {
             val safe = nim.trim().lowercase(Locale.US).filter { it.isLetterOrDigit() || it == '.' || it == '-' || it == '_' }
             return "nim_${safe}@auth.azrilclas.internal"
+        }
+
+        fun internalAuthEmailForAdmin(username: String): String {
+            val safe = username.trim().lowercase(Locale.US).filter { it.isLetterOrDigit() || it == '.' || it == '-' || it == '_' }
+            return "admin_${safe}@auth.azrilclas.internal"
         }
     }
 
@@ -296,12 +317,31 @@ class AzrilAuthRepository(
     private fun nowIso(): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(Date())
 
-    suspend fun restoreSession(): RestoredSession = withContext(Dispatchers.IO) {
+    private fun buildPrimaryAdminProfile(): UserProfile = UserProfile(
+        id = PRIMARY_ADMIN_ID,
+        fullName = "Administrator Utama Azril Clas",
+        email = PRIMARY_ADMIN_EMAIL,
+        username = PRIMARY_ADMIN_USERNAME,
+        role = UserRole.ADMIN,
+        status = AccountStatus.ACTIVE,
+        mustChangePassword = false
+    )
+
+    private suspend fun clearStoredSessionKeys() {
+        store.putString(KEY_SESSION_TOKEN, null)
+        store.putString(KEY_SESSION_USER_ID, null)
+        store.putString(KEY_SESSION_ROLE, null)
+        store.putString(KEY_SESSION_PROFILE_JSON, null)
+        store.putLong(KEY_SESSION_EXPIRES_AT, 0L)
+    }
+
+    suspend fun restoreSession(nowMillis: Long = System.currentTimeMillis()): RestoredSession = withContext(Dispatchers.IO) {
         val rememberMe = store.getBoolean(KEY_REMEMBER_ME, true)
         val rememberedIdentifier = store.getString(KEY_REMEMBERED_IDENTIFIER).orEmpty()
         val token = store.getString(KEY_SESSION_TOKEN)
+        val storedRole = store.getString(KEY_SESSION_ROLE)
         val expiresAt = store.getLong(KEY_SESSION_EXPIRES_AT, 0L)
-        val accounts = loadLocalAccounts()
+        val accounts = accountsMutex.withLock { loadLocalAccounts() }
         val registeredStudents = accounts.filter { it.role == UserRole.STUDENT }.map { it.toStudentRecord() }
         val savedClasses = loadLocalClasses()
         val savedAssignments = loadLocalAssignments()
@@ -311,15 +351,44 @@ class AzrilAuthRepository(
         val savedStreaks = loadLocalStudentStreaks()
         val savedStreakNotifications = loadLocalStreakNotifications()
 
-        val restoredProfile = if (rememberMe && !token.isNullOrBlank() && System.currentTimeMillis() < expiresAt) {
-            val userId = store.getString(KEY_SESSION_USER_ID)
-            val fromLocal = accounts.find { it.id == userId }?.toUserProfile()
-            fromLocal ?: deserializeProfile(store.getString(KEY_SESSION_PROFILE_JSON))
+        var sessionExpired = false
+        var activeExpiresAt: Long? = null
+        val restoredProfile = if (rememberMe && !token.isNullOrBlank()) {
+            if (expiresAt <= 0L || nowMillis >= expiresAt) {
+                sessionExpired = true
+                clearStoredSessionKeys()
+                null
+            } else {
+                val userId = store.getString(KEY_SESSION_USER_ID)
+                val fromLocal = accounts.find { it.id == userId }?.toUserProfile()
+                val candidate = fromLocal ?: deserializeProfile(store.getString(KEY_SESSION_PROFILE_JSON))
+                val roleMismatch = storedRole != null && candidate != null && !storedRole.equals(candidate.role.name, ignoreCase = true)
+
+                if (candidate == null || roleMismatch || candidate.status == AccountStatus.INACTIVE) {
+                    sessionExpired = true
+                    clearStoredSessionKeys()
+                    null
+                } else if (candidate.role == UserRole.ADMIN && isSupabaseConfigured() && !token.startsWith("azr_admin_sess_")) {
+                    // Re-verify Admin JWT & role with Supabase backend on session restore
+                    val verified = verifyAdminSessionWithSupabase(token)
+                    if (verified) {
+                        activeExpiresAt = expiresAt
+                        candidate
+                    } else {
+                        sessionExpired = true
+                        clearStoredSessionKeys()
+                        null
+                    }
+                } else {
+                    activeExpiresAt = expiresAt
+                    candidate
+                }
+            }
         } else {
-            store.putString(KEY_SESSION_TOKEN, null)
-            store.putString(KEY_SESSION_USER_ID, null)
-            store.putString(KEY_SESSION_PROFILE_JSON, null)
-            store.putLong(KEY_SESSION_EXPIRES_AT, 0L)
+            if (!token.isNullOrBlank() && expiresAt > 0L && nowMillis >= expiresAt) {
+                sessionExpired = true
+            }
+            clearStoredSessionKeys()
             null
         }
 
@@ -335,7 +404,9 @@ class AzrilAuthRepository(
             savedHistoricalAttendanceRecords = savedHistoricalAttendance,
             savedStreaks = savedStreaks,
             savedStreakNotifications = savedStreakNotifications,
-            isSupabaseConfigured = isSupabaseConfigured()
+            isSupabaseConfigured = isSupabaseConfigured(),
+            sessionExpired = sessionExpired,
+            sessionExpiresAt = activeExpiresAt
         )
     }
 
@@ -679,24 +750,113 @@ class AzrilAuthRepository(
     }
 
     /**
+     * Dedicated Administrator login (Username + Password).
+     * - When Supabase is configured: authenticates strictly via Supabase Edge Function
+     *   `admin-auth-login` (or `resolve_admin_login_email` + GoTrue + `verify_admin_session`),
+     *   verifying `role = 'admin'` on the backend. NEVER falls back to local verifier.
+     * - When Supabase is not configured: validates against salted PBKDF2-HMAC-SHA256 verifier
+     *   (never plaintext in source code or storage).
+     * - Student accounts are ALWAYS rejected on this portal.
+     */
+    suspend fun loginAdmin(
+        username: String,
+        password: String,
+        rememberMe: Boolean = false,
+        nowMillis: Long = System.currentTimeMillis()
+    ): AuthResult = withContext(Dispatchers.IO) {
+        val cleanUsername = username.trim()
+        if (cleanUsername.isEmpty()) return@withContext AuthResult.Failure("Username administrator wajib diisi.")
+        if (password.isEmpty()) return@withContext AuthResult.Failure("Password administrator wajib diisi.")
+
+        if (isSupabaseConfigured()) {
+            return@withContext loginAdminViaSupabase(
+                username = cleanUsername,
+                password = password,
+                rememberMe = rememberMe,
+                nowMillis = nowMillis
+            )
+        }
+
+        // Offline/local fallback: reject student accounts attempting Admin portal login
+        val localAccounts = accountsMutex.withLock { loadLocalAccounts() }
+        val matchingStudent = localAccounts.find {
+            it.role == UserRole.STUDENT && (
+                it.nim.equals(cleanUsername, ignoreCase = true) ||
+                    it.username.equals(cleanUsername, ignoreCase = true) ||
+                    it.email.equals(cleanUsername, ignoreCase = true)
+                )
+        }
+        if (matchingStudent != null) {
+            return@withContext AuthResult.Failure("Akses ditolak: akun mahasiswa tidak memiliki hak akses Administrator.")
+        }
+
+        // Verify primary admin username (exact case-sensitive username) & salted PBKDF2 verifier
+        val isPrimaryAdmin = cleanUsername == PRIMARY_ADMIN_USERNAME &&
+            PasswordHasher.verifyPassword(password, PRIMARY_ADMIN_VERIFIER_HASH)
+
+        val localAdmin = if (!isPrimaryAdmin) {
+            localAccounts.find {
+                it.role == UserRole.ADMIN &&
+                    it.username.equals(cleanUsername, ignoreCase = true) &&
+                    PasswordHasher.verifyPassword(password, it.passwordHash)
+            }
+        } else null
+
+        if (!isPrimaryAdmin && localAdmin == null) {
+            return@withContext AuthResult.Failure("Username atau password administrator tidak valid.")
+        }
+        if (localAdmin != null && localAdmin.accountStatus == AccountStatus.INACTIVE) {
+            return@withContext AuthResult.Failure("Akun administrator sedang dinonaktifkan.")
+        }
+
+        val adminProfile = localAdmin?.toUserProfile() ?: buildPrimaryAdminProfile()
+        val expiresAt = nowMillis + ADMIN_SESSION_DURATION_MS
+        persistSessionState(
+            profile = adminProfile,
+            token = "azr_admin_sess_${UUID.randomUUID()}",
+            identifier = adminProfile.username ?: cleanUsername,
+            rememberMe = rememberMe,
+            expiresAtMillis = expiresAt
+        )
+        AuthResult.Success(
+            profile = adminProfile,
+            usingSupabase = false,
+            sessionExpiresAt = expiresAt
+        )
+    }
+
+    /**
      * Student login uses NIM (unique) + Password provisioned by Admin.
-     * Also supports username/email resolution for Admin or legacy accounts.
+     * Strictly separates Student sessions from Admin accounts.
      */
     suspend fun login(
         identifier: String,
         password: String,
-        rememberMe: Boolean
+        rememberMe: Boolean,
+        nowMillis: Long = System.currentTimeMillis()
     ): AuthResult = withContext(Dispatchers.IO) {
         val cleanId = identifier.trim()
         val cleanLower = cleanId.lowercase(Locale.US)
         if (cleanId.isEmpty()) return@withContext AuthResult.Failure("NIM wajib diisi.")
         if (password.isEmpty()) return@withContext AuthResult.Failure("Kata sandi wajib diisi.")
 
+        // Strictly prevent Administrator accounts from logging in via the Student login screen
+        if (cleanId.equals(PRIMARY_ADMIN_USERNAME, ignoreCase = true) ||
+            cleanLower == PRIMARY_ADMIN_EMAIL.lowercase(Locale.US)
+        ) {
+            return@withContext AuthResult.Failure("Akun Administrator harus masuk melalui halaman Login Admin.")
+        }
+
         if (isSupabaseConfigured()) {
-            val remoteResult = loginViaSupabase(cleanId, password, rememberMe)
-            if (remoteResult is AuthResult.Success) return@withContext remoteResult
-            // If Supabase returns failure, check if an Admin-created local account exists before returning remote error
-            val localAccounts = loadLocalAccounts()
+            val remoteResult = loginViaSupabase(cleanId, password, rememberMe, nowMillis)
+            if (remoteResult is AuthResult.Success) {
+                if (remoteResult.profile.role == UserRole.ADMIN) {
+                    logout()
+                    return@withContext AuthResult.Failure("Akun Administrator harus masuk melalui halaman Login Admin.")
+                }
+                return@withContext remoteResult
+            }
+            val localAccounts = accountsMutex.withLock { loadLocalAccounts() }
             val localMatch = localAccounts.find {
                 it.nim.equals(cleanId, ignoreCase = true) ||
                     it.username.equals(cleanLower, ignoreCase = true) ||
@@ -712,6 +872,10 @@ class AzrilAuthRepository(
                 it.email.equals(cleanLower, ignoreCase = true)
         } ?: return@withContext AuthResult.Failure("NIM tidak terdaftar. Hubungi Admin untuk pembuatan akun mahasiswa.")
 
+        if (matched.role == UserRole.ADMIN) {
+            return@withContext AuthResult.Failure("Akun Administrator harus masuk melalui halaman Login Admin.")
+        }
+
         if (matched.accountStatus == AccountStatus.INACTIVE) {
             return@withContext AuthResult.Failure("Akun mahasiswa ini sedang dinonaktifkan oleh Admin.")
         }
@@ -721,18 +885,27 @@ class AzrilAuthRepository(
         }
 
         val profile = matched.toUserProfile()
+        val expiresAt = nowMillis + REMEMBER_SESSION_DURATION_MS
         persistSessionState(
             profile = profile,
             token = "azr_sess_${UUID.randomUUID()}",
             identifier = matched.nim.ifBlank { cleanId },
-            rememberMe = rememberMe
+            rememberMe = rememberMe,
+            expiresAtMillis = expiresAt
         )
-        AuthResult.Success(profile = profile, usingSupabase = false)
+        AuthResult.Success(
+            profile = profile,
+            usingSupabase = false,
+            sessionExpiresAt = expiresAt
+        )
     }
 
     suspend fun logout() = withContext(Dispatchers.IO) {
         val token = store.getString(KEY_SESSION_TOKEN)
-        if (isSupabaseConfigured() && !token.isNullOrBlank()) {
+        val storedRole = store.getString(KEY_SESSION_ROLE)
+        if (isSupabaseConfigured() && !token.isNullOrBlank() &&
+            !token.startsWith("azr_sess_") && !token.startsWith("azr_admin_sess_")
+        ) {
             runCatching {
                 val req = Request.Builder()
                     .url("${supabaseUrl.trimEnd('/')}/auth/v1/logout")
@@ -743,11 +916,9 @@ class AzrilAuthRepository(
                 httpClient.newCall(req).execute().close()
             }
         }
-        store.putString(KEY_SESSION_TOKEN, null)
-        store.putString(KEY_SESSION_USER_ID, null)
-        store.putString(KEY_SESSION_PROFILE_JSON, null)
-        store.putLong(KEY_SESSION_EXPIRES_AT, 0L)
-        if (!store.getBoolean(KEY_REMEMBER_ME, false)) {
+        clearStoredSessionKeys()
+        // Never leave admin credentials in remembered student identifier
+        if (storedRole == UserRole.ADMIN.name || !store.getBoolean(KEY_REMEMBER_ME, false)) {
             store.putString(KEY_REMEMBERED_IDENTIFIER, null)
         }
     }
@@ -1030,28 +1201,166 @@ class AzrilAuthRepository(
         profile: UserProfile,
         token: String,
         identifier: String,
-        rememberMe: Boolean
+        rememberMe: Boolean,
+        expiresAtMillis: Long = System.currentTimeMillis() +
+            if (profile.role == UserRole.ADMIN) ADMIN_SESSION_DURATION_MS else REMEMBER_SESSION_DURATION_MS
     ) {
         store.putBoolean(KEY_REMEMBER_ME, rememberMe)
         if (rememberMe) {
-            store.putString(KEY_REMEMBERED_IDENTIFIER, identifier)
+            if (profile.role == UserRole.STUDENT) {
+                store.putString(KEY_REMEMBERED_IDENTIFIER, identifier)
+            }
             store.putString(KEY_SESSION_TOKEN, token)
             store.putString(KEY_SESSION_USER_ID, profile.id)
+            store.putString(KEY_SESSION_ROLE, profile.role.name)
             store.putString(KEY_SESSION_PROFILE_JSON, serializeProfile(profile))
-            store.putLong(KEY_SESSION_EXPIRES_AT, System.currentTimeMillis() + REMEMBER_SESSION_DURATION_MS)
+            store.putLong(KEY_SESSION_EXPIRES_AT, expiresAtMillis)
         } else {
             store.putString(KEY_REMEMBERED_IDENTIFIER, null)
-            store.putString(KEY_SESSION_TOKEN, null)
-            store.putString(KEY_SESSION_USER_ID, null)
-            store.putString(KEY_SESSION_PROFILE_JSON, null)
-            store.putLong(KEY_SESSION_EXPIRES_AT, 0L)
+            clearStoredSessionKeys()
         }
+    }
+
+    private suspend fun loginAdminViaSupabase(
+        username: String,
+        password: String,
+        rememberMe: Boolean,
+        nowMillis: Long
+    ): AuthResult {
+        return try {
+            val base = supabaseUrl.trimEnd('/')
+
+            // 1. Primary path: dedicated backend Edge Function `admin-auth-login`
+            val edgePayload = JSONObject().apply {
+                put("action", "login")
+                put("username", username)
+                put("password", password)
+            }
+            val edgeReq = Request.Builder()
+                .url("$base/functions/v1/admin-auth-login")
+                .post(edgePayload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Authorization", "Bearer ${supabaseAnonKey.trim()}")
+                .addHeader("Content-Type", "application/json")
+                .build()
+
+            httpClient.newCall(edgeReq).execute().use { resp ->
+                val rawBody = resp.body?.string().orEmpty()
+                if (resp.isSuccessful) {
+                    val json = JSONObject(rawBody)
+                    val accessToken = json.optString("access_token")
+                    val profJson = json.optJSONObject("profile")
+                    val roleStr = profJson?.optString("role", "")
+                    if (accessToken.isBlank() || profJson == null || !roleStr.equals("admin", ignoreCase = true)) {
+                        return AuthResult.Failure("Verifikasi role administrator dari backend gagal.")
+                    }
+                    val adminProfile = UserProfile(
+                        id = profJson.optString("id"),
+                        fullName = profJson.optString("full_name", "Administrator Azril Clas"),
+                        email = profJson.optString("email", PRIMARY_ADMIN_EMAIL),
+                        username = profJson.optString("username", username),
+                        role = UserRole.ADMIN,
+                        status = AccountStatus.ACTIVE,
+                        mustChangePassword = false,
+                        createdAt = profJson.optString("created_at").ifBlank { null }
+                    )
+                    val serverExpiresAtSec = json.optLong("expires_at", 0L)
+                    val expiresAt = if (serverExpiresAtSec > 0L) {
+                        minOf(serverExpiresAtSec * 1000L, nowMillis + ADMIN_SESSION_DURATION_MS)
+                    } else {
+                        nowMillis + ADMIN_SESSION_DURATION_MS
+                    }
+                    persistSessionState(adminProfile, accessToken, username, rememberMe, expiresAt)
+                    return AuthResult.Success(profile = adminProfile, usingSupabase = true, sessionExpiresAt = expiresAt)
+                } else if (resp.code != 404) {
+                    val errMsg = runCatching { JSONObject(rawBody).optString("error") }.getOrNull()
+                    return AuthResult.Failure(
+                        errMsg?.takeIf { it.isNotBlank() } ?: "Username atau password administrator tidak valid."
+                    )
+                }
+            }
+
+            // 2. Fallback path when Edge Function is not yet deployed: secure DB RPC `resolve_admin_login_email`
+            val resolvedEmail = resolveAdminEmailFromSupabase(base, username)
+                ?: return AuthResult.Failure("Username atau password administrator tidak valid.")
+
+            val authPayload = JSONObject().apply {
+                put("email", resolvedEmail)
+                put("password", password)
+            }
+            val authReq = Request.Builder()
+                .url("$base/auth/v1/token?grant_type=password")
+                .post(authPayload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Content-Type", "application/json")
+                .build()
+
+            httpClient.newCall(authReq).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return AuthResult.Failure("Username atau password administrator tidak valid.")
+                }
+                val json = JSONObject(body)
+                val accessToken = json.optString("access_token")
+                val userId = json.optJSONObject("user")?.optString("id").orEmpty()
+                if (accessToken.isBlank() || userId.isBlank()) {
+                    return AuthResult.Failure("Token sesi administrator tidak valid.")
+                }
+
+                // Mandatory backend verification via verify_admin_session() + profiles.role == 'admin'
+                val backendVerified = verifyAdminSessionWithSupabase(accessToken)
+                val profile = fetchSupabaseProfile(base, accessToken, userId, resolvedEmail)
+                if (!backendVerified || profile == null || profile.role != UserRole.ADMIN || profile.status != AccountStatus.ACTIVE) {
+                    return AuthResult.Failure("Akses ditolak: akun ini tidak terverifikasi sebagai Administrator.")
+                }
+
+                val expiresInSec = json.optLong("expires_in", 3600L)
+                val expiresAt = minOf(nowMillis + expiresInSec * 1000L, nowMillis + ADMIN_SESSION_DURATION_MS)
+                persistSessionState(profile, accessToken, username, rememberMe, expiresAt)
+                AuthResult.Success(profile = profile, usingSupabase = true, sessionExpiresAt = expiresAt)
+            }
+        } catch (e: Exception) {
+            AuthResult.Failure("Gagal terhubung ke Supabase Auth: ${e.localizedMessage ?: "kesalahan jaringan"}")
+        }
+    }
+
+    private fun resolveAdminEmailFromSupabase(baseUrl: String, username: String): String? {
+        val body = JSONObject().apply { put("p_username", username) }
+        val req = Request.Builder()
+            .url("$baseUrl/rest/v1/rpc/resolve_admin_login_email")
+            .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .addHeader("apikey", supabaseAnonKey.trim())
+            .addHeader("Content-Type", "application/json")
+            .build()
+        return httpClient.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            resp.body?.string()?.trim()?.removeSurrounding("\"")?.takeIf { it.contains("@") }
+        }
+    }
+
+    suspend fun verifyAdminSessionWithSupabase(jwt: String): Boolean = withContext(Dispatchers.IO) {
+        if (!isSupabaseConfigured() || jwt.isBlank()) return@withContext false
+        runCatching {
+            val base = supabaseUrl.trimEnd('/')
+            val req = Request.Builder()
+                .url("$base/rest/v1/rpc/verify_admin_session")
+                .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Authorization", "Bearer $jwt")
+                .addHeader("Content-Type", "application/json")
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use false
+                resp.body?.string()?.trim().equals("true", ignoreCase = true)
+            }
+        }.getOrDefault(false)
     }
 
     private suspend fun loginViaSupabase(
         identifier: String,
         password: String,
-        rememberMe: Boolean
+        rememberMe: Boolean,
+        nowMillis: Long
     ): AuthResult {
         return try {
             val base = supabaseUrl.trimEnd('/')
@@ -1085,8 +1394,16 @@ class AzrilAuthRepository(
                 val profile = fetchSupabaseProfile(base, accessToken, userId, resolvedEmail)
                     ?: return AuthResult.Failure("Profil akun tidak ditemukan di tabel profiles.")
 
-                persistSessionState(profile, accessToken, identifier, rememberMe)
-                AuthResult.Success(profile = profile, usingSupabase = true)
+                if (profile.role == UserRole.ADMIN) {
+                    return AuthResult.Failure("Akun Administrator harus masuk melalui halaman Login Admin.")
+                }
+                if (profile.status == AccountStatus.INACTIVE) {
+                    return AuthResult.Failure("Akun mahasiswa ini sedang dinonaktifkan oleh Admin.")
+                }
+
+                val expiresAt = nowMillis + REMEMBER_SESSION_DURATION_MS
+                persistSessionState(profile, accessToken, identifier, rememberMe, expiresAt)
+                AuthResult.Success(profile = profile, usingSupabase = true, sessionExpiresAt = expiresAt)
             }
         } catch (e: Exception) {
             AuthResult.Failure("Gagal terhubung ke Supabase Auth: ${e.localizedMessage ?: "kesalahan jaringan"}")

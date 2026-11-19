@@ -95,7 +95,7 @@ fun LoginScreen(
     isSupabaseConfigured: Boolean,
     onLogin: (identifier: String, password: String, rememberMe: Boolean) -> Unit,
     onClearAuthError: () -> Unit,
-    onEnterAdminPreview: () -> Unit
+    onOpenAdminLogin: () -> Unit
 ) {
     var loginIdentifier by rememberSaveable { mutableStateOf(rememberedIdentifier) }
     var loginPassword by rememberSaveable { mutableStateOf("") }
@@ -229,7 +229,7 @@ fun LoginScreen(
                         rememberMe = rememberMe,
                         onRememberMeChange = { rememberMe = it },
                         onSubmitLogin = ::submitLogin,
-                        onEnterAdminPreview = onEnterAdminPreview,
+                        onOpenAdminLogin = onOpenAdminLogin,
                         modifier = Modifier.widthIn(max = 470.dp)
                     )
                 }
@@ -288,7 +288,7 @@ fun LoginScreen(
                     rememberMe = rememberMe,
                     onRememberMeChange = { rememberMe = it },
                     onSubmitLogin = ::submitLogin,
-                    onEnterAdminPreview = onEnterAdminPreview,
+                    onOpenAdminLogin = onOpenAdminLogin,
                     modifier = Modifier.widthIn(max = 520.dp)
                 )
             }
@@ -312,7 +312,7 @@ private fun LoginCardStack(
     rememberMe: Boolean,
     onRememberMeChange: (Boolean) -> Unit,
     onSubmitLogin: () -> Unit,
-    onEnterAdminPreview: () -> Unit,
+    onOpenAdminLogin: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val fieldColors = OutlinedTextFieldDefaults.colors(
@@ -485,24 +485,24 @@ private fun LoginCardStack(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("Panel Administrator", style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold), color = InkText)
+                    Text("Login Administrator", style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold), color = InkText)
                     Text(
-                        "Kelola data mahasiswa, password, status AFK/Netral/Lulus, penugasan, dan peringkat.",
+                        "Masuk khusus Administrator dengan verifikasi username dan password resmi.",
                         style = MaterialTheme.typography.labelSmall,
                         color = InkMuted
                     )
                 }
                 Spacer(modifier = Modifier.width(12.dp))
                 Button(
-                    onClick = onEnterAdminPreview,
+                    onClick = onOpenAdminLogin,
                     shape = RoundedCornerShape(999.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
-                    modifier = Modifier.testTag("preview_admin_button")
+                    modifier = Modifier.testTag("open_admin_login_button")
                 ) {
                     Icon(Icons.Rounded.AdminPanelSettings, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Admin", style = MaterialTheme.typography.labelLarge)
+                    Text("Login Admin", style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
