@@ -52,13 +52,17 @@ import com.example.ui.model.Assignment
 import com.example.ui.model.AttendanceSessionState
 import com.example.ui.model.AttendanceStatus
 import com.example.ui.model.ScreenLoadState
+import com.example.ui.model.StudentBadgeStatus
 import com.example.ui.navigation.StudentDestination
 import com.example.ui.screens.ranking.StudentRankingDashboardWidget
 import com.example.ui.state.AzrilUiState
+import com.example.ui.state.AzrilViewModel
 import com.example.ui.theme.Amber50
 import com.example.ui.theme.Amber700
 import com.example.ui.theme.BorderMint
 import com.example.ui.theme.DarkCardBg
+import com.example.ui.theme.Emerald50
+import com.example.ui.theme.Emerald700
 import com.example.ui.theme.InkMuted
 import com.example.ui.theme.InkSubtle
 import com.example.ui.theme.InkText
@@ -69,7 +73,9 @@ import com.example.ui.theme.LimePrimary
 import com.example.ui.theme.PureWhite
 import com.example.ui.theme.Rose50
 import com.example.ui.theme.Rose600
+import com.example.ui.theme.Rose700
 import com.example.ui.theme.SoftMintBg
+import com.example.ui.theme.SurfaceMuted
 
 @Composable
 fun StudentDashboardScreen(
@@ -85,7 +91,11 @@ fun StudentDashboardScreen(
     }
 
     val user = uiState.currentUser ?: return
-    val activeAssignments = uiState.assignments.filter { it.isActive }
+    val myStudentRecord = uiState.students.find { it.id == user.id }
+    val myBadgeStatus = myStudentRecord?.badgeStatus ?: user.badgeStatus
+    val activeAssignments = uiState.assignments.filter {
+        AzrilViewModel.isAssignmentForStudent(it, user, myStudentRecord)
+    }
     val mySubmissions = uiState.submissions.filter { it.studentId == user.id }
     val pendingAssignments = activeAssignments.filter { a -> mySubmissions.none { it.assignmentId == a.id } }
     val openSessions = uiState.attendanceSessions.filter { it.state == AttendanceSessionState.OPEN }
@@ -112,7 +122,7 @@ fun StudentDashboardScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Text(
-                    text = "Halo, selamat belajar 👋",
+                    text = "Halo, selamat belajar",
                     style = MaterialTheme.typography.bodyMedium,
                     color = InkSubtle
                 )
@@ -137,13 +147,19 @@ fun StudentDashboardScreen(
                         containerColor = LightGreenSecondary,
                         contentColor = LimeInk
                     )
-                    user.className?.takeIf { it.isNotBlank() }?.let { cls ->
-                        AzrilStatusBadge(
-                            text = cls,
-                            containerColor = PureWhite,
-                            contentColor = InkText
-                        )
-                    }
+                    AzrilStatusBadge(
+                        text = myBadgeStatus.label,
+                        containerColor = when (myBadgeStatus) {
+                            StudentBadgeStatus.AFK -> Rose50
+                            StudentBadgeStatus.LULUS -> Emerald50
+                            StudentBadgeStatus.NEUTRAL -> SurfaceMuted
+                        },
+                        contentColor = when (myBadgeStatus) {
+                            StudentBadgeStatus.AFK -> Rose700
+                            StudentBadgeStatus.LULUS -> Emerald700
+                            StudentBadgeStatus.NEUTRAL -> InkMuted
+                        }
+                    )
                 }
             }
             Spacer(modifier = Modifier.width(12.dp))
@@ -163,7 +179,13 @@ fun StudentDashboardScreen(
             }
         }
 
-        // 2. Signature Black Card Ranking Widget (#171A17 + Lime Green #B5D45D)
+        // 2. Top Login Streak & XP Hero Card (Flame, Streak Days, WIB Status, 7-Day History, Total/Monthly XP)
+        StudentStreakAndXpHeroCard(
+            uiState = uiState,
+            onOpenXpHistory = { onNavigate(StudentDestination.XP_HISTORY) }
+        )
+
+        // 3. Signature Black Card Ranking Widget (#171A17 + Lime Green #B5D45D)
         StudentRankingDashboardWidget(
             uiState = uiState,
             onOpenRanking = { onNavigate(StudentDestination.RANKING) }
@@ -300,6 +322,7 @@ private fun StudentUpcomingDeadlinesCard(
         } else {
             pendingAssignments.take(3).forEachIndexed { idx, task ->
                 if (idx > 0) HorizontalDivider(color = BorderMint.copy(alpha = 0.6f), modifier = Modifier.padding(vertical = 10.dp))
+                val overdue = task.isDeadlinePassed()
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -309,10 +332,14 @@ private fun StudentUpcomingDeadlinesCard(
                 ) {
                     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text(task.title, style = MaterialTheme.typography.titleSmall, color = InkText, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text("${task.className} • Tenggat: ${task.deadline}", style = MaterialTheme.typography.bodySmall, color = InkSubtle)
+                        Text("${task.targetSummaryLabel()} • Tenggat: ${task.deadline}", style = MaterialTheme.typography.bodySmall, color = if (overdue) Rose700 else InkSubtle)
                     }
                     Spacer(modifier = Modifier.width(8.dp))
-                    AzrilStatusBadge(task.submissionMethod.label, Amber50, Amber700)
+                    AzrilStatusBadge(
+                        text = if (overdue) "Terlewat" else task.submissionMethod.label,
+                        containerColor = if (overdue) Rose50 else Amber50,
+                        contentColor = if (overdue) Rose700 else Amber700
+                    )
                 }
             }
         }
@@ -402,10 +429,10 @@ private fun StudentRecentActivityCard(
                 Text("Aktivitas Terbaru", style = MaterialTheme.typography.titleMedium, color = InkText)
             }
             Text(
-                text = "Nilai & Feedback",
+                text = "Riwayat XP",
                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
                 color = LimeDeep,
-                modifier = Modifier.clickable { onNavigate(StudentDestination.GRADES_FEEDBACK) }
+                modifier = Modifier.clickable { onNavigate(StudentDestination.XP_HISTORY) }
             )
         }
         Spacer(modifier = Modifier.height(14.dp))
@@ -424,7 +451,7 @@ private fun StudentRecentActivityCard(
                 ) {
                     Icon(Icons.Rounded.EventAvailable, contentDescription = null, tint = LimeDeep)
                     Text(
-                        text = "Belum ada aktivitas akademik tercatat. Mulai isi absensi atau kumpulkan tugas untuk melihat aktivitas dan perolehan poin Anda di sini.",
+                        text = "Belum ada aktivitas akademik tercatat. Mulai isi absensi atau kumpulkan tugas untuk melihat aktivitas dan perolehan XP Anda di sini.",
                         style = MaterialTheme.typography.bodySmall,
                         color = InkMuted
                     )
@@ -439,11 +466,11 @@ private fun StudentRecentActivityCard(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(tx.description, style = MaterialTheme.typography.titleSmall, color = InkText)
+                        Text(tx.activityTitle.ifBlank { tx.description }, style = MaterialTheme.typography.titleSmall, color = InkText)
                         Text("${tx.sourceType.label} • ${tx.updatedAt}", style = MaterialTheme.typography.bodySmall, color = InkSubtle)
                     }
                     AzrilStatusBadge(
-                        text = if (tx.points >= 0) "+${tx.points} pts" else "${tx.points} pts",
+                        text = if (tx.points >= 0) "+${tx.points} XP" else "${tx.points} XP",
                         containerColor = LightGreenSecondary,
                         contentColor = LimeInk
                     )

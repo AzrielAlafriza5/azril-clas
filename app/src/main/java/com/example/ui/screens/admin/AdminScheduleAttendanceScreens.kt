@@ -367,6 +367,7 @@ fun AdminAttendanceScreen(
     isExpanded: Boolean
 ) {
     var showOpenDialog by rememberSaveable { mutableStateOf(false) }
+    var showManualRecordDialog by rememberSaveable { mutableStateOf(false) }
     var qrPreviewSession by remember { mutableStateOf<AttendanceSession?>(null) }
     var correctingRecord by remember { mutableStateOf<AttendanceRecord?>(null) }
 
@@ -379,16 +380,27 @@ fun AdminAttendanceScreen(
     ) {
         AzrilPageHeader(
             title = "Sistem Absensi Berbatas Waktu",
-            subtitle = "Buka sesi daring atau luring dengan batas waktu ketat, token QR dinamis, dan audit koreksi kehadiran.",
+            subtitle = "Hadir +20 XP • Izin ke-1 & ke-2/semester +10 XP • Izin ke-3+ & Alfa 0 XP. Perubahan status otomatis menyinkronkan XP.",
             action = {
-                Button(
-                    onClick = { showOpenDialog = true },
-                    shape = RoundedCornerShape(999.dp),
-                    modifier = Modifier.testTag("open_attendance_session_button")
-                ) {
-                    Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Buka Sesi")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (uiState.attendanceSessions.isNotEmpty() && uiState.students.isNotEmpty()) {
+                        OutlinedButton(
+                            onClick = { showManualRecordDialog = true },
+                            shape = RoundedCornerShape(999.dp),
+                            modifier = Modifier.testTag("admin_record_attendance_button")
+                        ) {
+                            Text("Catat Absen")
+                        }
+                    }
+                    Button(
+                        onClick = { showOpenDialog = true },
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier.testTag("open_attendance_session_button")
+                    ) {
+                        Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Buka Sesi")
+                    }
                 }
             }
         )
@@ -454,19 +466,49 @@ fun AdminAttendanceScreen(
             }
         }
 
+        // Attendance Records & Individual Semester Izin Quota
+        AzrilCard {
+            Text("Kuota Izin Semester (${uiState.settings.activeSemesterKey})", style = MaterialTheme.typography.titleMedium, color = Navy900)
+            Spacer(modifier = Modifier.height(6.dp))
+            if (uiState.students.isEmpty()) {
+                Text("Belum ada mahasiswa terdaftar.", style = MaterialTheme.typography.bodySmall, color = Slate500)
+            } else {
+                uiState.students.forEachIndexed { idx, stu ->
+                    if (idx > 0) HorizontalDivider(color = BorderLight, modifier = Modifier.padding(vertical = 6.dp))
+                    val quota = viewModel.getStudentIzinQuota(stu.id)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("${stu.fullName} (${stu.nim})", style = MaterialTheme.typography.titleSmall, color = Navy900)
+                            Text("Izin terpakai: ${quota.usedIzinCount}x • Sisa kuota izin ber-XP: ${quota.remainingPaidIzin}/${quota.maxPaidIzin}", style = MaterialTheme.typography.bodySmall, color = Slate600)
+                        }
+                        AzrilStatusBadge(
+                            text = if (quota.remainingPaidIzin > 0) "Sisa ${quota.remainingPaidIzin}/${quota.maxPaidIzin}" else "Kuota XP Habis",
+                            containerColor = if (quota.remainingPaidIzin > 0) Emerald50 else Amber50,
+                            contentColor = if (quota.remainingPaidIzin > 0) Emerald700 else Amber700
+                        )
+                    }
+                }
+            }
+        }
+
         // Attendance Records & Audit Correction
         AzrilCard {
             Text("Rekap & Koreksi Kehadiran", style = MaterialTheme.typography.titleMedium, color = Navy900)
             Spacer(modifier = Modifier.height(6.dp))
             if (uiState.attendanceRecords.isEmpty()) {
                 Text(
-                    "Belum ada catatan kehadiran mahasiswa. Setiap perubahan status oleh Admin wajib menyertakan alasan untuk riwayat audit.",
+                    "Belum ada catatan kehadiran mahasiswa. Setiap perubahan status oleh Admin wajib menyertakan alasan dan otomatis menghitung ulang XP.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Slate500
                 )
             } else {
                 uiState.attendanceRecords.forEach { rec ->
                     HorizontalDivider(color = BorderLight, modifier = Modifier.padding(vertical = 8.dp))
+                    val quota = viewModel.getStudentIzinQuota(rec.studentId)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -474,7 +516,7 @@ fun AdminAttendanceScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("${rec.studentName} (${rec.studentNim})", style = MaterialTheme.typography.titleSmall, color = Navy900)
-                            Text("${rec.meetingTitle} • ${rec.recordedAt}", style = MaterialTheme.typography.bodySmall, color = Slate500)
+                            Text("${rec.meetingTitle} • ${rec.recordedAt} • Izin sem ini: ${quota.usedIzinCount}x (Sisa ${quota.remainingPaidIzin}/${quota.maxPaidIzin})", style = MaterialTheme.typography.bodySmall, color = Slate500)
                             rec.correctionReason?.let {
                                 Text("Alasan koreksi: $it", style = MaterialTheme.typography.labelSmall, color = Amber700)
                             }
@@ -487,6 +529,19 @@ fun AdminAttendanceScreen(
                 }
             }
         }
+    }
+
+    if (showManualRecordDialog) {
+        AdminRecordAttendanceDialog(
+            sessions = uiState.attendanceSessions,
+            students = uiState.students,
+            onDismiss = { showManualRecordDialog = false },
+            onSave = { sessionId, studentId, status, note ->
+                val err = viewModel.adminRecordStudentAttendance(sessionId, studentId, status, note)
+                if (err == null) showManualRecordDialog = false
+                err
+            }
+        )
     }
 
     if (showOpenDialog) {
@@ -674,6 +729,66 @@ private fun AttendanceCorrectionDialog(
         confirmButton = {
             Button(onClick = { error = onSave(status, reason) }, shape = RoundedCornerShape(999.dp)) {
                 Text("Simpan Koreksi")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Batal") } }
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AdminRecordAttendanceDialog(
+    sessions: List<AttendanceSession>,
+    students: List<com.example.ui.model.StudentRecord>,
+    onDismiss: () -> Unit,
+    onSave: (String, String, AttendanceStatus, String) -> String?
+) {
+    var sessionId by rememberSaveable { mutableStateOf(sessions.firstOrNull()?.id ?: "") }
+    var studentId by rememberSaveable { mutableStateOf(students.firstOrNull()?.id ?: "") }
+    var status by rememberSaveable { mutableStateOf(AttendanceStatus.HADIR) }
+    var note by rememberSaveable { mutableStateOf("") }
+    var error by rememberSaveable { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text("Catat Absensi Mahasiswa", style = MaterialTheme.typography.titleLarge, color = Navy900) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Pilih Sesi", style = MaterialTheme.typography.labelMedium, color = Slate600)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    sessions.forEach { s ->
+                        FilterChip(selected = sessionId == s.id, onClick = { sessionId = s.id; error = null }, label = { Text(s.meetingTitle) })
+                    }
+                }
+                Text("Pilih Mahasiswa", style = MaterialTheme.typography.labelMedium, color = Slate600)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    students.forEach { stu ->
+                        FilterChip(selected = studentId == stu.id, onClick = { studentId = stu.id; error = null }, label = { Text(stu.fullName) })
+                    }
+                }
+                Text("Status Kehadiran (Hadir +20 XP, Izin ke-1/2 +10 XP, Izin ke-3+ & Alfa 0 XP)", style = MaterialTheme.typography.labelMedium, color = Slate600)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    AttendanceStatus.entries.forEach { st ->
+                        FilterChip(selected = status == st, onClick = { status = st; error = null }, label = { Text(st.label) })
+                    }
+                }
+                OutlinedTextField(
+                    value = note,
+                    onValueChange = { note = it },
+                    label = { Text("Keterangan / Alasan (Opsional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose600) }
+            }
+        },
+        confirmButton = {
+            Button(onClick = { error = onSave(sessionId, studentId, status, note) }, shape = RoundedCornerShape(999.dp)) {
+                Text("Simpan Absensi")
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Batal") } }

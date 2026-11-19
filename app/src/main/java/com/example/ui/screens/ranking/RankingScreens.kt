@@ -63,11 +63,13 @@ import com.example.ui.components.AzrilEmptyState
 import com.example.ui.components.AzrilMintCard
 import com.example.ui.components.AzrilPageHeader
 import com.example.ui.components.AzrilStatusBadge
+import androidx.compose.material.icons.rounded.WarningAmber
 import com.example.ui.model.PointSourceType
 import com.example.ui.model.RankingPeriodFilter
 import com.example.ui.model.RankingPointAuditLog
 import com.example.ui.model.RankingPointTransaction
 import com.example.ui.model.RankingScope
+import com.example.ui.model.StudentBadgeStatus
 import com.example.ui.model.StudentRankingEntry
 import com.example.ui.state.AzrilUiState
 import com.example.ui.state.AzrilViewModel
@@ -89,8 +91,11 @@ import com.example.ui.theme.LimePrimary
 import com.example.ui.theme.MintSurfaceSoft
 import com.example.ui.theme.OnDarkMuted
 import com.example.ui.theme.PureWhite
+import com.example.ui.theme.Rose50
 import com.example.ui.theme.Rose600
+import com.example.ui.theme.Rose700
 import com.example.ui.theme.SoftMintBg
+import com.example.ui.theme.SurfaceMuted
 
 @Composable
 private fun limeFilterChipColors() = FilterChipDefaults.filterChipColors(
@@ -107,6 +112,7 @@ fun AdminRankingScreen(
     viewModel: AzrilViewModel,
     isExpanded: Boolean
 ) {
+    var selectedCategory by rememberSaveable { mutableStateOf(RankingScope.ALL) }
     var selectedPeriod by rememberSaveable { mutableStateOf(RankingPeriodFilter.SEMESTER) }
     var customStartDate by rememberSaveable { mutableStateOf("01 Nov 2026") }
     var customEndDate by rememberSaveable { mutableStateOf("30 Nov 2026") }
@@ -116,12 +122,32 @@ fun AdminRankingScreen(
     var inspectingEntry by remember { mutableStateOf<StudentRankingEntry?>(null) }
     var adjustingEntry by remember { mutableStateOf<StudentRankingEntry?>(null) }
 
-    val rankings = remember(uiState, selectedPeriod, selectedProdiId, selectedClassId, selectedSemester) {
+    val effectiveProdiId = when (selectedCategory) {
+        RankingScope.STUDY_PROGRAM -> selectedProdiId ?: uiState.studyPrograms.firstOrNull()?.id
+        RankingScope.CLASS -> selectedProdiId
+        RankingScope.ALL -> null
+    }
+    val effectiveClassId = when (selectedCategory) {
+        RankingScope.CLASS -> selectedClassId ?: uiState.classes.firstOrNull { effectiveProdiId == null || it.studyProgramId == effectiveProdiId }?.id
+        else -> null
+    }
+
+    val rankings = remember(uiState, selectedPeriod, effectiveProdiId, effectiveClassId, selectedSemester) {
         AzrilViewModel.computeRankings(
             state = uiState,
             periodFilter = selectedPeriod,
-            studyProgramId = selectedProdiId,
-            classId = selectedClassId,
+            studyProgramId = effectiveProdiId,
+            classId = effectiveClassId,
+            semester = selectedSemester
+        )
+    }
+
+    val afkStudents = remember(uiState, selectedPeriod, effectiveProdiId, effectiveClassId, selectedSemester) {
+        AzrilViewModel.computeAfkStudents(
+            state = uiState,
+            periodFilter = selectedPeriod,
+            studyProgramId = effectiveProdiId,
+            classId = effectiveClassId,
             semester = selectedSemester
         )
     }
@@ -139,15 +165,42 @@ fun AdminRankingScreen(
     ) {
         AzrilPageHeader(
             title = "Student Ranking & Leaderboard",
-            subtitle = "Peringkat otomatis dari kehadiran dan ketepatan pengumpulan tugas dengan tie-breaker & audit log."
+            subtitle = "Peringkat berdasarkan Kelas, Prodi, dan Tingkat Fakultas/Keseluruhan. Mahasiswa AFK dipisahkan khusus dengan tanda merah."
         )
 
         PointRulesReferenceCard()
 
-        // Filter Panel
+        // Category & Filter Panel
         AzrilCard {
-            Text("Filter Periode & Akademik", style = MaterialTheme.typography.titleSmall, color = InkText)
+            Text("Kategori Peringkat", style = MaterialTheme.typography.titleSmall, color = InkText)
             Spacer(modifier = Modifier.height(8.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                RankingScope.entries.forEach { scope ->
+                    FilterChip(
+                        selected = selectedCategory == scope,
+                        onClick = {
+                            selectedCategory = scope
+                            if (scope == RankingScope.ALL) {
+                                selectedProdiId = null
+                                selectedClassId = null
+                            } else if (scope == RankingScope.STUDY_PROGRAM) {
+                                selectedClassId = null
+                                if (selectedProdiId == null) selectedProdiId = uiState.studyPrograms.firstOrNull()?.id
+                            } else if (scope == RankingScope.CLASS) {
+                                if (selectedClassId == null) selectedClassId = uiState.classes.firstOrNull()?.id
+                            }
+                        },
+                        label = { Text(scope.label) },
+                        shape = RoundedCornerShape(999.dp),
+                        colors = limeFilterChipColors(),
+                        modifier = Modifier.testTag("admin_ranking_scope_${scope.name.lowercase()}")
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            Text("Periode Penilaian", style = MaterialTheme.typography.labelMedium, color = InkMuted)
+            Spacer(modifier = Modifier.height(4.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 RankingPeriodFilter.entries.forEach { period ->
                     FilterChip(
@@ -181,21 +234,23 @@ fun AdminRankingScreen(
                     )
                 }
             }
-            if (uiState.studyPrograms.isNotEmpty()) {
+            if (selectedCategory != RankingScope.ALL && uiState.studyPrograms.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(10.dp))
                 Text("Program Studi", style = MaterialTheme.typography.labelMedium, color = InkMuted)
                 Spacer(modifier = Modifier.height(4.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = selectedProdiId == null,
-                        onClick = { selectedProdiId = null; selectedClassId = null },
-                        label = { Text("Semua Prodi") },
-                        shape = RoundedCornerShape(999.dp),
-                        colors = limeFilterChipColors()
-                    )
+                    if (selectedCategory == RankingScope.CLASS) {
+                        FilterChip(
+                            selected = selectedProdiId == null,
+                            onClick = { selectedProdiId = null; selectedClassId = null },
+                            label = { Text("Semua Prodi") },
+                            shape = RoundedCornerShape(999.dp),
+                            colors = limeFilterChipColors()
+                        )
+                    }
                     uiState.studyPrograms.forEach { prodi ->
                         FilterChip(
-                            selected = selectedProdiId == prodi.id,
+                            selected = effectiveProdiId == prodi.id,
                             onClick = { selectedProdiId = prodi.id; selectedClassId = null },
                             label = { Text(prodi.code) },
                             shape = RoundedCornerShape(999.dp),
@@ -204,22 +259,15 @@ fun AdminRankingScreen(
                     }
                 }
             }
-            val visibleClasses = uiState.classes.filter { selectedProdiId == null || it.studyProgramId == selectedProdiId }
-            if (visibleClasses.isNotEmpty()) {
+            val visibleClasses = uiState.classes.filter { effectiveProdiId == null || it.studyProgramId == effectiveProdiId }
+            if (selectedCategory == RankingScope.CLASS && visibleClasses.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
-                Text("Kelas", style = MaterialTheme.typography.labelMedium, color = InkMuted)
+                Text("Pilih Kelas", style = MaterialTheme.typography.labelMedium, color = InkMuted)
                 Spacer(modifier = Modifier.height(4.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = selectedClassId == null,
-                        onClick = { selectedClassId = null },
-                        label = { Text("Semua Kelas") },
-                        shape = RoundedCornerShape(999.dp),
-                        colors = limeFilterChipColors()
-                    )
                     visibleClasses.forEach { cls ->
                         FilterChip(
-                            selected = selectedClassId == cls.id,
+                            selected = effectiveClassId == cls.id,
                             onClick = { selectedClassId = cls.id },
                             label = { Text(cls.name) },
                             shape = RoundedCornerShape(999.dp),
@@ -255,8 +303,8 @@ fun AdminRankingScreen(
 
         if (rankings.isEmpty()) {
             AzrilEmptyState(
-                title = "Belum Ada Data Peringkat Mahasiswa",
-                description = "Peringkat dihitung otomatis dari data aktual absensi dan pengumpulan tugas (tanpa data dummy). Daftarkan mahasiswa, buka sesi absensi, atau buat tugas untuk melihat leaderboard aktif.",
+                title = "Belum Ada Data Peringkat Aktif",
+                description = "Peringkat menampilkan mahasiswa aktif (Lulus / Netral) berdasarkan data aktual absensi dan tugas. Mahasiswa AFK ditampilkan pada daftar terpisah di bawah.",
                 icon = Icons.Rounded.EmojiEvents,
                 showIllustration = true
             )
@@ -266,7 +314,7 @@ fun AdminRankingScreen(
                 onSelectEntry = { inspectingEntry = it }
             )
 
-            Text("Peringkat Seluruh Mahasiswa (${rankings.size})", style = MaterialTheme.typography.titleMedium, color = InkText)
+            Text("Peringkat ${selectedCategory.label} (${rankings.size})", style = MaterialTheme.typography.titleMedium, color = InkText)
             rankings.forEach { entry ->
                 AdminRankingStudentCard(
                     entry = entry,
@@ -275,6 +323,13 @@ fun AdminRankingScreen(
                 )
             }
         }
+
+        // Dedicated Separate AFK Students List (Red Marker, Never Mixed into Active Leaderboard)
+        AfkStudentsSeparateSection(
+            afkStudents = afkStudents,
+            isAdmin = true,
+            onInspect = { inspectingEntry = it }
+        )
 
         // Global Audit History Card
         AzrilCard {
@@ -346,6 +401,7 @@ fun StudentRankingScreen(
 
     val effectiveScope = if (!allowGlobal && selectedScope == RankingScope.ALL) RankingScope.STUDY_PROGRAM else selectedScope
     val myStudentRecord = uiState.students.find { it.id == user.id }
+    val myBadgeStatus = myStudentRecord?.badgeStatus ?: user.badgeStatus
 
     val rankings = remember(uiState, effectiveScope, selectedPeriod, myStudentRecord) {
         when (effectiveScope) {
@@ -366,6 +422,25 @@ fun StudentRankingScreen(
         }
     }
 
+    val afkStudents = remember(uiState, effectiveScope, selectedPeriod, myStudentRecord) {
+        when (effectiveScope) {
+            RankingScope.CLASS -> AzrilViewModel.computeAfkStudents(
+                state = uiState,
+                periodFilter = selectedPeriod,
+                classId = myStudentRecord?.classId
+            )
+            RankingScope.STUDY_PROGRAM -> AzrilViewModel.computeAfkStudents(
+                state = uiState,
+                periodFilter = selectedPeriod,
+                studyProgramId = myStudentRecord?.studyProgramId
+            )
+            RankingScope.ALL -> AzrilViewModel.computeAfkStudents(
+                state = uiState,
+                periodFilter = selectedPeriod
+            )
+        }
+    }
+
     val myEntry = rankings.find { it.studentId == user.id }
     val myTransactions = uiState.rankingPoints.filter { it.studentId == user.id }
 
@@ -378,7 +453,7 @@ fun StudentRankingScreen(
     ) {
         AzrilPageHeader(
             title = "Ranking & Leaderboard",
-            subtitle = "Pantau posisi peringkat Anda dari kehadiran dan ketepatan waktu pengumpulan tugas."
+            subtitle = "Peringkat berdasarkan Kelas, Prodi, dan Tingkat Fakultas/Keseluruhan. Mahasiswa berstatus AFK ditampilkan terpisah."
         )
 
         // Personal Dark Ranking Hero Card (#171A17 + Lime Green #B5D45D)
@@ -393,11 +468,14 @@ fun StudentRankingScreen(
                     containerColor = LimePrimary,
                     contentColor = DarkCardBg
                 )
-                AzrilStatusBadge(
-                    text = selectedPeriod.label,
-                    containerColor = DarkCardElevated,
-                    contentColor = PureWhite
-                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    StudentCapStatusBadge(status = myBadgeStatus, onDark = true)
+                    AzrilStatusBadge(
+                        text = selectedPeriod.label,
+                        containerColor = DarkCardElevated,
+                        contentColor = PureWhite
+                    )
+                }
             }
             Spacer(modifier = Modifier.height(14.dp))
             Row(
@@ -408,15 +486,19 @@ fun StudentRankingScreen(
                 Column {
                     Text("Posisi Anda Saat Ini", style = MaterialTheme.typography.labelMedium, color = OnDarkMuted)
                     Text(
-                        text = myEntry?.let { "#${it.rank}" } ?: "Belum Ada",
+                        text = when {
+                            myBadgeStatus == StudentBadgeStatus.AFK -> "AFK"
+                            myEntry != null -> "#${myEntry.rank}"
+                            else -> "Belum Ada"
+                        },
                         style = MaterialTheme.typography.displaySmall,
-                        color = PureWhite
+                        color = if (myBadgeStatus == StudentBadgeStatus.AFK) Rose600 else PureWhite
                     )
                 }
                 Column(horizontalAlignment = Alignment.End) {
                     Text("Total Poin", style = MaterialTheme.typography.labelMedium, color = OnDarkMuted)
                     Text(
-                        text = "${myEntry?.totalPoints ?: 0} pts",
+                        text = "${myEntry?.totalPoints ?: myTransactions.sumOf { it.points }} pts",
                         style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Bold),
                         color = LimePrimary
                     )
@@ -437,26 +519,45 @@ fun StudentRankingScreen(
                 )
                 Text(
                     text = when {
+                        myBadgeStatus == StudentBadgeStatus.AFK -> "Status AFK (terpisah dari leaderboard)"
                         myEntry == null -> "Aktifkan poin via absensi/tugas"
                         myEntry.rank == 1 -> "Posisi Puncak!"
                         myEntry.pointGapToAbove != null -> "Selisih ${myEntry.pointGapToAbove} pts ke #${myEntry.rankAbove}"
                         else -> "-"
                     },
                     style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                    color = LimePrimary
+                    color = if (myBadgeStatus == StudentBadgeStatus.AFK) Rose600 else LimePrimary
                 )
             }
         }
 
         // Scope & Period Controls
         AzrilCard {
-            Text("Cakupan & Periode", style = MaterialTheme.typography.titleSmall, color = InkText)
+            Text("Kategori & Periode", style = MaterialTheme.typography.titleSmall, color = InkText)
             Spacer(modifier = Modifier.height(8.dp))
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = effectiveScope == RankingScope.CLASS, onClick = { selectedScope = RankingScope.CLASS }, label = { Text("Di Kelas") }, shape = RoundedCornerShape(999.dp), colors = limeFilterChipColors())
-                FilterChip(selected = effectiveScope == RankingScope.STUDY_PROGRAM, onClick = { selectedScope = RankingScope.STUDY_PROGRAM }, label = { Text("Di Prodi") }, shape = RoundedCornerShape(999.dp), colors = limeFilterChipColors())
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(
+                    selected = effectiveScope == RankingScope.CLASS,
+                    onClick = { selectedScope = RankingScope.CLASS },
+                    label = { Text(RankingScope.CLASS.label) },
+                    shape = RoundedCornerShape(999.dp),
+                    colors = limeFilterChipColors()
+                )
+                FilterChip(
+                    selected = effectiveScope == RankingScope.STUDY_PROGRAM,
+                    onClick = { selectedScope = RankingScope.STUDY_PROGRAM },
+                    label = { Text(RankingScope.STUDY_PROGRAM.label) },
+                    shape = RoundedCornerShape(999.dp),
+                    colors = limeFilterChipColors()
+                )
                 if (allowGlobal) {
-                    FilterChip(selected = effectiveScope == RankingScope.ALL, onClick = { selectedScope = RankingScope.ALL }, label = { Text("Seluruh Mahasiswa") }, shape = RoundedCornerShape(999.dp), colors = limeFilterChipColors())
+                    FilterChip(
+                        selected = effectiveScope == RankingScope.ALL,
+                        onClick = { selectedScope = RankingScope.ALL },
+                        label = { Text(RankingScope.ALL.label) },
+                        shape = RoundedCornerShape(999.dp),
+                        colors = limeFilterChipColors()
+                    )
                 }
             }
             Spacer(modifier = Modifier.height(8.dp))
@@ -470,7 +571,7 @@ fun StudentRankingScreen(
         if (rankings.isEmpty()) {
             AzrilEmptyState(
                 title = "Leaderboard Masih Kosong",
-                description = "Catat kehadiran (+10 poin) atau kumpulkan tugas tepat waktu (+10 poin) agar peringkat Anda muncul secara otomatis.",
+                description = "Catat kehadiran (+20 XP), kumpulkan tugas (+35/+30/+10 XP), aktif berdiskusi (+10/+20 XP), dan jaga Login Streak agar peringkat Anda muncul otomatis.",
                 icon = Icons.Rounded.EmojiEvents,
                 showIllustration = true
             )
@@ -497,9 +598,14 @@ fun StudentRankingScreen(
                             modifier = Modifier.weight(1f)
                         ) {
                             RankBadgeCircle(entry.rank)
-                            Column {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Text(entry.studentName, style = MaterialTheme.typography.titleSmall, color = InkText)
+                            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(
+                                        text = entry.displayNameWithProdi,
+                                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                        color = InkText
+                                    )
+                                    StudentCapStatusBadge(status = entry.badgeStatus)
                                     if (isMe) {
                                         AzrilStatusBadge("Anda", DarkCardBg, LimePrimary)
                                     }
@@ -511,6 +617,7 @@ fun StudentRankingScreen(
                                 )
                             }
                         }
+                        Spacer(modifier = Modifier.width(8.dp))
                         AzrilStatusBadge(
                             text = "${entry.totalPoints} pts",
                             containerColor = if (isMe) DarkCardBg else SoftMintBg,
@@ -519,6 +626,15 @@ fun StudentRankingScreen(
                     }
                 }
             }
+        }
+
+        // Dedicated Separate AFK Students List (Red Marker, Never Mixed into Active Leaderboard)
+        if (afkStudents.isNotEmpty()) {
+            AfkStudentsSeparateSection(
+                afkStudents = afkStudents,
+                isAdmin = false,
+                onInspect = {}
+            )
         }
 
         // Student Read-Only Point History
@@ -598,7 +714,7 @@ fun AdminRankingDashboardWidget(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(
-                    "Belum ada mahasiswa pada papan peringkat. Poin dihitung otomatis dari absensi (+10 Hadir, +5 Izin/Sakit) & tugas (+10 Tepat Waktu, +5 Terlambat).",
+                    "Belum ada mahasiswa pada papan peringkat. XP dihitung otomatis dari absensi (+20 Hadir, +10 Izin maks. 2x/semester), tugas (+35/+30/+10), keaktifan (+10/+20), & bonus streak.",
                     style = MaterialTheme.typography.bodySmall,
                     color = OnDarkMuted,
                     modifier = Modifier.padding(14.dp)
@@ -615,7 +731,7 @@ fun AdminRankingDashboardWidget(
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         RankBadgeCircle(entry.rank)
                         Column {
-                            Text(entry.studentName, style = MaterialTheme.typography.titleSmall, color = PureWhite)
+                            Text(entry.displayNameWithProdi, style = MaterialTheme.typography.titleSmall, color = PureWhite)
                             Text("${entry.className} • Hadir ${entry.hadirCount}x • Tepat ${entry.onTimeAssignmentsCount}x", style = MaterialTheme.typography.bodySmall, color = OnDarkMuted)
                         }
                     }
@@ -755,17 +871,17 @@ private fun PointRulesReferenceCard() {
     AzrilMintCard(contentPadding = PaddingValues(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Icon(Icons.Rounded.Security, contentDescription = null, tint = DarkCardBg, modifier = Modifier.size(18.dp))
-            Text("Aturan Poin Otomatis & Anti-Duplikasi", style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold), color = InkText)
+            Text("Aturan XP Otomatis & Anti-Duplikasi", style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold), color = InkText)
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            "Absensi: Hadir +10 • Izin +5 • Sakit +5 • Alfa 0  |  Tugas: Tepat Waktu +10 • Terlambat +5 • Tidak Mengumpulkan 0",
+            "Absensi: Hadir +20 XP • Izin ke-1 & ke-2/semester +10 XP • Izin ke-3+ & Alfa 0 XP  |  Tugas: Sebelum Deadline +35 XP • Tepat Waktu +30 XP • Terlambat +10 XP  |  Keaktifan: Biasa +10 XP • Kritis +20 XP  |  Streak: 3h +10 • 7h +30 • 14h +50 • 30h +100 XP",
             style = MaterialTheme.typography.bodySmall,
             color = InkText
         )
         Spacer(modifier = Modifier.height(2.dp))
         Text(
-            "Tie-breaker jika poin sama: (1) Tugas tepat waktu terbanyak, (2) Hadir terbanyak, (3) Alfa paling sedikit.",
+            "Total XP selalu dihitung dari ledger transaksi permanen. Tie-breaker: (1) Tugas tepat waktu terbanyak, (2) Hadir terbanyak, (3) Alfa paling sedikit.",
             style = MaterialTheme.typography.labelSmall,
             color = InkMuted
         )
@@ -852,10 +968,10 @@ private fun PodiumColumn(
         }
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = entry?.studentName ?: "Belum terisi",
+            text = entry?.displayNameWithProdi ?: "Belum terisi",
             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
             color = if (entry != null) InkText else InkSubtle,
-            maxLines = 1,
+            maxLines = 2,
             overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center
         )
@@ -893,6 +1009,7 @@ private fun PodiumColumn(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun AdminRankingStudentCard(
     entry: StudentRankingEntry,
@@ -911,9 +1028,16 @@ private fun AdminRankingStudentCard(
                 modifier = Modifier.weight(1f)
             ) {
                 RankBadgeCircle(entry.rank)
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(entry.studentName, style = MaterialTheme.typography.titleMedium, color = InkText)
-                    Text("NIM ${entry.nim} • ${entry.studyProgramName} • ${entry.className}", style = MaterialTheme.typography.bodySmall, color = InkSubtle)
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = entry.displayNameWithProdi,
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                            color = InkText
+                        )
+                        StudentCapStatusBadge(status = entry.badgeStatus)
+                    }
+                    Text("NIM ${entry.nim} • ${entry.className}", style = MaterialTheme.typography.bodySmall, color = InkSubtle)
                 }
             }
             AzrilStatusBadge("${entry.totalPoints} pts", DarkCardBg, LimePrimary)
@@ -955,6 +1079,106 @@ private fun AdminRankingStudentCard(
 }
 
 @Composable
+private fun StudentCapStatusBadge(
+    status: StudentBadgeStatus,
+    onDark: Boolean = false
+) {
+    when (status) {
+        StudentBadgeStatus.AFK -> AzrilStatusBadge("AFK", Rose600, PureWhite)
+        StudentBadgeStatus.LULUS -> AzrilStatusBadge("Lulus", Emerald50, Emerald700)
+        StudentBadgeStatus.NEUTRAL -> AzrilStatusBadge(
+            text = "Netral",
+            containerColor = if (onDark) DarkCardElevated else SurfaceMuted,
+            contentColor = if (onDark) OnDarkMuted else InkMuted
+        )
+    }
+}
+
+@Composable
+private fun AfkStudentsSeparateSection(
+    afkStudents: List<StudentRankingEntry>,
+    isAdmin: Boolean,
+    onInspect: (StudentRankingEntry) -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().testTag("afk_students_section"),
+        shape = RoundedCornerShape(24.dp),
+        color = Rose50,
+        border = BorderStroke(1.5.dp, Rose600.copy(alpha = 0.45f))
+    ) {
+        Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(
+                        modifier = Modifier.size(34.dp).clip(CircleShape).background(Rose600),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Rounded.WarningAmber, contentDescription = null, tint = PureWhite, modifier = Modifier.size(18.dp))
+                    }
+                    Column {
+                        Text(
+                            text = "Daftar Mahasiswa Berstatus AFK (${afkStudents.size})",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                            color = Rose700
+                        )
+                        Text(
+                            text = "Dipisahkan dari papan peringkat mahasiswa aktif (Lulus / Netral).",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Rose700.copy(alpha = 0.85f)
+                        )
+                    }
+                }
+            }
+
+            if (afkStudents.isEmpty()) {
+                Text(
+                    text = "Tidak ada mahasiswa berstatus AFK pada cakupan ini.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Rose700.copy(alpha = 0.8f)
+                )
+            } else {
+                afkStudents.forEach { entry ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .clickable(enabled = isAdmin) { onInspect(entry) },
+                        shape = RoundedCornerShape(16.dp),
+                        color = PureWhite,
+                        border = BorderStroke(1.dp, Rose600.copy(alpha = 0.35f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = entry.displayNameWithProdi,
+                                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = Rose700
+                                )
+                                Text(
+                                    text = "NIM ${entry.nim} • ${entry.className} • ${entry.totalPoints} pts",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = InkMuted
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            AzrilStatusBadge("AFK", Rose600, PureWhite)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun RankBadgeCircle(rank: Int) {
     val (bg, fg) = when (rank) {
         1 -> LimePrimary to DarkCardBg
@@ -990,20 +1214,25 @@ private fun PointTransactionRow(tx: RankingPointTransaction) {
                 containerColor = when (tx.sourceType) {
                     PointSourceType.ATTENDANCE -> MintSurfaceSoft
                     PointSourceType.ASSIGNMENT -> Emerald50
+                    PointSourceType.PARTICIPATION -> DarkCardBg
+                    PointSourceType.STREAK_BONUS -> Amber50
                     PointSourceType.MANUAL_ADJUSTMENT -> Amber50
                 },
                 contentColor = when (tx.sourceType) {
                     PointSourceType.ATTENDANCE -> LimeInk
                     PointSourceType.ASSIGNMENT -> Emerald700
+                    PointSourceType.PARTICIPATION -> LimePrimary
+                    PointSourceType.STREAK_BONUS -> Amber700
                     PointSourceType.MANUAL_ADJUSTMENT -> Amber700
                 }
             )
-            Text(tx.description, style = MaterialTheme.typography.bodySmall, color = InkText)
+            Text(tx.activityTitle.ifBlank { tx.description }, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold), color = InkText)
+            Text(tx.description, style = MaterialTheme.typography.labelSmall, color = InkMuted)
             Text("Diperbarui: ${tx.updatedAt}", style = MaterialTheme.typography.labelSmall, color = InkSubtle)
         }
         Spacer(modifier = Modifier.width(8.dp))
         Text(
-            text = if (tx.points >= 0) "+${tx.points} pts" else "${tx.points} pts",
+            text = if (tx.points >= 0) "+${tx.points} XP" else "${tx.points} XP",
             style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
             color = if (tx.points > 0) Emerald600 else if (tx.points < 0) Rose600 else InkSubtle
         )
@@ -1044,8 +1273,8 @@ private fun RankingDetailDialog(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("${entry.studentName} (NIM ${entry.nim})", style = MaterialTheme.typography.titleSmall, color = InkText)
-                Text("${entry.studyProgramName} • ${entry.className} • Total ${entry.totalPoints} poin", style = MaterialTheme.typography.bodySmall, color = InkMuted)
+                Text("${entry.displayNameWithProdi} (NIM ${entry.nim})", style = MaterialTheme.typography.titleSmall, color = InkText)
+                Text("Status: ${entry.badgeStatus.label} • ${entry.className} • Total ${entry.totalPoints} poin", style = MaterialTheme.typography.bodySmall, color = InkMuted)
                 HorizontalDivider(color = BorderMint)
                 Text("Rincian Transaksi Poin (${transactions.size})", style = MaterialTheme.typography.labelLarge, color = InkText)
                 if (transactions.isEmpty()) {

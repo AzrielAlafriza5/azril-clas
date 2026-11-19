@@ -1,10 +1,15 @@
 package com.example
 
+import android.Manifest
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -41,8 +46,10 @@ import com.example.ui.screens.admin.AdminReportsScreen
 import com.example.ui.screens.admin.AdminSchedulesScreen
 import com.example.ui.screens.admin.AdminSettingsScreen
 import com.example.ui.screens.admin.AdminStudentsScreen
+import com.example.data.gamification.StreakReminderNotifier
 import com.example.ui.screens.admin.AdminStudyProgramsScreen
 import com.example.ui.screens.admin.AdminSubmissionsScreen
+import com.example.ui.screens.admin.AdminXpParticipationScreen
 import com.example.ui.screens.admin.RoleNotificationsScreen
 import com.example.ui.screens.auth.LoginScreen
 import com.example.ui.screens.ranking.AdminRankingScreen
@@ -54,6 +61,7 @@ import com.example.ui.screens.student.StudentGradesScreen
 import com.example.ui.screens.student.StudentProfileScreen
 import com.example.ui.screens.student.StudentScheduleScreen
 import com.example.ui.screens.student.StudentSubmissionsScreen
+import com.example.ui.screens.student.StudentXpHistoryScreen
 import com.example.ui.state.AzrilViewModel
 import com.example.ui.theme.AzrilClasTheme
 import kotlinx.coroutines.delay
@@ -76,6 +84,20 @@ fun AzrilClasApp(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val user = uiState.currentUser
+    val context = LocalContext.current
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { /* Granted or denied gracefully; in-app notifications always stay active */ }
+
+    LaunchedEffect(user?.id) {
+        if (user?.role == UserRole.STUDENT &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !StreakReminderNotifier.hasNotificationPermission(context)
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     LaunchedEffect(uiState.toastMessage?.id) {
         if (uiState.toastMessage != null) {
@@ -112,20 +134,8 @@ fun AzrilClasApp(
                     onLogin = { identifier, password, rememberMe ->
                         viewModel.loginWithCredentials(identifier, password, rememberMe)
                     },
-                    onRegisterStudent = { fullName, nim, emailOrUsername, password, confirmPassword, prodiCode, rememberMe ->
-                        viewModel.registerStudentAccount(
-                            fullName = fullName,
-                            nim = nim,
-                            emailOrUsername = emailOrUsername,
-                            password = password,
-                            confirmPassword = confirmPassword,
-                            studyProgramCode = prodiCode,
-                            rememberMe = rememberMe
-                        )
-                    },
                     onClearAuthError = { viewModel.clearAuthError() },
-                    onEnterAdminPreview = { viewModel.enterAdminPreview() },
-                    onNotify = { msg, type -> viewModel.showToast(msg, type) }
+                    onEnterAdminPreview = { viewModel.enterAdminPreview() }
                 )
             }
             UserRole.ADMIN -> {
@@ -155,6 +165,7 @@ fun AzrilClasApp(
                         AdminDestination.SUBMISSIONS -> AdminSubmissionsScreen(uiState, viewModel, isExpanded)
                         AdminDestination.AI_ASSISTANT -> AdminAiAssistantScreen(uiState, viewModel, isExpanded)
                         AdminDestination.GRADING -> AdminGradingScreen(uiState, viewModel, isExpanded)
+                        AdminDestination.XP_KEAKTIFAN -> AdminXpParticipationScreen(uiState, viewModel, isExpanded)
                         AdminDestination.RANKING -> AdminRankingScreen(uiState, viewModel, isExpanded)
                         AdminDestination.REPORTS -> AdminReportsScreen(uiState, viewModel, isExpanded)
                         AdminDestination.NOTIFICATIONS -> RoleNotificationsScreen(uiState, UserRole.ADMIN, viewModel, isExpanded)
@@ -180,6 +191,7 @@ fun AzrilClasApp(
                 ) { isExpanded ->
                     when (uiState.studentDestination) {
                         StudentDestination.DASHBOARD -> StudentDashboardScreen(uiState, isExpanded) { viewModel.navigateStudent(it) }
+                        StudentDestination.XP_HISTORY -> StudentXpHistoryScreen(uiState, isExpanded)
                         StudentDestination.MY_SCHEDULE -> StudentScheduleScreen(uiState, viewModel, isExpanded) { viewModel.navigateStudent(it) }
                         StudentDestination.ATTENDANCE -> StudentAttendanceScreen(uiState, viewModel, isExpanded)
                         StudentDestination.ASSIGNMENTS -> StudentAssignmentsScreen(uiState, viewModel, isExpanded)

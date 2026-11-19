@@ -1,9 +1,11 @@
 package com.example.ui.screens.admin
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,17 +24,23 @@ import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Groups
+import androidx.compose.material.icons.rounded.LockReset
 import androidx.compose.material.icons.rounded.School
 import androidx.compose.material.icons.rounded.UploadFile
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -47,6 +55,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.ui.components.AzrilCard
 import com.example.ui.components.AzrilConfirmDeleteDialog
@@ -58,14 +68,23 @@ import com.example.ui.components.AzrilStatusBadge
 import com.example.ui.model.AcademicClass
 import com.example.ui.model.AccountStatus
 import com.example.ui.model.CsvImportPreviewRow
+import com.example.ui.model.StudentBadgeStatus
 import com.example.ui.model.StudentRecord
 import com.example.ui.model.StudyProgram
 import com.example.ui.model.ToastType
 import com.example.ui.state.AzrilUiState
 import com.example.ui.state.AzrilViewModel
 import com.example.ui.theme.BorderLight
+import com.example.ui.theme.BorderMint
+import com.example.ui.theme.DarkCardBg
 import com.example.ui.theme.Emerald50
+import com.example.ui.theme.Emerald600
 import com.example.ui.theme.Emerald700
+import com.example.ui.theme.InkMuted
+import com.example.ui.theme.InkText
+import com.example.ui.theme.LightGreenSecondary
+import com.example.ui.theme.LimeInk
+import com.example.ui.theme.LimePrimary
 import com.example.ui.theme.Navy900
 import com.example.ui.theme.PureWhite
 import com.example.ui.theme.Rose50
@@ -75,6 +94,7 @@ import com.example.ui.theme.RoyalBlue50
 import com.example.ui.theme.RoyalBlue700
 import com.example.ui.theme.Slate500
 import com.example.ui.theme.Slate600
+import com.example.ui.theme.SoftMintBg
 import com.example.ui.theme.SurfaceMuted
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -571,9 +591,12 @@ fun AdminStudentsScreen(
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var selectedProdiFilter by rememberSaveable { mutableStateOf("ALL") }
+    var selectedBadgeFilter by rememberSaveable { mutableStateOf("ALL") }
     var currentPage by rememberSaveable { mutableIntStateOf(1) }
     var showAddDialog by rememberSaveable { mutableStateOf(false) }
     var showCsvDialog by rememberSaveable { mutableStateOf(false) }
+    var editingStudent by remember { mutableStateOf<StudentRecord?>(null) }
+    var resettingPasswordStudent by remember { mutableStateOf<StudentRecord?>(null) }
     var deletingStudent by remember { mutableStateOf<StudentRecord?>(null) }
 
     val filtered = uiState.students.filter { stu ->
@@ -582,12 +605,17 @@ fun AdminStudentsScreen(
             stu.nim.contains(query, ignoreCase = true) ||
             stu.email.contains(query, ignoreCase = true)
         val matchesProdi = selectedProdiFilter == "ALL" || stu.studyProgramId == selectedProdiFilter
-        matchesQuery && matchesProdi
+        val matchesBadge = selectedBadgeFilter == "ALL" || stu.badgeStatus.name == selectedBadgeFilter
+        matchesQuery && matchesProdi && matchesBadge
     }
     val pageSize = 8
     val totalPages = ((filtered.size + pageSize - 1) / pageSize).coerceAtLeast(1)
     val safePage = currentPage.coerceIn(1, totalPages)
     val pageItems = filtered.drop((safePage - 1) * pageSize).take(pageSize)
+
+    val afkCount = uiState.students.count { it.badgeStatus == StudentBadgeStatus.AFK }
+    val neutralCount = uiState.students.count { it.badgeStatus == StudentBadgeStatus.NEUTRAL }
+    val lulusCount = uiState.students.count { it.badgeStatus == StudentBadgeStatus.LULUS }
 
     Column(
         modifier = Modifier
@@ -598,7 +626,7 @@ fun AdminStudentsScreen(
     ) {
         AzrilPageHeader(
             title = "Manajemen Mahasiswa",
-            subtitle = "Kelola profil akademik, validasi NIM unik, penempatan kelas, impor massal CSV, dan status akun.",
+            subtitle = "Kelola akun mahasiswa (login berbasis NIM), atur/reset password aman, dan tetapkan status/cap AFK, Netral, atau Lulus.",
             action = {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
@@ -609,23 +637,10 @@ fun AdminStudentsScreen(
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Impor")
                     }
-                    OutlinedButton(
-                        onClick = {
-                            viewModel.showToast(
-                                if (filtered.isEmpty()) "Belum ada data mahasiswa untuk diekspor."
-                                else "Ekspor ${filtered.size} data mahasiswa ke CSV siap dijalankan di Tahap 3.",
-                                ToastType.INFO
-                            )
-                        },
-                        shape = RoundedCornerShape(999.dp)
-                    ) {
-                        Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Unduh")
-                    }
                     Button(
                         onClick = { showAddDialog = true },
                         shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
                         modifier = Modifier.testTag("add_student_button")
                     ) {
                         Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -645,27 +660,76 @@ fun AdminStudentsScreen(
             )
             if (uiState.studyPrograms.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(10.dp))
+                Text("Program Studi", style = MaterialTheme.typography.labelMedium, color = InkMuted)
+                Spacer(modifier = Modifier.height(4.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(
                         selected = selectedProdiFilter == "ALL",
-                        onClick = { selectedProdiFilter = "ALL" },
-                        label = { Text("Semua Prodi") }
+                        onClick = { selectedProdiFilter = "ALL"; currentPage = 1 },
+                        label = { Text("Semua Prodi") },
+                        shape = RoundedCornerShape(999.dp)
                     )
                     uiState.studyPrograms.forEach { prodi ->
                         FilterChip(
                             selected = selectedProdiFilter == prodi.id,
-                            onClick = { selectedProdiFilter = prodi.id },
-                            label = { Text(prodi.code) }
+                            onClick = { selectedProdiFilter = prodi.id; currentPage = 1 },
+                            label = { Text(prodi.code) },
+                            shape = RoundedCornerShape(999.dp)
                         )
                     }
                 }
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            Text("Filter Status / Cap Mahasiswa", style = MaterialTheme.typography.labelMedium, color = InkMuted)
+            Spacer(modifier = Modifier.height(4.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(
+                    selected = selectedBadgeFilter == "ALL",
+                    onClick = { selectedBadgeFilter = "ALL"; currentPage = 1 },
+                    label = { Text("Semua (${uiState.students.size})") },
+                    shape = RoundedCornerShape(999.dp),
+                    modifier = Modifier.testTag("filter_badge_all")
+                )
+                FilterChip(
+                    selected = selectedBadgeFilter == StudentBadgeStatus.AFK.name,
+                    onClick = { selectedBadgeFilter = StudentBadgeStatus.AFK.name; currentPage = 1 },
+                    label = { Text("AFK ($afkCount)") },
+                    shape = RoundedCornerShape(999.dp),
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Rose600,
+                        selectedLabelColor = PureWhite,
+                        containerColor = Rose50,
+                        labelColor = Rose700
+                    ),
+                    modifier = Modifier.testTag("filter_badge_afk")
+                )
+                FilterChip(
+                    selected = selectedBadgeFilter == StudentBadgeStatus.NEUTRAL.name,
+                    onClick = { selectedBadgeFilter = StudentBadgeStatus.NEUTRAL.name; currentPage = 1 },
+                    label = { Text("Netral ($neutralCount)") },
+                    shape = RoundedCornerShape(999.dp),
+                    modifier = Modifier.testTag("filter_badge_neutral")
+                )
+                FilterChip(
+                    selected = selectedBadgeFilter == StudentBadgeStatus.LULUS.name,
+                    onClick = { selectedBadgeFilter = StudentBadgeStatus.LULUS.name; currentPage = 1 },
+                    label = { Text("Lulus ($lulusCount)") },
+                    shape = RoundedCornerShape(999.dp),
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Emerald600,
+                        selectedLabelColor = PureWhite,
+                        containerColor = Emerald50,
+                        labelColor = Emerald700
+                    ),
+                    modifier = Modifier.testTag("filter_badge_lulus")
+                )
             }
         }
 
         if (filtered.isEmpty()) {
             AzrilEmptyState(
                 title = "Belum Ada Data Mahasiswa",
-                description = "Tambahkan mahasiswa secara satuan atau impor massal via CSV. Password tidak disimpan di tabel profil (menggunakan Auth terpisah pada Tahap 2).",
+                description = "Akun mahasiswa dibuat dan dikelola sepenuhnya oleh Admin. Tambahkan mahasiswa beserta password awal agar mahasiswa dapat login menggunakan NIM.",
                 icon = Icons.Rounded.Groups,
                 showIllustration = true,
                 actionLabel = "Tambah Mahasiswa",
@@ -673,35 +737,135 @@ fun AdminStudentsScreen(
             )
         } else {
             pageItems.forEach { stu ->
-                AzrilCard {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                AzrilStatusBadge("NIM ${stu.nim}", RoyalBlue50, RoyalBlue700)
-                                AzrilStatusBadge(
-                                    text = stu.status.label,
-                                    containerColor = if (stu.status == AccountStatus.ACTIVE) Emerald50 else Rose50,
-                                    contentColor = if (stu.status == AccountStatus.ACTIVE) Emerald700 else Rose700
+                val isAfk = stu.badgeStatus == StudentBadgeStatus.AFK
+                val isLulus = stu.badgeStatus == StudentBadgeStatus.LULUS
+                val cardBorderColor = when (stu.badgeStatus) {
+                    StudentBadgeStatus.AFK -> Rose600.copy(alpha = 0.45f)
+                    StudentBadgeStatus.LULUS -> Emerald600.copy(alpha = 0.4f)
+                    StudentBadgeStatus.NEUTRAL -> BorderMint
+                }
+                val cardBgColor = when (stu.badgeStatus) {
+                    StudentBadgeStatus.AFK -> Rose50.copy(alpha = 0.35f)
+                    StudentBadgeStatus.LULUS -> Emerald50.copy(alpha = 0.3f)
+                    StudentBadgeStatus.NEUTRAL -> PureWhite
+                }
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    color = cardBgColor,
+                    border = BorderStroke(1.dp, cardBorderColor)
+                ) {
+                    Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.Top
+                        ) {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    AzrilStatusBadge("NIM ${stu.nim}", DarkCardBg, LimePrimary)
+                                    AzrilStatusBadge(
+                                        text = stu.badgeStatus.label,
+                                        containerColor = when (stu.badgeStatus) {
+                                            StudentBadgeStatus.AFK -> Rose50
+                                            StudentBadgeStatus.LULUS -> Emerald50
+                                            StudentBadgeStatus.NEUTRAL -> SurfaceMuted
+                                        },
+                                        contentColor = when (stu.badgeStatus) {
+                                            StudentBadgeStatus.AFK -> Rose700
+                                            StudentBadgeStatus.LULUS -> Emerald700
+                                            StudentBadgeStatus.NEUTRAL -> Slate600
+                                        }
+                                    )
+                                    AzrilStatusBadge(
+                                        text = stu.status.label,
+                                        containerColor = if (stu.status == AccountStatus.ACTIVE) LightGreenSecondary else Rose50,
+                                        contentColor = if (stu.status == AccountStatus.ACTIVE) LimeInk else Rose700
+                                    )
+                                }
+                                Text(
+                                    text = "${stu.fullName} — ${stu.studyProgramName}",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = if (isAfk) Rose700 else InkText
+                                )
+                                Text(stu.email, style = MaterialTheme.typography.bodySmall, color = Slate500)
+                                Text(
+                                    "${stu.className ?: "Belum ada kelas"} • Sem ${stu.semester} (${stu.cohortYear})",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Slate600
                                 )
                             }
-                            Text(stu.fullName, style = MaterialTheme.typography.titleMedium, color = Navy900)
-                            Text(stu.email, style = MaterialTheme.typography.bodySmall, color = Slate500)
-                            Text(
-                                "${stu.studyProgramName} • ${stu.className ?: "Belum ada kelas"} • Sem ${stu.semester} (${stu.cohortYear})",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Slate600
-                            )
-                        }
-                        Row {
-                            TextButton(onClick = { viewModel.toggleStudentStatus(stu.id) }) {
-                                Text(if (stu.status == AccountStatus.ACTIVE) "Nonaktifkan" else "Aktifkan")
+                            Row {
+                                IconButton(
+                                    onClick = { editingStudent = stu },
+                                    modifier = Modifier.testTag("edit_student_${stu.nim}")
+                                ) {
+                                    Icon(Icons.Rounded.Edit, contentDescription = "Edit ${stu.fullName}", tint = InkText)
+                                }
+                                IconButton(
+                                    onClick = { deletingStudent = stu },
+                                    modifier = Modifier.testTag("delete_student_${stu.nim}")
+                                ) {
+                                    Icon(Icons.Rounded.Delete, contentDescription = "Hapus ${stu.fullName}", tint = Rose600)
+                                }
                             }
-                            IconButton(onClick = { deletingStudent = stu }) {
-                                Icon(Icons.Rounded.Delete, contentDescription = "Hapus ${stu.fullName}", tint = Rose600)
+                        }
+
+                        HorizontalDivider(color = cardBorderColor.copy(alpha = 0.6f))
+
+                        // Quick Admin Cap Status Selector (AFK / Netral / Lulus)
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("Status / Cap Mahasiswa (Khusus Admin)", style = MaterialTheme.typography.labelSmall, color = InkMuted)
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                StudentBadgeStatus.entries.forEach { cap ->
+                                    val selected = stu.badgeStatus == cap
+                                    FilterChip(
+                                        selected = selected,
+                                        onClick = { viewModel.updateStudentBadgeStatus(stu.id, cap) },
+                                        label = { Text(cap.label) },
+                                        shape = RoundedCornerShape(999.dp),
+                                        colors = when (cap) {
+                                            StudentBadgeStatus.AFK -> FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Rose600,
+                                                selectedLabelColor = PureWhite,
+                                                containerColor = PureWhite,
+                                                labelColor = Rose700
+                                            )
+                                            StudentBadgeStatus.LULUS -> FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = Emerald600,
+                                                selectedLabelColor = PureWhite,
+                                                containerColor = PureWhite,
+                                                labelColor = Emerald700
+                                            )
+                                            StudentBadgeStatus.NEUTRAL -> FilterChipDefaults.filterChipColors(
+                                                selectedContainerColor = DarkCardBg,
+                                                selectedLabelColor = LimePrimary,
+                                                containerColor = PureWhite,
+                                                labelColor = InkText
+                                            )
+                                        },
+                                        modifier = Modifier.testTag("set_badge_${stu.nim}_${cap.dbValue}")
+                                    )
+                                }
+                            }
+                        }
+
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(
+                                onClick = { resettingPasswordStudent = stu },
+                                shape = RoundedCornerShape(999.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                                modifier = Modifier.testTag("reset_password_${stu.nim}")
+                            ) {
+                                Icon(Icons.Rounded.LockReset, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Atur / Reset Password")
+                            }
+                            TextButton(onClick = { viewModel.toggleStudentStatus(stu.id) }) {
+                                Text(if (stu.status == AccountStatus.ACTIVE) "Nonaktifkan Akun" else "Aktifkan Akun")
+                            }
+                            if (isLulus) {
+                                AzrilStatusBadge("Tercatat Lulus", Emerald50, Emerald700)
                             }
                         }
                     }
@@ -721,9 +885,57 @@ fun AdminStudentsScreen(
             studyPrograms = uiState.studyPrograms,
             classes = uiState.classes,
             onDismiss = { showAddDialog = false },
-            onSave = { name, nim, email, prodiId, classId, sem, cohort ->
-                val err = viewModel.addStudent(name, nim, email, prodiId, classId, sem, cohort, AccountStatus.PENDING_ACTIVATION)
+            onSave = { name, nim, email, prodiId, classId, sem, cohort, initialPassword, badgeStatus ->
+                val err = viewModel.addStudent(
+                    fullName = name,
+                    nim = nim,
+                    email = email,
+                    studyProgramId = prodiId,
+                    classId = classId,
+                    semester = sem,
+                    cohortYear = cohort,
+                    status = AccountStatus.ACTIVE,
+                    initialPassword = initialPassword,
+                    badgeStatus = badgeStatus
+                )
                 if (err == null) showAddDialog = false
+                err
+            }
+        )
+    }
+
+    editingStudent?.let { stu ->
+        EditStudentDialog(
+            student = stu,
+            studyPrograms = uiState.studyPrograms,
+            classes = uiState.classes,
+            onDismiss = { editingStudent = null },
+            onSave = { name, nim, email, prodiId, classId, sem, cohort, accStatus, badgeStatus ->
+                val err = viewModel.updateStudent(
+                    studentId = stu.id,
+                    fullName = name,
+                    nim = nim,
+                    email = email,
+                    studyProgramId = prodiId,
+                    classId = classId,
+                    semester = sem,
+                    cohortYear = cohort,
+                    accountStatus = accStatus,
+                    badgeStatus = badgeStatus
+                )
+                if (err == null) editingStudent = null
+                err
+            }
+        )
+    }
+
+    resettingPasswordStudent?.let { stu ->
+        ResetStudentPasswordDialog(
+            student = stu,
+            onDismiss = { resettingPasswordStudent = null },
+            onSave = { newPw ->
+                val err = viewModel.resetStudentPassword(stu.id, newPw)
+                if (err == null) resettingPasswordStudent = null
                 err
             }
         )
@@ -741,7 +953,7 @@ fun AdminStudentsScreen(
     deletingStudent?.let { stu ->
         AzrilConfirmDeleteDialog(
             title = "Hapus Data Mahasiswa?",
-            message = "Hapus ${stu.fullName} (NIM ${stu.nim}) dari daftar mahasiswa?",
+            message = "Hapus ${stu.fullName} (NIM ${stu.nim}) dari daftar mahasiswa beserta kredensial loginnya?",
             onConfirm = {
                 viewModel.deleteStudent(stu.id)
                 deletingStudent = null
@@ -757,13 +969,16 @@ private fun AddStudentDialog(
     studyPrograms: List<StudyProgram>,
     classes: List<AcademicClass>,
     onDismiss: () -> Unit,
-    onSave: (String, String, String, String, String?, Int, Int) -> String?
+    onSave: (String, String, String, String, String?, Int, Int, String, StudentBadgeStatus) -> String?
 ) {
     var fullName by rememberSaveable { mutableStateOf("") }
     var nim by rememberSaveable { mutableStateOf("") }
     var email by rememberSaveable { mutableStateOf("") }
+    var initialPassword by rememberSaveable { mutableStateOf("") }
+    var passwordVisible by rememberSaveable { mutableStateOf(false) }
     var selectedProdiId by rememberSaveable { mutableStateOf(studyPrograms.firstOrNull()?.id ?: "") }
     var selectedClassId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedBadge by rememberSaveable { mutableStateOf(StudentBadgeStatus.NEUTRAL) }
     var semester by rememberSaveable { mutableStateOf("1") }
     var cohort by rememberSaveable { mutableStateOf("2026") }
     var error by rememberSaveable { mutableStateOf<String?>(null) }
@@ -773,16 +988,21 @@ private fun AddStudentDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = PureWhite,
-        title = { Text("Tambah Mahasiswa", style = MaterialTheme.typography.titleLarge, color = Navy900) },
+        title = { Text("Tambah Mahasiswa Baru", style = MaterialTheme.typography.titleLarge, color = Navy900) },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                Text(
+                    "Mahasiswa akan login menggunakan NIM sebagai username dan kata sandi awal di bawah ini.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Slate600
+                )
                 if (studyPrograms.isEmpty()) {
                     Text("Tambahkan Program Studi terlebih dahulu sebelum mendaftarkan mahasiswa.", style = MaterialTheme.typography.bodySmall, color = Rose700)
                 } else {
-                    Text("Program Studi", style = MaterialTheme.typography.labelMedium, color = Navy900)
+                    Text("Program Studi *", style = MaterialTheme.typography.labelMedium, color = Navy900)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         studyPrograms.forEach { prodi ->
                             FilterChip(
@@ -805,9 +1025,36 @@ private fun AddStudentDialog(
                         }
                     }
                 }
-                OutlinedTextField(value = fullName, onValueChange = { fullName = it; error = null }, label = { Text("Nama Lengkap") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = nim, onValueChange = { nim = it; error = null }, label = { Text("NIM (Unik)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = email, onValueChange = { email = it; error = null }, label = { Text("Email Akademik") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = fullName, onValueChange = { fullName = it; error = null }, label = { Text("Nama Lengkap *") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = nim, onValueChange = { nim = it; error = null }, label = { Text("NIM (Username Login, Unik) *") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = email, onValueChange = { email = it; error = null }, label = { Text("Email Akademik (Opsional)") }, placeholder = { Text("otomatis NIM@mahasiswa.azrilclas.ac.id") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    value = initialPassword,
+                    onValueChange = { initialPassword = it; error = null },
+                    label = { Text("Password Awal Mahasiswa *") },
+                    placeholder = { Text("Minimal 6 karakter") },
+                    visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                            Icon(
+                                imageVector = if (passwordVisible) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                contentDescription = "Tampilkan kata sandi"
+                            )
+                        }
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("Status / Cap Mahasiswa", style = MaterialTheme.typography.labelMedium, color = Navy900)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StudentBadgeStatus.entries.forEach { cap ->
+                        FilterChip(
+                            selected = selectedBadge == cap,
+                            onClick = { selectedBadge = cap },
+                            label = { Text(cap.label) }
+                        )
+                    }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(value = semester, onValueChange = { semester = it.filter(Char::isDigit) }, label = { Text("Semester") }, singleLine = true, modifier = Modifier.weight(1f))
                     OutlinedTextField(value = cohort, onValueChange = { cohort = it.filter(Char::isDigit) }, label = { Text("Angkatan") }, singleLine = true, modifier = Modifier.weight(1f))
@@ -818,11 +1065,180 @@ private fun AddStudentDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    error = onSave(fullName, nim, email, selectedProdiId, selectedClassId, semester.toIntOrNull() ?: 1, cohort.toIntOrNull() ?: 2026)
+                    error = onSave(
+                        fullName,
+                        nim,
+                        email,
+                        selectedProdiId,
+                        selectedClassId,
+                        semester.toIntOrNull() ?: 1,
+                        cohort.toIntOrNull() ?: 2026,
+                        initialPassword,
+                        selectedBadge
+                    )
                 },
                 enabled = studyPrograms.isNotEmpty(),
                 shape = RoundedCornerShape(999.dp)
-            ) { Text("Simpan") }
+            ) { Text("Simpan Akun") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Batal") } }
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun EditStudentDialog(
+    student: StudentRecord,
+    studyPrograms: List<StudyProgram>,
+    classes: List<AcademicClass>,
+    onDismiss: () -> Unit,
+    onSave: (String, String, String, String, String?, Int, Int, AccountStatus, StudentBadgeStatus) -> String?
+) {
+    var fullName by rememberSaveable(student.id) { mutableStateOf(student.fullName) }
+    var nim by rememberSaveable(student.id) { mutableStateOf(student.nim) }
+    var email by rememberSaveable(student.id) { mutableStateOf(student.email) }
+    var selectedProdiId by rememberSaveable(student.id) { mutableStateOf(student.studyProgramId) }
+    var selectedClassId by rememberSaveable(student.id) { mutableStateOf(student.classId) }
+    var selectedBadge by rememberSaveable(student.id) { mutableStateOf(student.badgeStatus) }
+    var semester by rememberSaveable(student.id) { mutableStateOf(student.semester.toString()) }
+    var cohort by rememberSaveable(student.id) { mutableStateOf(student.cohortYear.toString()) }
+    var error by rememberSaveable(student.id) { mutableStateOf<String?>(null) }
+
+    val matchingClasses = classes.filter { it.studyProgramId == selectedProdiId }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text("Edit Data Mahasiswa", style = MaterialTheme.typography.titleLarge, color = Navy900) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Program Studi", style = MaterialTheme.typography.labelMedium, color = Navy900)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    studyPrograms.forEach { prodi ->
+                        FilterChip(
+                            selected = selectedProdiId == prodi.id,
+                            onClick = { selectedProdiId = prodi.id; selectedClassId = null },
+                            label = { Text(prodi.code) }
+                        )
+                    }
+                }
+                if (matchingClasses.isNotEmpty()) {
+                    Text("Kelas", style = MaterialTheme.typography.labelMedium, color = Navy900)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        matchingClasses.forEach { cls ->
+                            FilterChip(
+                                selected = selectedClassId == cls.id,
+                                onClick = { selectedClassId = if (selectedClassId == cls.id) null else cls.id },
+                                label = { Text(cls.name) }
+                            )
+                        }
+                    }
+                }
+                OutlinedTextField(value = fullName, onValueChange = { fullName = it; error = null }, label = { Text("Nama Lengkap") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = nim, onValueChange = { nim = it; error = null }, label = { Text("NIM (Username Login)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = email, onValueChange = { email = it; error = null }, label = { Text("Email Akademik") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Text("Status / Cap Mahasiswa", style = MaterialTheme.typography.labelMedium, color = Navy900)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StudentBadgeStatus.entries.forEach { cap ->
+                        FilterChip(
+                            selected = selectedBadge == cap,
+                            onClick = { selectedBadge = cap },
+                            label = { Text(cap.label) }
+                        )
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(value = semester, onValueChange = { semester = it.filter(Char::isDigit) }, label = { Text("Semester") }, singleLine = true, modifier = Modifier.weight(1f))
+                    OutlinedTextField(value = cohort, onValueChange = { cohort = it.filter(Char::isDigit) }, label = { Text("Angkatan") }, singleLine = true, modifier = Modifier.weight(1f))
+                }
+                error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose600) }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    error = onSave(
+                        fullName,
+                        nim,
+                        email,
+                        selectedProdiId,
+                        selectedClassId,
+                        semester.toIntOrNull() ?: student.semester,
+                        cohort.toIntOrNull() ?: student.cohortYear,
+                        student.status,
+                        selectedBadge
+                    )
+                },
+                shape = RoundedCornerShape(999.dp)
+            ) { Text("Simpan Perubahan") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Batal") } }
+    )
+}
+
+@Composable
+private fun ResetStudentPasswordDialog(
+    student: StudentRecord,
+    onDismiss: () -> Unit,
+    onSave: (String) -> String?
+) {
+    var newPassword by rememberSaveable(student.id) { mutableStateOf("") }
+    var confirmPassword by rememberSaveable(student.id) { mutableStateOf("") }
+    var visible by rememberSaveable(student.id) { mutableStateOf(false) }
+    var error by rememberSaveable(student.id) { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = PureWhite,
+        title = { Text("Atur / Reset Kata Sandi", style = MaterialTheme.typography.titleLarge, color = Navy900) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Tetapkan kata sandi baru untuk ${student.fullName} (NIM ${student.nim}). Kata sandi disimpan dalam bentuk hash aman, tidak pernah dalam teks biasa.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Slate600
+                )
+                OutlinedTextField(
+                    value = newPassword,
+                    onValueChange = { newPassword = it; error = null },
+                    label = { Text("Kata Sandi Baru (min. 6 karakter)") },
+                    visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { visible = !visible }) {
+                            Icon(
+                                imageVector = if (visible) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                contentDescription = "Tampilkan kata sandi"
+                            )
+                        }
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = confirmPassword,
+                    onValueChange = { confirmPassword = it; error = null },
+                    label = { Text("Konfirmasi Kata Sandi Baru") },
+                    visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose600) }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    error = when {
+                        newPassword.trim().length < 6 -> "Kata sandi baru minimal 6 karakter."
+                        newPassword != confirmPassword -> "Konfirmasi kata sandi tidak cocok."
+                        else -> onSave(newPassword.trim())
+                    }
+                },
+                shape = RoundedCornerShape(999.dp)
+            ) { Text("Simpan Password") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Batal") } }
     )

@@ -31,6 +31,10 @@ import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.School
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.UploadFile
+import androidx.compose.material.icons.outlined.Bolt
+import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.ui.graphics.vector.ImageVector
 
 interface NavDestination {
@@ -60,13 +64,14 @@ enum class AdminDestination(
     SUBMISSIONS("admin_submissions", "Pengumpulan", "Kumpul", Icons.Rounded.UploadFile, Icons.Outlined.UploadFile, "Evaluasi"),
     AI_ASSISTANT("admin_ai_assistant", "AI Assistant", "AI", Icons.Rounded.AutoAwesome, Icons.Outlined.AutoAwesome, "Evaluasi"),
     GRADING("admin_grading", "Penilaian", "Nilai", Icons.Rounded.Grade, Icons.Outlined.Grade, "Evaluasi"),
+    XP_KEAKTIFAN("admin_xp_keaktifan", "XP Keaktifan", "XP Aktif", Icons.Rounded.Bolt, Icons.Outlined.Bolt, "Evaluasi"),
     RANKING("admin_ranking", "Ranking", "Ranking", Icons.Rounded.EmojiEvents, Icons.Outlined.EmojiEvents, "Evaluasi"),
     REPORTS("admin_reports", "Laporan", "Laporan", Icons.Rounded.Analytics, Icons.Outlined.Analytics, "Sistem"),
     NOTIFICATIONS("admin_notifications", "Notifikasi", "Notif", Icons.Rounded.Notifications, Icons.Outlined.Notifications, "Sistem"),
     SETTINGS("admin_settings", "Pengaturan", "Atur", Icons.Rounded.Settings, Icons.Outlined.Settings, "Sistem");
 
     companion object {
-        val bottomBarItems = listOf(DASHBOARD, ATTENDANCE, ASSIGNMENTS, RANKING, AI_ASSISTANT)
+        val bottomBarItems = listOf(DASHBOARD, ATTENDANCE, ASSIGNMENTS, XP_KEAKTIFAN, RANKING)
     }
 }
 
@@ -79,6 +84,7 @@ enum class StudentDestination(
     override val sectionGroup: String
 ) : NavDestination {
     DASHBOARD("student_dashboard", "Dashboard", "Beranda", Icons.Rounded.Dashboard, Icons.Outlined.Dashboard, "Utama"),
+    XP_HISTORY("student_xp_history", "Riwayat XP", "Riwayat XP", Icons.Rounded.History, Icons.Outlined.History, "Utama"),
     MY_SCHEDULE("student_schedule", "Jadwal Saya", "Jadwal", Icons.Rounded.CalendarMonth, Icons.Outlined.CalendarMonth, "Perkuliahan"),
     ATTENDANCE("student_attendance", "Absensi", "Absensi", Icons.Rounded.FactCheck, Icons.Outlined.FactCheck, "Perkuliahan"),
     ASSIGNMENTS("student_assignments", "Daftar Tugas", "Tugas", Icons.Rounded.Assignment, Icons.Outlined.Assignment, "Tugas & Nilai"),
@@ -89,6 +95,6 @@ enum class StudentDestination(
     PROFILE("student_profile", "Profil Saya", "Profil", Icons.Rounded.Person, Icons.Outlined.Person, "Akun");
 
     companion object {
-        val bottomBarItems = listOf(DASHBOARD, ATTENDANCE, ASSIGNMENTS, RANKING, PROFILE)
+        val bottomBarItems = listOf(DASHBOARD, XP_HISTORY, ASSIGNMENTS, RANKING, PROFILE)
     }
 }

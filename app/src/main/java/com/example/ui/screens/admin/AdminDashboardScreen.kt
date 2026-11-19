@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Assignment
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Class
 import androidx.compose.material.icons.rounded.FactCheck
@@ -140,6 +141,7 @@ fun AdminDashboardScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 val actions = listOf(
+                    Triple("Beri XP Keaktifan", Icons.Rounded.Bolt, AdminDestination.XP_KEAKTIFAN),
                     Triple("Tambah Mahasiswa", Icons.Rounded.PersonAdd, AdminDestination.STUDENTS),
                     Triple("Buka Absensi", Icons.Rounded.FactCheck, AdminDestination.ATTENDANCE),
                     Triple("Buat Tugas", Icons.Rounded.Add, AdminDestination.ASSIGNMENTS),

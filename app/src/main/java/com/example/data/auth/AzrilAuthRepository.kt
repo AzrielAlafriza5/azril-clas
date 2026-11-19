@@ -10,10 +10,25 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.BuildConfig
+import com.example.ui.model.AcademicClass
 import com.example.ui.model.AccountStatus
+import com.example.ui.model.Assignment
+import com.example.ui.model.AssignmentTargetType
+import com.example.ui.model.AttendanceRecord
+import com.example.ui.model.AttendanceStatus
+import com.example.ui.model.ParticipationXpCategory
+import com.example.ui.model.PointSourceType
+import com.example.ui.model.RankingPointTransaction
+import com.example.ui.model.StreakNotificationLog
+import com.example.ui.model.StreakReminderSlot
+import com.example.ui.model.StudentBadgeStatus
+import com.example.ui.model.StudentRecord
+import com.example.ui.model.StudentStreakState
 import com.example.ui.model.StudyProgram
+import com.example.ui.model.SubmissionMethod
 import com.example.ui.model.UserProfile
 import com.example.ui.model.UserRole
+import com.example.ui.model.XpCategory
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.text.SimpleDateFormat
@@ -166,7 +181,13 @@ data class RestoredSession(
     val profile: UserProfile?,
     val rememberedIdentifier: String,
     val rememberMeEnabled: Boolean,
-    val registeredStudents: List<UserProfile>,
+    val registeredStudents: List<StudentRecord>,
+    val savedClasses: List<AcademicClass>,
+    val savedAssignments: List<Assignment>,
+    val savedXpTransactions: List<RankingPointTransaction> = emptyList(),
+    val savedAttendanceRecords: List<AttendanceRecord> = emptyList(),
+    val savedStreaks: Map<String, StudentStreakState> = emptyMap(),
+    val savedStreakNotifications: List<StreakNotificationLog> = emptyList(),
     val isSupabaseConfigured: Boolean
 )
 
@@ -178,6 +199,12 @@ data class StoredAccountRecord(
     val username: String,
     val studyProgramId: String,
     val studyProgramCode: String,
+    val classId: String? = null,
+    val className: String? = null,
+    val semester: Int = 1,
+    val cohortYear: Int = 2026,
+    val accountStatus: AccountStatus = AccountStatus.ACTIVE,
+    val badgeStatus: StudentBadgeStatus = StudentBadgeStatus.NEUTRAL,
     val role: UserRole,
     val passwordHash: String,
     val createdAt: String
@@ -191,11 +218,28 @@ data class StoredAccountRecord(
         nim = nim,
         studyProgramId = studyProgramId,
         studyProgramName = studyProgramCode,
-        className = "Belum terdaftar di kelas",
-        semester = 1,
-        cohortYear = 2026,
-        status = AccountStatus.ACTIVE,
+        classId = classId,
+        className = className ?: "Belum terdaftar di kelas",
+        semester = semester,
+        cohortYear = cohortYear,
+        status = accountStatus,
+        badgeStatus = badgeStatus,
         createdAt = createdAt
+    )
+
+    fun toStudentRecord(): StudentRecord = StudentRecord(
+        id = id,
+        fullName = fullName,
+        nim = nim,
+        email = email,
+        studyProgramId = studyProgramId,
+        studyProgramName = studyProgramCode,
+        classId = classId,
+        className = className,
+        semester = semester,
+        cohortYear = cohortYear,
+        status = accountStatus,
+        badgeStatus = badgeStatus
     )
 }
 
@@ -213,6 +257,12 @@ class AzrilAuthRepository(
         private const val KEY_REMEMBER_ME = "remember_me_enabled"
         private const val KEY_REMEMBERED_IDENTIFIER = "remembered_identifier"
         private const val KEY_ACCOUNTS_JSON = "registered_accounts_v1"
+        private const val KEY_CLASSES_JSON = "azril_classes_v1"
+        private const val KEY_ASSIGNMENTS_JSON = "azril_assignments_v1"
+        private const val KEY_XP_TRANSACTIONS_JSON = "azril_xp_transactions_v1"
+        private const val KEY_ATTENDANCE_RECORDS_JSON = "azril_attendance_records_v1"
+        private const val KEY_STUDENT_STREAKS_JSON = "azril_student_streaks_v1"
+        private const val KEY_STREAK_NOTIFS_JSON = "azril_streak_notifs_v1"
 
         private const val REMEMBER_SESSION_DURATION_MS = 30L * 24 * 60 * 60 * 1000
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -236,14 +286,19 @@ class AzrilAuthRepository(
         val token = store.getString(KEY_SESSION_TOKEN)
         val expiresAt = store.getLong(KEY_SESSION_EXPIRES_AT, 0L)
         val accounts = loadLocalAccounts()
-        val registeredProfiles = accounts.filter { it.role == UserRole.STUDENT }.map { it.toUserProfile() }
+        val registeredStudents = accounts.filter { it.role == UserRole.STUDENT }.map { it.toStudentRecord() }
+        val savedClasses = loadLocalClasses()
+        val savedAssignments = loadLocalAssignments()
+        val savedXpTransactions = loadLocalXpTransactions()
+        val savedAttendanceRecords = loadLocalAttendanceRecords()
+        val savedStreaks = loadLocalStudentStreaks()
+        val savedStreakNotifications = loadLocalStreakNotifications()
 
         val restoredProfile = if (rememberMe && !token.isNullOrBlank() && System.currentTimeMillis() < expiresAt) {
             val userId = store.getString(KEY_SESSION_USER_ID)
             val fromLocal = accounts.find { it.id == userId }?.toUserProfile()
             fromLocal ?: deserializeProfile(store.getString(KEY_SESSION_PROFILE_JSON))
         } else {
-            // Session expired or Remember Me disabled -> clear stale session token while keeping remembered identifier
             store.putString(KEY_SESSION_TOKEN, null)
             store.putString(KEY_SESSION_USER_ID, null)
             store.putString(KEY_SESSION_PROFILE_JSON, null)
@@ -255,116 +310,233 @@ class AzrilAuthRepository(
             profile = restoredProfile,
             rememberedIdentifier = rememberedIdentifier,
             rememberMeEnabled = rememberMe,
-            registeredStudents = registeredProfiles,
+            registeredStudents = registeredStudents,
+            savedClasses = savedClasses,
+            savedAssignments = savedAssignments,
+            savedXpTransactions = savedXpTransactions,
+            savedAttendanceRecords = savedAttendanceRecords,
+            savedStreaks = savedStreaks,
+            savedStreakNotifications = savedStreakNotifications,
             isSupabaseConfigured = isSupabaseConfigured()
         )
     }
 
-    suspend fun registerStudent(
+    /**
+     * Admin-only student provisioning.
+     * Password is NEVER stored in plaintext — strictly hashed via PBKDF2WithHmacSHA256.
+     */
+    suspend fun adminCreateStudentAccount(
+        studentId: String = UUID.randomUUID().toString(),
         fullName: String,
         nim: String,
-        emailOrUsername: String,
-        password: String,
-        confirmPassword: String,
+        email: String,
+        studyProgramId: String,
         studyProgramCode: String,
-        rememberMe: Boolean
+        classId: String?,
+        className: String?,
+        semester: Int,
+        cohortYear: Int,
+        accountStatus: AccountStatus,
+        badgeStatus: StudentBadgeStatus,
+        initialPassword: String
     ): AuthResult = withContext(Dispatchers.IO) {
         val cleanName = fullName.trim()
         val cleanNim = nim.trim()
-        val cleanInput = emailOrUsername.trim().lowercase(Locale.US)
-        val prodi = OfficialStudyPrograms.findByCode(studyProgramCode)
+        val cleanEmail = email.trim().lowercase(Locale.US)
 
-        if (cleanName.length < 3) return@withContext AuthResult.Failure("Nama lengkap wajib diisi (minimal 3 karakter).")
-        if (cleanNim.length < 5) return@withContext AuthResult.Failure("NIM wajib diisi (minimal 5 karakter).")
-        if (cleanInput.length < 3) return@withContext AuthResult.Failure("Email atau username wajib diisi (minimal 3 karakter).")
-        if (cleanInput.contains(" ")) return@withContext AuthResult.Failure("Email atau username tidak boleh mengandung spasi.")
-        if (password.length < 8) return@withContext AuthResult.Failure("Kata sandi minimal 8 karakter.")
-        if (password != confirmPassword) return@withContext AuthResult.Failure("Konfirmasi kata sandi tidak cocok.")
-        if (prodi == null) return@withContext AuthResult.Failure("Pilih program studi yang valid (HES, PJKR, atau FARMASI).")
+        if (cleanName.length < 3) return@withContext AuthResult.Failure("Nama lengkap minimal 3 karakter.")
+        if (cleanNim.length < 5) return@withContext AuthResult.Failure("NIM minimal 5 karakter.")
+        if (cleanNim.contains(" ")) return@withContext AuthResult.Failure("NIM tidak boleh mengandung spasi.")
+        if (!cleanEmail.contains("@") || !cleanEmail.contains(".")) return@withContext AuthResult.Failure("Format email akademik tidak valid.")
+        if (initialPassword.length < 6) return@withContext AuthResult.Failure("Password awal mahasiswa minimal 6 karakter.")
 
-        val isEmailInput = cleanInput.contains("@") && cleanInput.contains(".")
-        val resolvedEmail = if (isEmailInput) cleanInput else "$cleanInput@mahasiswa.azrilclas.ac.id"
-        val resolvedUsername = if (isEmailInput) cleanInput.substringBefore("@") else cleanInput
-
-        if (isSupabaseConfigured()) {
-            val remoteResult = registerViaSupabase(
-                fullName = cleanName,
-                nim = cleanNim,
-                email = resolvedEmail,
-                username = resolvedUsername,
-                password = password,
-                prodi = prodi,
-                rememberMe = rememberMe,
-                loginIdentifier = cleanInput
-            )
-            if (remoteResult is AuthResult.Success || remoteResult is AuthResult.Failure) {
-                return@withContext remoteResult
-            }
-        }
-
-        // Secure local credential store fallback (PBKDF2WithHmacSHA256 + unique NIM/email/username check)
         val accounts = loadLocalAccounts()
         if (accounts.any { it.nim.equals(cleanNim, ignoreCase = true) }) {
-            return@withContext AuthResult.Failure("NIM '$cleanNim' sudah terdaftar pada akun lain.")
+            return@withContext AuthResult.Failure("NIM '$cleanNim' sudah terdaftar pada akun mahasiswa lain.")
         }
-        if (accounts.any { it.email.equals(resolvedEmail, ignoreCase = true) }) {
-            return@withContext AuthResult.Failure("Email '$resolvedEmail' sudah digunakan oleh akun lain.")
-        }
-        if (accounts.any { it.username.equals(resolvedUsername, ignoreCase = true) }) {
-            return@withContext AuthResult.Failure("Username '$resolvedUsername' sudah digunakan oleh akun lain.")
+        if (accounts.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
+            return@withContext AuthResult.Failure("Email '$cleanEmail' sudah digunakan oleh akun lain.")
         }
 
-        val newRecord = StoredAccountRecord(
-            id = UUID.randomUUID().toString(),
+        val record = StoredAccountRecord(
+            id = studentId,
             fullName = cleanName,
             nim = cleanNim,
-            email = resolvedEmail,
-            username = resolvedUsername,
-            studyProgramId = prodi.id,
-            studyProgramCode = prodi.code,
-            role = UserRole.STUDENT, // Always assigned by system, never user-chosen
-            passwordHash = PasswordHasher.hashPassword(password),
+            email = cleanEmail,
+            username = cleanNim,
+            studyProgramId = studyProgramId,
+            studyProgramCode = studyProgramCode,
+            classId = classId,
+            className = className,
+            semester = semester,
+            cohortYear = cohortYear,
+            accountStatus = accountStatus,
+            badgeStatus = badgeStatus,
+            role = UserRole.STUDENT,
+            passwordHash = PasswordHasher.hashPassword(initialPassword),
             createdAt = nowIso()
         )
-        saveLocalAccounts(listOf(newRecord) + accounts)
-
-        val profile = newRecord.toUserProfile()
-        persistSessionState(
-            profile = profile,
-            token = "azr_sess_${UUID.randomUUID()}",
-            identifier = cleanInput,
-            rememberMe = rememberMe
-        )
-        AuthResult.Success(profile = profile, usingSupabase = false)
+        saveLocalAccounts(listOf(record) + accounts)
+        AuthResult.Success(profile = record.toUserProfile(), usingSupabase = isSupabaseConfigured())
     }
 
+    suspend fun adminUpdateStudentAccount(
+        studentId: String,
+        fullName: String,
+        nim: String,
+        email: String,
+        studyProgramId: String,
+        studyProgramCode: String,
+        classId: String?,
+        className: String?,
+        semester: Int,
+        cohortYear: Int,
+        accountStatus: AccountStatus,
+        badgeStatus: StudentBadgeStatus
+    ): AuthResult = withContext(Dispatchers.IO) {
+        val cleanName = fullName.trim()
+        val cleanNim = nim.trim()
+        val cleanEmail = email.trim().lowercase(Locale.US)
+        if (cleanName.length < 3) return@withContext AuthResult.Failure("Nama lengkap minimal 3 karakter.")
+        if (cleanNim.length < 5) return@withContext AuthResult.Failure("NIM minimal 5 karakter.")
+        if (cleanNim.contains(" ")) return@withContext AuthResult.Failure("NIM tidak boleh mengandung spasi.")
+        if (!cleanEmail.contains("@") || !cleanEmail.contains(".")) return@withContext AuthResult.Failure("Format email tidak valid.")
+
+        val accounts = loadLocalAccounts()
+        if (accounts.any { it.id != studentId && it.nim.equals(cleanNim, ignoreCase = true) }) {
+            return@withContext AuthResult.Failure("NIM '$cleanNim' sudah digunakan oleh mahasiswa lain.")
+        }
+        if (accounts.any { it.id != studentId && it.email.equals(cleanEmail, ignoreCase = true) }) {
+            return@withContext AuthResult.Failure("Email '$cleanEmail' sudah digunakan oleh akun lain.")
+        }
+
+        val existing = accounts.find { it.id == studentId }
+        val updated = if (existing != null) {
+            existing.copy(
+                fullName = cleanName,
+                nim = cleanNim,
+                email = cleanEmail,
+                username = cleanNim,
+                studyProgramId = studyProgramId,
+                studyProgramCode = studyProgramCode,
+                classId = classId,
+                className = className,
+                semester = semester,
+                cohortYear = cohortYear,
+                accountStatus = accountStatus,
+                badgeStatus = badgeStatus
+            )
+        } else {
+            StoredAccountRecord(
+                id = studentId,
+                fullName = cleanName,
+                nim = cleanNim,
+                email = cleanEmail,
+                username = cleanNim,
+                studyProgramId = studyProgramId,
+                studyProgramCode = studyProgramCode,
+                classId = classId,
+                className = className,
+                semester = semester,
+                cohortYear = cohortYear,
+                accountStatus = accountStatus,
+                badgeStatus = badgeStatus,
+                role = UserRole.STUDENT,
+                passwordHash = PasswordHasher.hashPassword(cleanNim),
+                createdAt = nowIso()
+            )
+        }
+        val nextList = if (existing != null) {
+            accounts.map { if (it.id == studentId) updated else it }
+        } else {
+            listOf(updated) + accounts
+        }
+        saveLocalAccounts(nextList)
+        syncStudentBadgeToSupabaseIfConnected(studentId, badgeStatus)
+        AuthResult.Success(profile = updated.toUserProfile(), usingSupabase = isSupabaseConfigured())
+    }
+
+    suspend fun adminUpdateStudentBadgeStatus(
+        studentId: String,
+        badgeStatus: StudentBadgeStatus
+    ): Boolean = withContext(Dispatchers.IO) {
+        val accounts = loadLocalAccounts()
+        val updated = accounts.map { acc ->
+            if (acc.id == studentId) acc.copy(badgeStatus = badgeStatus) else acc
+        }
+        saveLocalAccounts(updated)
+        syncStudentBadgeToSupabaseIfConnected(studentId, badgeStatus)
+        true
+    }
+
+    suspend fun adminResetStudentPassword(
+        studentId: String,
+        newPassword: String
+    ): String? = withContext(Dispatchers.IO) {
+        if (newPassword.length < 6) return@withContext "Kata sandi baru minimal 6 karakter."
+        val accounts = loadLocalAccounts()
+        val target = accounts.find { it.id == studentId }
+            ?: return@withContext "Akun mahasiswa tidak ditemukan."
+        val newHash = PasswordHasher.hashPassword(newPassword)
+        val updated = accounts.map { acc ->
+            if (acc.id == target.id) acc.copy(passwordHash = newHash) else acc
+        }
+        saveLocalAccounts(updated)
+        null
+    }
+
+    suspend fun adminDeleteStudentAccount(studentId: String) = withContext(Dispatchers.IO) {
+        val accounts = loadLocalAccounts().filterNot { it.id == studentId }
+        saveLocalAccounts(accounts)
+    }
+
+    /**
+     * Student login uses NIM (unique) + Password provisioned by Admin.
+     * Also supports username/email resolution for Admin or legacy accounts.
+     */
     suspend fun login(
         identifier: String,
         password: String,
         rememberMe: Boolean
     ): AuthResult = withContext(Dispatchers.IO) {
-        val cleanId = identifier.trim().lowercase(Locale.US)
-        if (cleanId.isEmpty()) return@withContext AuthResult.Failure("Email atau username wajib diisi.")
+        val cleanId = identifier.trim()
+        val cleanLower = cleanId.lowercase(Locale.US)
+        if (cleanId.isEmpty()) return@withContext AuthResult.Failure("NIM wajib diisi.")
         if (password.isEmpty()) return@withContext AuthResult.Failure("Kata sandi wajib diisi.")
 
         if (isSupabaseConfigured()) {
-            return@withContext loginViaSupabase(cleanId, password, rememberMe)
+            val remoteResult = loginViaSupabase(cleanId, password, rememberMe)
+            if (remoteResult is AuthResult.Success) return@withContext remoteResult
+            // If Supabase returns failure, check if an Admin-created local account exists before returning remote error
+            val localAccounts = loadLocalAccounts()
+            val localMatch = localAccounts.find {
+                it.nim.equals(cleanId, ignoreCase = true) ||
+                    it.username.equals(cleanLower, ignoreCase = true) ||
+                    it.email.equals(cleanLower, ignoreCase = true)
+            }
+            if (localMatch == null) return@withContext remoteResult
         }
 
         val accounts = loadLocalAccounts()
         val matched = accounts.find {
-            it.email.equals(cleanId, ignoreCase = true) || it.username.equals(cleanId, ignoreCase = true)
-        } ?: return@withContext AuthResult.Failure("Akun tidak ditemukan. Periksa username/email atau daftar akun baru.")
+            it.nim.equals(cleanId, ignoreCase = true) ||
+                it.username.equals(cleanLower, ignoreCase = true) ||
+                it.email.equals(cleanLower, ignoreCase = true)
+        } ?: return@withContext AuthResult.Failure("NIM tidak terdaftar. Hubungi Admin untuk pembuatan akun mahasiswa.")
+
+        if (matched.accountStatus == AccountStatus.INACTIVE) {
+            return@withContext AuthResult.Failure("Akun mahasiswa ini sedang dinonaktifkan oleh Admin.")
+        }
 
         if (!PasswordHasher.verifyPassword(password, matched.passwordHash)) {
-            return@withContext AuthResult.Failure("Kata sandi salah. Silakan coba lagi.")
+            return@withContext AuthResult.Failure("Kata sandi salah. Hubungi Admin jika Anda lupa kata sandi.")
         }
 
         val profile = matched.toUserProfile()
         persistSessionState(
             profile = profile,
             token = "azr_sess_${UUID.randomUUID()}",
-            identifier = cleanId,
+            identifier = matched.nim.ifBlank { cleanId },
             rememberMe = rememberMe
         )
         AuthResult.Success(profile = profile, usingSupabase = false)
@@ -383,7 +555,6 @@ class AzrilAuthRepository(
                 httpClient.newCall(req).execute().close()
             }
         }
-        // End session immediately; keep remembered identifier ONLY if Remember Me was enabled (NEVER password)
         store.putString(KEY_SESSION_TOKEN, null)
         store.putString(KEY_SESSION_USER_ID, null)
         store.putString(KEY_SESSION_PROFILE_JSON, null)
@@ -393,8 +564,202 @@ class AzrilAuthRepository(
         }
     }
 
-    suspend fun getRegisteredStudents(): List<UserProfile> = withContext(Dispatchers.IO) {
-        loadLocalAccounts().filter { it.role == UserRole.STUDENT }.map { it.toUserProfile() }
+    suspend fun getRegisteredStudents(): List<StudentRecord> = withContext(Dispatchers.IO) {
+        loadLocalAccounts().filter { it.role == UserRole.STUDENT }.map { it.toStudentRecord() }
+    }
+
+    suspend fun saveClasses(classes: List<AcademicClass>) = withContext(Dispatchers.IO) {
+        val arr = JSONArray()
+        classes.forEach { cls ->
+            arr.put(JSONObject().apply {
+                put("id", cls.id)
+                put("name", cls.name)
+                put("study_program_id", cls.studyProgramId)
+                put("study_program_name", cls.studyProgramName)
+                put("semester", cls.semester)
+                put("academic_year", cls.academicYear)
+                put("cohort_year", cls.cohortYear)
+                put("description", cls.description)
+                put("is_active", cls.isActive)
+                put("member_ids", JSONArray(cls.memberIds))
+            })
+        }
+        store.putString(KEY_CLASSES_JSON, arr.toString())
+    }
+
+    suspend fun saveAssignments(assignments: List<Assignment>) = withContext(Dispatchers.IO) {
+        val arr = JSONArray()
+        assignments.forEach { a ->
+            arr.put(JSONObject().apply {
+                put("id", a.id)
+                put("title", a.title)
+                put("description", a.description)
+                put("instructions", a.instructions)
+                put("class_id", a.classId)
+                put("class_name", a.className)
+                put("target_type", a.targetType.dbValue)
+                put("target_class_ids", JSONArray(a.targetClassIds))
+                put("target_class_names", JSONArray(a.targetClassNames))
+                put("target_study_program_ids", JSONArray(a.targetStudyProgramIds))
+                put("target_study_program_codes", JSONArray(a.targetStudyProgramCodes))
+                put("course_category", a.courseCategory)
+                put("created_at", a.createdAt)
+                put("deadline", a.deadline)
+                if (a.deadlineEpochMillis != null) put("deadline_epoch_millis", a.deadlineEpochMillis)
+                put("allowed_formats", JSONArray(a.allowedFormats))
+                put("max_file_size_mb", a.maxFileSizeMb)
+                put("submission_method", a.submissionMethod.name)
+                put("file1_name", a.file1Name ?: "")
+                put("file1_url", a.file1Url ?: "")
+                put("file2_name", a.file2Name ?: "")
+                put("file2_url", a.file2Url ?: "")
+                put("material_attachment", a.materialAttachment ?: "")
+                put("is_active", a.isActive)
+            })
+        }
+        store.putString(KEY_ASSIGNMENTS_JSON, arr.toString())
+    }
+
+    suspend fun saveXpTransactions(transactions: List<RankingPointTransaction>) = withContext(Dispatchers.IO) {
+        val arr = JSONArray()
+        transactions.forEach { tx ->
+            arr.put(JSONObject().apply {
+                put("id", tx.id)
+                put("student_id", tx.studentId)
+                put("source_type", tx.sourceType.name)
+                put("source_id", tx.sourceId)
+                put("points", tx.points)
+                put("description", tx.description)
+                put("created_at", tx.createdAt)
+                put("updated_at", tx.updatedAt)
+                put("timestamp_millis", tx.timestampMillis)
+                put("xp_category", tx.xpCategory.name)
+                put("activity_title", tx.activityTitle)
+                put("semester_key", tx.semesterKey)
+                put("admin_id", tx.adminId ?: "")
+                put("admin_name", tx.adminName ?: "")
+            })
+        }
+        store.putString(KEY_XP_TRANSACTIONS_JSON, arr.toString())
+    }
+
+    suspend fun saveAttendanceRecords(records: List<AttendanceRecord>) = withContext(Dispatchers.IO) {
+        val arr = JSONArray()
+        records.forEach { r ->
+            arr.put(JSONObject().apply {
+                put("id", r.id)
+                put("session_id", r.sessionId)
+                put("meeting_title", r.meetingTitle)
+                put("class_name", r.className)
+                put("student_id", r.studentId)
+                put("student_name", r.studentName)
+                put("student_nim", r.studentNim)
+                put("date_label", r.dateLabel)
+                put("recorded_at", r.recordedAt)
+                put("status", r.status.name)
+                put("correction_reason", r.correctionReason ?: "")
+                put("semester_key", r.semesterKey)
+                put("timestamp_millis", r.timestampMillis)
+            })
+        }
+        store.putString(KEY_ATTENDANCE_RECORDS_JSON, arr.toString())
+    }
+
+    suspend fun saveStudentStreaks(streaks: Map<String, StudentStreakState>) = withContext(Dispatchers.IO) {
+        val arr = JSONArray()
+        streaks.values.forEach { s ->
+            arr.put(JSONObject().apply {
+                put("student_id", s.studentId)
+                put("current_streak", s.currentStreak)
+                put("longest_streak", s.longestStreak)
+                put("last_login_date_wib", s.lastLoginDateWib ?: "")
+                put("streak_cycle_id", s.streakCycleId)
+                put("login_dates_wib", JSONArray(s.loginDatesWib))
+                put("claimed_milestones", JSONArray(s.claimedMilestonesInCycle))
+            })
+        }
+        store.putString(KEY_STUDENT_STREAKS_JSON, arr.toString())
+    }
+
+    suspend fun saveStreakNotificationLogs(logs: List<StreakNotificationLog>) = withContext(Dispatchers.IO) {
+        val arr = JSONArray()
+        logs.forEach { l ->
+            arr.put(JSONObject().apply {
+                put("id", l.id)
+                put("student_id", l.studentId)
+                put("reminder_date_wib", l.reminderDateWib)
+                put("slot", l.slot.name)
+                put("message", l.message)
+                put("sent_at_label", l.sentAtLabel)
+                put("timestamp_millis", l.timestampMillis)
+            })
+        }
+        store.putString(KEY_STREAK_NOTIFS_JSON, arr.toString())
+    }
+
+    suspend fun syncLoginStreakToSupabaseIfConnected() = withContext(Dispatchers.IO) {
+        if (!isSupabaseConfigured()) return@withContext
+        val jwt = store.getString(KEY_SESSION_TOKEN) ?: return@withContext
+        if (jwt.startsWith("azr_sess_")) return@withContext
+        runCatching {
+            val base = supabaseUrl.trimEnd('/')
+            val req = Request.Builder()
+                .url("$base/rest/v1/rpc/record_student_login_streak")
+                .post("{}".toRequestBody(JSON_MEDIA_TYPE))
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Authorization", "Bearer $jwt")
+                .addHeader("Content-Type", "application/json")
+                .build()
+            httpClient.newCall(req).execute().close()
+        }
+    }
+
+    suspend fun syncParticipationXpToSupabaseIfConnected(
+        studentId: String,
+        category: ParticipationXpCategory,
+        note: String,
+        semesterKey: String
+    ) = withContext(Dispatchers.IO) {
+        if (!isSupabaseConfigured()) return@withContext
+        val jwt = store.getString(KEY_SESSION_TOKEN) ?: return@withContext
+        if (jwt.startsWith("azr_sess_")) return@withContext
+        runCatching {
+            val base = supabaseUrl.trimEnd('/')
+            val payload = JSONObject().apply {
+                put("p_student_id", studentId)
+                put("p_category", category.xpCategory.name)
+                put("p_note", note)
+                put("p_semester_key", semesterKey)
+            }
+            val req = Request.Builder()
+                .url("$base/rest/v1/rpc/admin_award_participation_xp")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Authorization", "Bearer $jwt")
+                .addHeader("Content-Type", "application/json")
+                .build()
+            httpClient.newCall(req).execute().close()
+        }
+    }
+
+    private suspend fun syncStudentBadgeToSupabaseIfConnected(studentId: String, badgeStatus: StudentBadgeStatus) {
+        if (!isSupabaseConfigured()) return
+        val jwt = store.getString(KEY_SESSION_TOKEN) ?: return
+        if (jwt.startsWith("azr_sess_")) return
+        runCatching {
+            val base = supabaseUrl.trimEnd('/')
+            val body = JSONObject().apply {
+                put("student_badge_status", badgeStatus.dbValue)
+            }
+            val req = Request.Builder()
+                .url("$base/rest/v1/profiles?id=eq.$studentId")
+                .patch(body.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Authorization", "Bearer $jwt")
+                .addHeader("Content-Type", "application/json")
+                .build()
+            httpClient.newCall(req).execute().close()
+        }
     }
 
     private suspend fun persistSessionState(
@@ -411,76 +776,11 @@ class AzrilAuthRepository(
             store.putString(KEY_SESSION_PROFILE_JSON, serializeProfile(profile))
             store.putLong(KEY_SESSION_EXPIRES_AT, System.currentTimeMillis() + REMEMBER_SESSION_DURATION_MS)
         } else {
-            // Do not persist long-lived session across app restart when Remember Me is unchecked
             store.putString(KEY_REMEMBERED_IDENTIFIER, null)
             store.putString(KEY_SESSION_TOKEN, null)
             store.putString(KEY_SESSION_USER_ID, null)
             store.putString(KEY_SESSION_PROFILE_JSON, null)
             store.putLong(KEY_SESSION_EXPIRES_AT, 0L)
-        }
-    }
-
-    private suspend fun registerViaSupabase(
-        fullName: String,
-        nim: String,
-        email: String,
-        username: String,
-        password: String,
-        prodi: StudyProgram,
-        rememberMe: Boolean,
-        loginIdentifier: String
-    ): AuthResult {
-        return try {
-            val base = supabaseUrl.trimEnd('/')
-            val payload = JSONObject().apply {
-                put("email", email)
-                put("password", password)
-                put("data", JSONObject().apply {
-                    put("full_name", fullName)
-                    put("nim", nim)
-                    put("username", username)
-                    put("study_program_code", prodi.code)
-                })
-            }
-            val request = Request.Builder()
-                .url("$base/auth/v1/signup")
-                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                .addHeader("apikey", supabaseAnonKey.trim())
-                .addHeader("Content-Type", "application/json")
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                val body = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    val msg = runCatching { JSONObject(body).optString("msg").ifBlank { JSONObject(body).optString("error_description") } }
-                        .getOrDefault("")
-                        .ifBlank { "Pendaftaran gagal (${response.code}). Pastikan NIM, email, dan username belum terdaftar." }
-                    return AuthResult.Failure(msg)
-                }
-                val json = JSONObject(body)
-                val accessToken = json.optString("access_token")
-                val userObj = json.optJSONObject("user") ?: json
-                val userId = userObj.optString("id").ifBlank { UUID.randomUUID().toString() }
-                val profile = UserProfile(
-                    id = userId,
-                    fullName = fullName,
-                    email = email,
-                    username = username,
-                    role = UserRole.STUDENT,
-                    nim = nim,
-                    studyProgramId = prodi.id,
-                    studyProgramName = prodi.code,
-                    className = "Belum terdaftar di kelas",
-                    semester = 1,
-                    cohortYear = 2026,
-                    status = AccountStatus.ACTIVE,
-                    createdAt = nowIso()
-                )
-                persistSessionState(profile, accessToken.ifBlank { "supabase_pending" }, loginIdentifier, rememberMe)
-                AuthResult.Success(profile = profile, usingSupabase = true)
-            }
-        } catch (e: Exception) {
-            AuthResult.Failure("Tidak dapat terhubung ke Supabase Auth: ${e.localizedMessage ?: "kesalahan jaringan"}")
         }
     }
 
@@ -492,10 +792,10 @@ class AzrilAuthRepository(
         return try {
             val base = supabaseUrl.trimEnd('/')
             val resolvedEmail = if (identifier.contains("@")) {
-                identifier
+                identifier.lowercase(Locale.US)
             } else {
-                resolveEmailFromSupabaseUsername(base, identifier)
-                    ?: return AuthResult.Failure("Username tidak ditemukan di database.")
+                resolveEmailFromSupabaseIdentifier(base, identifier)
+                    ?: return AuthResult.Failure("NIM atau akun tidak ditemukan di database.")
             }
 
             val payload = JSONObject().apply {
@@ -512,7 +812,7 @@ class AzrilAuthRepository(
             httpClient.newCall(request).execute().use { response ->
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
-                    return AuthResult.Failure("Email/username atau kata sandi tidak sesuai.")
+                    return AuthResult.Failure("NIM atau kata sandi tidak sesuai.")
                 }
                 val json = JSONObject(body)
                 val accessToken = json.optString("access_token")
@@ -529,8 +829,8 @@ class AzrilAuthRepository(
         }
     }
 
-    private fun resolveEmailFromSupabaseUsername(baseUrl: String, username: String): String? {
-        val body = JSONObject().apply { put("p_identifier", username) }
+    private fun resolveEmailFromSupabaseIdentifier(baseUrl: String, identifier: String): String? {
+        val body = JSONObject().apply { put("p_identifier", identifier) }
         val req = Request.Builder()
             .url("$baseUrl/rest/v1/rpc/resolve_login_email")
             .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
@@ -545,7 +845,7 @@ class AzrilAuthRepository(
 
     private fun fetchSupabaseProfile(baseUrl: String, jwt: String, userId: String, fallbackEmail: String): UserProfile? {
         val req = Request.Builder()
-            .url("$baseUrl/rest/v1/profiles?id=eq.$userId&select=id,full_name,nim,email,username,study_program_id,role,created_at,study_programs(code,name)")
+            .url("$baseUrl/rest/v1/profiles?id=eq.$userId&select=id,full_name,nim,email,username,study_program_id,class_id,semester,cohort_year,student_badge_status,role,created_at,study_programs(code,name)")
             .get()
             .addHeader("apikey", supabaseAnonKey.trim())
             .addHeader("Authorization", "Bearer $jwt")
@@ -557,6 +857,7 @@ class AzrilAuthRepository(
             val row = arr.getJSONObject(0)
             val prodiObj = row.optJSONObject("study_programs")
             val roleStr = row.optString("role", "student")
+            val prodiCode = prodiObj?.optString("code")?.ifBlank { null } ?: prodiObj?.optString("name")
             UserProfile(
                 id = row.optString("id", userId),
                 fullName = row.optString("full_name", "Mahasiswa"),
@@ -565,9 +866,13 @@ class AzrilAuthRepository(
                 role = if (roleStr.equals("admin", ignoreCase = true)) UserRole.ADMIN else UserRole.STUDENT,
                 nim = row.optString("nim").ifBlank { null },
                 studyProgramId = row.optString("study_program_id").ifBlank { null },
-                studyProgramName = prodiObj?.optString("code")?.ifBlank { null } ?: prodiObj?.optString("name"),
-                className = "Terhubung ke Supabase",
+                studyProgramName = prodiCode,
+                classId = row.optString("class_id").ifBlank { null },
+                className = row.optString("class_id").ifBlank { "Terhubung ke Supabase" },
+                semester = row.optInt("semester", 1),
+                cohortYear = row.optInt("cohort_year", 2026),
                 status = AccountStatus.ACTIVE,
+                badgeStatus = StudentBadgeStatus.fromDbValue(row.optString("student_badge_status", "neutral")),
                 createdAt = row.optString("created_at").ifBlank { null }
             )
         }
@@ -584,9 +889,17 @@ class AzrilAuthRepository(
                     fullName = o.getString("full_name"),
                     nim = o.getString("nim"),
                     email = o.getString("email"),
-                    username = o.getString("username"),
+                    username = o.optString("username", o.getString("nim")),
                     studyProgramId = o.getString("study_program_id"),
                     studyProgramCode = o.getString("study_program_code"),
+                    classId = o.optString("class_id").ifBlank { null },
+                    className = o.optString("class_name").ifBlank { null },
+                    semester = o.optInt("semester", 1),
+                    cohortYear = o.optInt("cohort_year", 2026),
+                    accountStatus = runCatching {
+                        AccountStatus.valueOf(o.optString("account_status", AccountStatus.ACTIVE.name))
+                    }.getOrDefault(AccountStatus.ACTIVE),
+                    badgeStatus = StudentBadgeStatus.fromDbValue(o.optString("badge_status", "neutral")),
                     role = if (o.optString("role") == "ADMIN") UserRole.ADMIN else UserRole.STUDENT,
                     passwordHash = o.getString("password_hash"),
                     createdAt = o.optString("created_at")
@@ -606,12 +919,189 @@ class AzrilAuthRepository(
                 put("username", acc.username)
                 put("study_program_id", acc.studyProgramId)
                 put("study_program_code", acc.studyProgramCode)
+                put("class_id", acc.classId ?: "")
+                put("class_name", acc.className ?: "")
+                put("semester", acc.semester)
+                put("cohort_year", acc.cohortYear)
+                put("account_status", acc.accountStatus.name)
+                put("badge_status", acc.badgeStatus.dbValue)
                 put("role", acc.role.name)
                 put("password_hash", acc.passwordHash)
                 put("created_at", acc.createdAt)
             })
         }
         store.putString(KEY_ACCOUNTS_JSON, arr.toString())
+    }
+
+    private suspend fun loadLocalClasses(): List<AcademicClass> {
+        val raw = store.getString(KEY_CLASSES_JSON) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                AcademicClass(
+                    id = o.getString("id"),
+                    name = o.getString("name"),
+                    studyProgramId = o.getString("study_program_id"),
+                    studyProgramName = o.getString("study_program_name"),
+                    semester = o.optInt("semester", 1),
+                    academicYear = o.optString("academic_year", "2026/2027"),
+                    cohortYear = o.optInt("cohort_year", 2026),
+                    description = o.optString("description", ""),
+                    isActive = o.optBoolean("is_active", true),
+                    memberIds = o.optJSONArray("member_ids").toStringList()
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private suspend fun loadLocalAssignments(): List<Assignment> {
+        val raw = store.getString(KEY_ASSIGNMENTS_JSON) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                Assignment(
+                    id = o.getString("id"),
+                    title = o.getString("title"),
+                    description = o.optString("description", ""),
+                    instructions = o.optString("instructions", ""),
+                    classId = o.optString("class_id", ""),
+                    className = o.optString("class_name", ""),
+                    targetType = AssignmentTargetType.fromDbValue(o.optString("target_type", "class")),
+                    targetClassIds = o.optJSONArray("target_class_ids").toStringList(),
+                    targetClassNames = o.optJSONArray("target_class_names").toStringList(),
+                    targetStudyProgramIds = o.optJSONArray("target_study_program_ids").toStringList(),
+                    targetStudyProgramCodes = o.optJSONArray("target_study_program_codes").toStringList(),
+                    courseCategory = o.optString("course_category", "Umum"),
+                    createdAt = o.optString("created_at", ""),
+                    deadline = o.optString("deadline", ""),
+                    deadlineEpochMillis = if (o.has("deadline_epoch_millis")) o.optLong("deadline_epoch_millis") else null,
+                    allowedFormats = o.optJSONArray("allowed_formats").toStringList().ifEmpty { listOf("PDF", "DOCX") },
+                    maxFileSizeMb = o.optInt("max_file_size_mb", 10),
+                    submissionMethod = runCatching {
+                        SubmissionMethod.valueOf(o.optString("submission_method", SubmissionMethod.BOTH.name))
+                    }.getOrDefault(SubmissionMethod.BOTH),
+                    file1Name = o.optString("file1_name").ifBlank { null },
+                    file1Url = o.optString("file1_url").ifBlank { null },
+                    file2Name = o.optString("file2_name").ifBlank { null },
+                    file2Url = o.optString("file2_url").ifBlank { null },
+                    materialAttachment = o.optString("material_attachment").ifBlank { null },
+                    isActive = o.optBoolean("is_active", true)
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private suspend fun loadLocalXpTransactions(): List<RankingPointTransaction> {
+        val raw = store.getString(KEY_XP_TRANSACTIONS_JSON) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                val sourceType = runCatching {
+                    PointSourceType.valueOf(o.optString("source_type", PointSourceType.ATTENDANCE.name))
+                }.getOrDefault(PointSourceType.ATTENDANCE)
+                val xpCategory = runCatching {
+                    XpCategory.valueOf(o.optString("xp_category", XpCategory.fromSourceType(sourceType).name))
+                }.getOrDefault(XpCategory.fromSourceType(sourceType))
+                RankingPointTransaction(
+                    id = o.getString("id"),
+                    studentId = o.getString("student_id"),
+                    sourceType = sourceType,
+                    sourceId = o.optString("source_id", o.getString("id")),
+                    points = o.optInt("points", 0),
+                    description = o.optString("description", ""),
+                    createdAt = o.optString("created_at", ""),
+                    updatedAt = o.optString("updated_at", ""),
+                    timestampMillis = o.optLong("timestamp_millis", System.currentTimeMillis()),
+                    xpCategory = xpCategory,
+                    activityTitle = o.optString("activity_title", o.optString("description", "")),
+                    semesterKey = o.optString("semester_key", "2026/2027-Ganjil"),
+                    adminId = o.optString("admin_id").ifBlank { null },
+                    adminName = o.optString("admin_name").ifBlank { null }
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private suspend fun loadLocalAttendanceRecords(): List<AttendanceRecord> {
+        val raw = store.getString(KEY_ATTENDANCE_RECORDS_JSON) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                AttendanceRecord(
+                    id = o.getString("id"),
+                    sessionId = o.getString("session_id"),
+                    meetingTitle = o.optString("meeting_title", ""),
+                    className = o.optString("class_name", ""),
+                    studentId = o.getString("student_id"),
+                    studentName = o.optString("student_name", ""),
+                    studentNim = o.optString("student_nim", "-"),
+                    dateLabel = o.optString("date_label", ""),
+                    recordedAt = o.optString("recorded_at", ""),
+                    status = runCatching {
+                        AttendanceStatus.valueOf(o.optString("status", AttendanceStatus.HADIR.name))
+                    }.getOrDefault(AttendanceStatus.HADIR),
+                    correctionReason = o.optString("correction_reason").ifBlank { null },
+                    semesterKey = o.optString("semester_key", "2026/2027-Ganjil"),
+                    timestampMillis = o.optLong("timestamp_millis", System.currentTimeMillis())
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private suspend fun loadLocalStudentStreaks(): Map<String, StudentStreakState> {
+        val raw = store.getString(KEY_STUDENT_STREAKS_JSON) ?: return emptyMap()
+        return runCatching {
+            val arr = JSONArray(raw)
+            val result = mutableMapOf<String, StudentStreakState>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val studentId = o.getString("student_id")
+                val milestonesArr = o.optJSONArray("claimed_milestones")
+                val milestones = if (milestonesArr == null) emptyList() else {
+                    (0 until milestonesArr.length()).map { idx -> milestonesArr.optInt(idx) }.filter { it > 0 }
+                }
+                result[studentId] = StudentStreakState(
+                    studentId = studentId,
+                    currentStreak = o.optInt("current_streak", 0),
+                    longestStreak = o.optInt("longest_streak", 0),
+                    lastLoginDateWib = o.optString("last_login_date_wib").ifBlank { null },
+                    streakCycleId = o.optString("streak_cycle_id").ifBlank { UUID.randomUUID().toString() },
+                    loginDatesWib = o.optJSONArray("login_dates_wib").toStringList(),
+                    claimedMilestonesInCycle = milestones
+                )
+            }
+            result
+        }.getOrDefault(emptyMap())
+    }
+
+    private suspend fun loadLocalStreakNotifications(): List<StreakNotificationLog> {
+        val raw = store.getString(KEY_STREAK_NOTIFS_JSON) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                StreakNotificationLog(
+                    id = o.getString("id"),
+                    studentId = o.getString("student_id"),
+                    reminderDateWib = o.getString("reminder_date_wib"),
+                    slot = runCatching {
+                        StreakReminderSlot.valueOf(o.optString("slot", StreakReminderSlot.MORNING_08.name))
+                    }.getOrDefault(StreakReminderSlot.MORNING_08),
+                    message = o.optString("message", ""),
+                    sentAtLabel = o.optString("sent_at_label", ""),
+                    timestampMillis = o.optLong("timestamp_millis", System.currentTimeMillis())
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun JSONArray?.toStringList(): List<String> {
+        if (this == null) return emptyList()
+        return (0 until length()).mapNotNull { idx -> optString(idx).takeIf { it.isNotBlank() } }
     }
 
     private fun serializeProfile(profile: UserProfile): String = JSONObject().apply {
@@ -623,6 +1113,11 @@ class AzrilAuthRepository(
         put("nim", profile.nim ?: "")
         put("study_program_id", profile.studyProgramId ?: "")
         put("study_program_name", profile.studyProgramName ?: "")
+        put("class_id", profile.classId ?: "")
+        put("class_name", profile.className ?: "")
+        put("semester", profile.semester ?: 1)
+        put("cohort_year", profile.cohortYear ?: 2026)
+        put("badge_status", profile.badgeStatus.dbValue)
         put("created_at", profile.createdAt ?: "")
     }.toString()
 
@@ -639,8 +1134,12 @@ class AzrilAuthRepository(
                 nim = o.optString("nim").ifBlank { null },
                 studyProgramId = o.optString("study_program_id").ifBlank { null },
                 studyProgramName = o.optString("study_program_name").ifBlank { null },
-                className = "Belum terdaftar di kelas",
+                classId = o.optString("class_id").ifBlank { null },
+                className = o.optString("class_name").ifBlank { "Belum terdaftar di kelas" },
+                semester = o.optInt("semester", 1),
+                cohortYear = o.optInt("cohort_year", 2026),
                 status = AccountStatus.ACTIVE,
+                badgeStatus = StudentBadgeStatus.fromDbValue(o.optString("badge_status", "neutral")),
                 createdAt = o.optString("created_at").ifBlank { null }
             )
         }.getOrNull()
