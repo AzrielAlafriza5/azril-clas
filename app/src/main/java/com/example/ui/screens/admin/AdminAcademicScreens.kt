@@ -1,5 +1,7 @@
 package com.example.ui.screens.admin
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -19,13 +21,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Class
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.LockReset
+import androidx.compose.material.icons.rounded.PendingActions
 import androidx.compose.material.icons.rounded.School
+import androidx.compose.material.icons.rounded.TableChart
 import androidx.compose.material.icons.rounded.UploadFile
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
@@ -53,18 +58,23 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.example.data.importer.ExcelStudentImportParser
 import com.example.ui.components.AzrilCard
 import com.example.ui.components.AzrilConfirmDeleteDialog
 import com.example.ui.components.AzrilEmptyState
 import com.example.ui.components.AzrilPageHeader
 import com.example.ui.components.AzrilPaginationBar
 import com.example.ui.components.AzrilSearchField
+import com.example.ui.components.AzrilStatCard
 import com.example.ui.components.AzrilStatusBadge
+import com.example.ui.theme.Amber50
+import com.example.ui.theme.Amber700
 import com.example.ui.model.AcademicClass
 import com.example.ui.model.AccountStatus
 import com.example.ui.model.CsvImportPreviewRow
@@ -589,11 +599,15 @@ fun AdminStudentsScreen(
     viewModel: AzrilViewModel,
     isExpanded: Boolean
 ) {
+    val context = LocalContext.current
     var query by rememberSaveable { mutableStateOf("") }
     var selectedProdiFilter by rememberSaveable { mutableStateOf("ALL") }
+    var selectedClassFilter by rememberSaveable { mutableStateOf("ALL") }
+    var selectedAccountFilter by rememberSaveable { mutableStateOf("ALL") }
     var selectedBadgeFilter by rememberSaveable { mutableStateOf("ALL") }
     var currentPage by rememberSaveable { mutableIntStateOf(1) }
     var showAddDialog by rememberSaveable { mutableStateOf(false) }
+    var showExcelDialog by rememberSaveable { mutableStateOf(false) }
     var showCsvDialog by rememberSaveable { mutableStateOf(false) }
     var editingStudent by remember { mutableStateOf<StudentRecord?>(null) }
     var resettingPasswordStudent by remember { mutableStateOf<StudentRecord?>(null) }
@@ -605,13 +619,46 @@ fun AdminStudentsScreen(
             stu.nim.contains(query, ignoreCase = true) ||
             stu.email.contains(query, ignoreCase = true)
         val matchesProdi = selectedProdiFilter == "ALL" || stu.studyProgramId == selectedProdiFilter
+        val matchesClass = selectedClassFilter == "ALL" || stu.classId == selectedClassFilter
+        val matchesAccount = when (selectedAccountFilter) {
+            "ACTIVE" -> stu.status == AccountStatus.ACTIVE
+            "INACTIVE" -> stu.status != AccountStatus.ACTIVE
+            "MUST_CHANGE_PW" -> stu.mustChangePassword
+            else -> true
+        }
         val matchesBadge = selectedBadgeFilter == "ALL" || stu.badgeStatus.name == selectedBadgeFilter
-        matchesQuery && matchesProdi && matchesBadge
+        matchesQuery && matchesProdi && matchesClass && matchesAccount && matchesBadge
     }
-    val pageSize = 8
+
+    val exportCsvLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            val csvText = ExcelStudentImportParser.buildStudentsCsvExport(filtered)
+            context.contentResolver.openOutputStream(uri)?.use { out ->
+                out.write(csvText.toByteArray(Charsets.UTF_8))
+                out.flush()
+            }
+        }.onSuccess {
+            viewModel.showToast("Berhasil mengekspor ${filtered.size} data mahasiswa ke CSV.", ToastType.SUCCESS)
+        }.onFailure {
+            viewModel.showToast("Gagal mengekspor data mahasiswa.", ToastType.ERROR)
+        }
+    }
+
+    val pageSize = 10
     val totalPages = ((filtered.size + pageSize - 1) / pageSize).coerceAtLeast(1)
     val safePage = currentPage.coerceIn(1, totalPages)
     val pageItems = filtered.drop((safePage - 1) * pageSize).take(pageSize)
+
+    val totalStudents = uiState.students.size
+    val pjkrCount = uiState.students.count { it.studyProgramName.equals("PJKR", ignoreCase = true) }
+    val farmasiCount = uiState.students.count { it.studyProgramName.equals("FARMASI", ignoreCase = true) }
+    val hesCount = uiState.students.count { it.studyProgramName.equals("HES", ignoreCase = true) }
+    val activeAccountCount = uiState.students.count { it.status == AccountStatus.ACTIVE }
+    val inactiveAccountCount = uiState.students.count { it.status != AccountStatus.ACTIVE }
+    val mustChangePwCount = uiState.students.count { it.mustChangePassword }
 
     val afkCount = uiState.students.count { it.badgeStatus == StudentBadgeStatus.AFK }
     val neutralCount = uiState.students.count { it.badgeStatus == StudentBadgeStatus.NEUTRAL }
@@ -625,17 +672,34 @@ fun AdminStudentsScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         AzrilPageHeader(
-            title = "Manajemen Mahasiswa",
-            subtitle = "Kelola akun mahasiswa (login berbasis NIM), atur/reset password aman, dan tetapkan status/cap AFK, Netral, atau Lulus.",
+            title = "Data Mahasiswa",
+            subtitle = "Import Excel (.xlsx) multi-sheet, pembuatan akun massal berbasis NIM, filter warna AFK/Blok Hitam, reset password, dan ekspor data.",
             action = {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = { showCsvDialog = true },
-                        shape = RoundedCornerShape(999.dp)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { showExcelDialog = true },
+                        shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = LimePrimary, contentColor = InkText),
+                        modifier = Modifier.testTag("open_excel_import_button")
                     ) {
-                        Icon(Icons.Rounded.UploadFile, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.Rounded.TableChart, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Impor")
+                        Text("Import Excel", fontWeight = FontWeight.Bold)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            if (filtered.isEmpty()) {
+                                viewModel.showToast("Belum ada data mahasiswa untuk diekspor.", ToastType.INFO)
+                            } else {
+                                exportCsvLauncher.launch("Data_Mahasiswa_AzrilClas.csv")
+                            }
+                        },
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier.testTag("export_students_csv_button")
+                    ) {
+                        Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Ekspor")
                     }
                     Button(
                         onClick = { showAddDialog = true },
@@ -651,6 +715,79 @@ fun AdminStudentsScreen(
             }
         )
 
+        // 6 Required Statistics Cards
+        val statCards = listOf(
+            Triple("Total Mahasiswa", "$totalStudents", "${uiState.classes.size} kelas • $afkCount AFK"),
+            Triple("Mahasiswa PJKR", "$pjkrCount", "Prodi PJKR"),
+            Triple("Mahasiswa FARMASI", "$farmasiCount", "Prodi FARMASI"),
+            Triple("Mahasiswa HES", "$hesCount", "Prodi HES"),
+            Triple("Akun Aktif", "$activeAccountCount", "Siap login dengan NIM"),
+            Triple("Belum Aktif", "$inactiveAccountCount", "$mustChangePwCount belum ganti password")
+        )
+        val statIcons = listOf(
+            Icons.Rounded.Groups,
+            Icons.Rounded.School,
+            Icons.Rounded.School,
+            Icons.Rounded.School,
+            Icons.Rounded.CheckCircle,
+            Icons.Rounded.PendingActions
+        )
+        val statCols = if (isExpanded) 3 else 2
+        statCards.chunked(statCols).forEachIndexed { rowIdx, chunk ->
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                chunk.forEachIndexed { colIdx, (label, value, helper) ->
+                    val globalIdx = rowIdx * statCols + colIdx
+                    val isWarning = globalIdx == 5 && (inactiveAccountCount > 0 || mustChangePwCount > 0)
+                    AzrilStatCard(
+                        label = label,
+                        value = value,
+                        helper = helper,
+                        icon = statIcons[globalIdx],
+                        accentColor = if (isWarning) Amber700 else LimeInk,
+                        accentBg = if (isWarning) Amber50 else LightGreenSecondary,
+                        mintVariant = globalIdx == 0 || globalIdx == 4,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                repeat(statCols - chunk.size) { Spacer(modifier = Modifier.weight(1f)) }
+            }
+        }
+
+        // Student Count per Class Summary (clickable filter)
+        if (uiState.classes.isNotEmpty()) {
+            AzrilCard {
+                Text("Jumlah Mahasiswa per Kelas", style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold), color = InkText)
+                Spacer(modifier = Modifier.height(8.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = selectedClassFilter == "ALL",
+                        onClick = { selectedClassFilter = "ALL"; currentPage = 1 },
+                        label = { Text("Semua Kelas ($totalStudents)") },
+                        shape = RoundedCornerShape(999.dp)
+                    )
+                    uiState.classes.forEach { cls ->
+                        val countInClass = uiState.students.count { it.classId == cls.id }
+                        val afkInClass = uiState.students.count { it.classId == cls.id && it.badgeStatus == StudentBadgeStatus.AFK }
+                        FilterChip(
+                            selected = selectedClassFilter == cls.id,
+                            onClick = {
+                                selectedClassFilter = if (selectedClassFilter == cls.id) "ALL" else cls.id
+                                currentPage = 1
+                            },
+                            label = {
+                                Text(
+                                    if (afkInClass > 0) "${cls.name}: $countInClass ($afkInClass AFK)"
+                                    else "${cls.name}: $countInClass"
+                                )
+                            },
+                            shape = RoundedCornerShape(999.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        // Search & Filters
         AzrilCard {
             AzrilSearchField(
                 value = query,
@@ -679,6 +816,16 @@ fun AdminStudentsScreen(
                     }
                 }
             }
+            Spacer(modifier = Modifier.height(10.dp))
+            Text("Status Akun", style = MaterialTheme.typography.labelMedium, color = InkMuted)
+            Spacer(modifier = Modifier.height(4.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(selected = selectedAccountFilter == "ALL", onClick = { selectedAccountFilter = "ALL"; currentPage = 1 }, label = { Text("Semua Akun") }, shape = RoundedCornerShape(999.dp))
+                FilterChip(selected = selectedAccountFilter == "ACTIVE", onClick = { selectedAccountFilter = "ACTIVE"; currentPage = 1 }, label = { Text("Aktif ($activeAccountCount)") }, shape = RoundedCornerShape(999.dp))
+                FilterChip(selected = selectedAccountFilter == "INACTIVE", onClick = { selectedAccountFilter = "INACTIVE"; currentPage = 1 }, label = { Text("Nonaktif ($inactiveAccountCount)") }, shape = RoundedCornerShape(999.dp))
+                FilterChip(selected = selectedAccountFilter == "MUST_CHANGE_PW", onClick = { selectedAccountFilter = "MUST_CHANGE_PW"; currentPage = 1 }, label = { Text("Belum Ganti Password ($mustChangePwCount)") }, shape = RoundedCornerShape(999.dp))
+            }
+
             Spacer(modifier = Modifier.height(10.dp))
             Text("Filter Status / Cap Mahasiswa", style = MaterialTheme.typography.labelMedium, color = InkMuted)
             Spacer(modifier = Modifier.height(4.dp))
@@ -729,11 +876,11 @@ fun AdminStudentsScreen(
         if (filtered.isEmpty()) {
             AzrilEmptyState(
                 title = "Belum Ada Data Mahasiswa",
-                description = "Akun mahasiswa dibuat dan dikelola sepenuhnya oleh Admin. Tambahkan mahasiswa beserta password awal agar mahasiswa dapat login menggunakan NIM.",
+                description = "Import file Excel (.xlsx) multi-sheet (PJKR-3B, FARMASI-3, HES-3B) untuk membuat akun mahasiswa secara massal, atau tambahkan mahasiswa satu per satu.",
                 icon = Icons.Rounded.Groups,
                 showIllustration = true,
-                actionLabel = "Tambah Mahasiswa",
-                onAction = { showAddDialog = true }
+                actionLabel = "Import Excel (.xlsx)",
+                onAction = { showExcelDialog = true }
             )
         } else {
             pageItems.forEach { stu ->
@@ -782,6 +929,9 @@ fun AdminStudentsScreen(
                                         containerColor = if (stu.status == AccountStatus.ACTIVE) LightGreenSecondary else Rose50,
                                         contentColor = if (stu.status == AccountStatus.ACTIVE) LimeInk else Rose700
                                     )
+                                    if (stu.mustChangePassword) {
+                                        AzrilStatusBadge("Password Awal (NIM)", Amber50, Amber700)
+                                    }
                                 }
                                 Text(
                                     text = "${stu.fullName} — ${stu.studyProgramName}",
@@ -880,6 +1030,13 @@ fun AdminStudentsScreen(
         }
     }
 
+    if (showExcelDialog) {
+        AdminExcelImportDialog(
+            viewModel = viewModel,
+            onDismiss = { showExcelDialog = false }
+        )
+    }
+
     if (showAddDialog) {
         AddStudentDialog(
             studyPrograms = uiState.studyPrograms,
@@ -934,7 +1091,7 @@ fun AdminStudentsScreen(
             student = stu,
             onDismiss = { resettingPasswordStudent = null },
             onSave = { newPw ->
-                val err = viewModel.resetStudentPassword(stu.id, newPw)
+                val err = viewModel.resetStudentPassword(stu.id, newPw, requirePasswordChange = true)
                 if (err == null) resettingPasswordStudent = null
                 err
             }
@@ -1197,10 +1354,20 @@ private fun ResetStudentPasswordDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "Tetapkan kata sandi baru untuk ${student.fullName} (NIM ${student.nim}). Kata sandi disimpan dalam bentuk hash aman, tidak pernah dalam teks biasa.",
+                    "Tetapkan kata sandi baru untuk ${student.fullName} (NIM ${student.nim}). Setelah direset, mahasiswa wajib mengganti kata sandi saat login berikutnya.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Slate600
                 )
+                OutlinedButton(
+                    onClick = {
+                        newPassword = student.nim
+                        confirmPassword = student.nim
+                        error = null
+                    },
+                    shape = RoundedCornerShape(999.dp)
+                ) {
+                    Text("Gunakan NIM sebagai Password Reset (${student.nim})")
+                }
                 OutlinedTextField(
                     value = newPassword,
                     onValueChange = { newPassword = it; error = null },

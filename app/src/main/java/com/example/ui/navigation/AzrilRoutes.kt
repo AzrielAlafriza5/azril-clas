@@ -57,7 +57,7 @@ enum class AdminDestination(
     DASHBOARD("admin_dashboard", "Dashboard", "Beranda", Icons.Rounded.Dashboard, Icons.Outlined.Dashboard, "Utama"),
     STUDY_PROGRAMS("admin_study_programs", "Program Studi", "Prodi", Icons.Rounded.School, Icons.Outlined.School, "Akademik"),
     CLASSES("admin_classes", "Kelas", "Kelas", Icons.Rounded.Class, Icons.Outlined.Class, "Akademik"),
-    STUDENTS("admin_students", "Mahasiswa", "Mhs", Icons.Rounded.Groups, Icons.Outlined.Groups, "Akademik"),
+    STUDENTS("admin_students", "Data Mahasiswa", "Mahasiswa", Icons.Rounded.Groups, Icons.Outlined.Groups, "Akademik"),
     SCHEDULES("admin_schedules", "Jadwal", "Jadwal", Icons.Rounded.CalendarMonth, Icons.Outlined.CalendarMonth, "Perkuliahan"),
     ATTENDANCE("admin_attendance", "Absensi", "Absensi", Icons.Rounded.FactCheck, Icons.Outlined.FactCheck, "Perkuliahan"),
     ASSIGNMENTS("admin_assignments", "Penugasan", "Tugas", Icons.Rounded.Assignment, Icons.Outlined.Assignment, "Evaluasi"),

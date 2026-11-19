@@ -9,6 +9,7 @@ import com.example.data.auth.DataStoreAuthStorage
 import com.example.data.auth.OfficialStudyPrograms
 import com.example.data.gamification.StreakReminderNotifier
 import com.example.data.gamification.XpAndStreakEngine
+import com.example.data.importer.ExcelStudentImportParser
 import com.example.ui.model.AcademicClass
 import com.example.ui.model.AccountStatus
 import com.example.ui.model.AppNotification
@@ -21,7 +22,10 @@ import com.example.ui.model.AttendanceSessionState
 import com.example.ui.model.AttendanceStatus
 import com.example.ui.model.ClassSchedule
 import com.example.ui.model.CsvImportPreviewRow
+import com.example.ui.model.ExcelImportPreviewSummary
+import com.example.ui.model.ExcelImportValidationStatus
 import com.example.ui.model.GradeAuditEntry
+import com.example.ui.model.HistoricalAttendanceRecord
 import com.example.ui.model.LearningMethod
 import com.example.ui.model.ParticipationXpCategory
 import com.example.ui.model.PointSourceType
@@ -78,6 +82,7 @@ data class AzrilUiState(
     val schedules: List<ClassSchedule> = emptyList(),
     val attendanceSessions: List<AttendanceSession> = emptyList(),
     val attendanceRecords: List<AttendanceRecord> = emptyList(),
+    val historicalAttendanceRecords: List<HistoricalAttendanceRecord> = emptyList(),
     val assignments: List<Assignment> = emptyList(),
     val submissions: List<SubmissionRecord> = emptyList(),
     val rankingPoints: List<RankingPointTransaction> = emptyList(),
@@ -126,7 +131,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                             semester = matchingStudent.semester,
                             cohortYear = matchingStudent.cohortYear,
                             status = matchingStudent.status,
-                            badgeStatus = matchingStudent.badgeStatus
+                            badgeStatus = matchingStudent.badgeStatus,
+                            mustChangePassword = matchingStudent.mustChangePassword
                         )
                     } else profile
                 }
@@ -141,14 +147,15 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                     assignments = if (restored.savedAssignments.isNotEmpty()) restored.savedAssignments else state.assignments,
                     rankingPoints = if (restored.savedXpTransactions.isNotEmpty()) restored.savedXpTransactions else state.rankingPoints,
                     attendanceRecords = if (restored.savedAttendanceRecords.isNotEmpty()) restored.savedAttendanceRecords else state.attendanceRecords,
+                    historicalAttendanceRecords = if (restored.savedHistoricalAttendanceRecords.isNotEmpty()) restored.savedHistoricalAttendanceRecords else state.historicalAttendanceRecords,
                     studentStreaks = if (restored.savedStreaks.isNotEmpty()) restored.savedStreaks else state.studentStreaks,
                     streakNotificationLogs = if (restored.savedStreakNotifications.isNotEmpty()) restored.savedStreakNotifications else state.streakNotificationLogs
                 )
             }
             val current = _uiState.value.currentUser
-            if (current?.role == UserRole.STUDENT) {
+            if (current?.role == UserRole.STUDENT && !current.mustChangePassword) {
                 recordStudentDailyLogin(current.id)
-            } else {
+            } else if (current == null || current.role == UserRole.ADMIN) {
                 evaluateStreakRemindersForInactiveStudents()
             }
         }
@@ -166,7 +173,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         semester = semester ?: 1,
         cohortYear = cohortYear ?: 2026,
         status = status,
-        badgeStatus = badgeStatus
+        badgeStatus = badgeStatus,
+        mustChangePassword = mustChangePassword
     )
 
     private fun mergeRegisteredStudents(
@@ -207,12 +215,24 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                                 semester = syncedStudent.semester,
                                 cohortYear = syncedStudent.cohortYear,
                                 status = syncedStudent.status,
-                                badgeStatus = syncedStudent.badgeStatus
+                                badgeStatus = syncedStudent.badgeStatus,
+                                mustChangePassword = result.profile.mustChangePassword || syncedStudent.mustChangePassword
                             )
                         } else result.profile
                         val updatedStudents = if (enrichedProfile.role == UserRole.STUDENT) {
                             mergeRegisteredStudents(state.students, listOf(enrichedProfile.toStudentRecord()))
                         } else state.students
+                        val loginToast = if (enrichedProfile.role == UserRole.STUDENT && enrichedProfile.mustChangePassword) {
+                            ToastMessage(
+                                message = "Login pertama terdeteksi. Silakan ganti password awal (NIM) Anda terlebih dahulu.",
+                                type = ToastType.INFO
+                            )
+                        } else {
+                            ToastMessage(
+                                message = "Selamat datang kembali, ${enrichedProfile.fullName}!",
+                                type = ToastType.SUCCESS
+                            )
+                        }
                         state.copy(
                             authInProgress = false,
                             authErrorMessage = null,
@@ -222,14 +242,12 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                             rememberMeEnabled = rememberMe,
                             rememberedIdentifier = if (rememberMe) (enrichedProfile.nim ?: identifier.trim()) else "",
                             students = updatedStudents,
-                            toastMessage = ToastMessage(
-                                message = "Selamat datang kembali, ${enrichedProfile.fullName}!",
-                                type = ToastType.SUCCESS
-                            )
+                            toastMessage = loginToast
                         )
                     }
-                    if (result.profile.role == UserRole.STUDENT) {
-                        recordStudentDailyLogin(result.profile.id)
+                    val active = _uiState.value.currentUser
+                    if (active?.role == UserRole.STUDENT && !active.mustChangePassword) {
+                        recordStudentDailyLogin(active.id)
                     }
                 }
                 is AuthResult.Failure -> {
@@ -238,6 +256,61 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                             authInProgress = false,
                             authErrorMessage = result.message,
                             toastMessage = ToastMessage(result.message, ToastType.ERROR)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun completeFirstLoginPasswordChange(
+        newPassword: String,
+        confirmPassword: String
+    ) {
+        val current = _uiState.value.currentUser ?: return
+        val cleanNew = newPassword.trim()
+        val cleanConfirm = confirmPassword.trim()
+        if (cleanNew.length < 6) {
+            _uiState.update { it.copy(authErrorMessage = "Kata sandi baru minimal 6 karakter.") }
+            return
+        }
+        if (cleanNew != cleanConfirm) {
+            _uiState.update { it.copy(authErrorMessage = "Konfirmasi kata sandi tidak cocok.") }
+            return
+        }
+        if (current.nim != null && cleanNew.equals(current.nim.trim(), ignoreCase = true)) {
+            _uiState.update { it.copy(authErrorMessage = "Kata sandi baru tidak boleh sama dengan NIM Anda.") }
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update { it.copy(authInProgress = true, authErrorMessage = null) }
+            when (val res = authRepository.completeFirstLoginPasswordChange(current.id, cleanNew)) {
+                is AuthResult.Success -> {
+                    _uiState.update { state ->
+                        val updatedProfile = current.copy(mustChangePassword = false)
+                        val updatedStudents = state.students.map { stu ->
+                            if (stu.id == current.id) stu.copy(mustChangePassword = false) else stu
+                        }
+                        state.copy(
+                            authInProgress = false,
+                            authErrorMessage = null,
+                            currentUser = updatedProfile,
+                            students = updatedStudents,
+                            studentDestination = StudentDestination.DASHBOARD,
+                            toastMessage = ToastMessage(
+                                "Kata sandi berhasil diperbarui! Selamat datang di Azril Clas, ${updatedProfile.fullName}.",
+                                ToastType.SUCCESS
+                            )
+                        )
+                    }
+                    recordStudentDailyLogin(current.id)
+                }
+                is AuthResult.Failure -> {
+                    _uiState.update {
+                        it.copy(
+                            authInProgress = false,
+                            authErrorMessage = res.message,
+                            toastMessage = ToastMessage(res.message, ToastType.ERROR)
                         )
                     }
                 }
@@ -656,10 +729,29 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 val members = updatedStudents.filter { it.classId == cls.id }.map { it.id }
                 cls.copy(memberIds = members)
             }
+            // Maintain full NIM & student-name consistency across attendance, historical attendance, and submissions
+            val updatedAttendance = state.attendanceRecords.map { rec ->
+                if (rec.studentId == studentId) rec.copy(studentNim = cleanNim, studentName = cleanName) else rec
+            }
+            val updatedHistorical = state.historicalAttendanceRecords.map { rec ->
+                if (rec.studentId == studentId) rec.copy(
+                    studentNim = cleanNim,
+                    studentName = cleanName,
+                    classId = selectedClass?.id ?: rec.classId,
+                    className = selectedClass?.name ?: rec.className,
+                    studyProgramCode = prodi.code
+                ) else rec
+            }
+            val updatedSubmissions = state.submissions.map { sub ->
+                if (sub.studentId == studentId) sub.copy(studentNim = cleanNim, studentName = cleanName) else sub
+            }
             state.copy(
                 students = updatedStudents,
                 classes = updatedClasses,
-                toastMessage = ToastMessage("Data mahasiswa $cleanName berhasil diperbarui.", ToastType.SUCCESS)
+                attendanceRecords = updatedAttendance,
+                historicalAttendanceRecords = updatedHistorical,
+                submissions = updatedSubmissions,
+                toastMessage = ToastMessage("Data mahasiswa $cleanName (NIM $cleanNim) berhasil diperbarui secara konsisten.", ToastType.SUCCESS)
             )
         }
         viewModelScope.launch {
@@ -678,6 +770,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 badgeStatus = badgeStatus
             )
             authRepository.saveClasses(_uiState.value.classes)
+            authRepository.saveAttendanceRecords(_uiState.value.attendanceRecords)
+            authRepository.saveHistoricalAttendanceRecords(_uiState.value.historicalAttendanceRecords)
         }
         return null
     }
@@ -709,7 +803,11 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         return null
     }
 
-    fun resetStudentPassword(studentId: String, newPassword: String): String? {
+    fun resetStudentPassword(
+        studentId: String,
+        newPassword: String,
+        requirePasswordChange: Boolean = true
+    ): String? {
         if (_uiState.value.currentUser?.role != UserRole.ADMIN) {
             return "Akses ditolak: hanya Admin yang dapat mengatur ulang kata sandi mahasiswa."
         }
@@ -717,12 +815,22 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         if (cleanPw.length < 6) return "Kata sandi baru minimal 6 karakter."
         val student = _uiState.value.students.find { it.id == studentId }
             ?: return "Data mahasiswa tidak ditemukan."
+        _uiState.update { state ->
+            state.copy(
+                students = state.students.map { stu ->
+                    if (stu.id == studentId) stu.copy(mustChangePassword = requirePasswordChange) else stu
+                }
+            )
+        }
         viewModelScope.launch {
-            val err = authRepository.adminResetStudentPassword(studentId, cleanPw)
+            val err = authRepository.adminResetStudentPassword(studentId, cleanPw, requirePasswordChange)
             if (err != null) {
                 showToast(err, ToastType.ERROR)
             } else {
-                showToast("Kata sandi untuk ${student.fullName} (NIM ${student.nim}) berhasil diperbarui secara aman.", ToastType.SUCCESS)
+                showToast(
+                    "Kata sandi untuk ${student.fullName} (NIM ${student.nim}) berhasil direset. Mahasiswa wajib mengganti password saat login berikutnya.",
+                    ToastType.SUCCESS
+                )
             }
         }
         return null
@@ -873,6 +981,287 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             }
             authRepository.saveClasses(_uiState.value.classes)
         }
+    }
+
+    // --- BULK EXCEL (.XLSX) STUDENT IMPORT, COLOR FILTERING (RED=AFK, BLACK=SKIP), & HISTORICAL ATTENDANCE ---
+    fun parseExcelStudentImport(
+        fileName: String,
+        bytes: ByteArray
+    ): Result<ExcelImportPreviewSummary> {
+        return ExcelStudentImportParser.parseXlsx(
+            fileName = fileName,
+            bytes = bytes,
+            existingStudents = _uiState.value.students,
+            studyPrograms = _uiState.value.studyPrograms
+        )
+    }
+
+    /**
+     * Commits a verified Excel import preview:
+     * - Imports ONLY VALID_NORMAL and VALID_AFK rows.
+     * - Strictly excludes SKIPPED_BLACK, ALREADY_EXISTS, and INVALID_OR_DUPLICATE rows.
+     * - Never overwrites existing student accounts.
+     * - Username = NIM, Initial Password = NIM, mustChangePassword = true.
+     * - Optional historical attendance import preserves exact Excel statuses with ZERO automatic XP.
+     */
+    fun commitExcelStudentImport(
+        preview: ExcelImportPreviewSummary,
+        importHistoricalAttendance: Boolean
+    ): String? {
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) {
+            return "Akses ditolak: hanya Admin yang dapat mengimpor data mahasiswa."
+        }
+
+        val stateSnapshot = _uiState.value
+        val existingNimSet = stateSnapshot.students.map { it.nim.trim().lowercase(Locale.US) }.toMutableSet()
+        val importableRows = preview.rows.filter { row ->
+            row.isImportable && existingNimSet.add(row.nim.trim().lowercase(Locale.US))
+        }
+
+        if (importableRows.isEmpty()) {
+            val msg = "Tidak ada mahasiswa baru yang siap diimpor (seluruh data sudah memiliki akun, blok hitam, atau tidak valid)."
+            showToast(msg, ToastType.WARNING)
+            return msg
+        }
+
+        // Auto-create missing classes mapped from sheet names (PJKR-3B, FARMASI-3, HES-3B, etc.)
+        val updatedClasses = stateSnapshot.classes.toMutableList()
+        fun ensureClassForRow(className: String, prodiId: String, prodiCode: String, semester: Int): AcademicClass {
+            val existing = updatedClasses.find { it.name.equals(className, ignoreCase = true) }
+            if (existing != null) return existing
+            val created = AcademicClass(
+                id = "cls-${className.lowercase(Locale.US).replace(Regex("[^a-z0-9]+"), "-")}",
+                name = className,
+                studyProgramId = prodiId,
+                studyProgramName = prodiCode,
+                semester = semester,
+                academicYear = stateSnapshot.settings.activeAcademicYear,
+                cohortYear = 2025,
+                description = "Dibuat otomatis dari impor Excel sheet $className",
+                isActive = true
+            )
+            updatedClasses.add(created)
+            return created
+        }
+
+        val importedAtLabel = currentTimeLabel()
+        val semesterKey = stateSnapshot.settings.activeSemesterKey
+        val newStudents = mutableListOf<StudentRecord>()
+        val newHistoricalRecords = mutableListOf<HistoricalAttendanceRecord>()
+        val existingHistKeys = stateSnapshot.historicalAttendanceRecords
+            .map { "${it.studentId}|${it.semesterKey}|${it.weekNumber}" }
+            .toMutableSet()
+
+        importableRows.forEach { row ->
+            val prodi = stateSnapshot.studyPrograms.find { it.id == row.studyProgramId }
+                ?: OfficialStudyPrograms.findByCode(row.studyProgramCode)
+                ?: return@forEach
+            val targetClass = ensureClassForRow(row.className, prodi.id, prodi.code, row.semester)
+            val badgeStatus = if (row.validationStatus == ExcelImportValidationStatus.VALID_AFK) {
+                StudentBadgeStatus.AFK
+            } else {
+                StudentBadgeStatus.NEUTRAL
+            }
+            val studentId = UUID.randomUUID().toString()
+            val stu = StudentRecord(
+                id = studentId,
+                fullName = row.fullName,
+                nim = row.nim,
+                email = "${row.nim.lowercase(Locale.US)}@mahasiswa.azrilclas.ac.id",
+                studyProgramId = prodi.id,
+                studyProgramName = prodi.code,
+                classId = targetClass.id,
+                className = targetClass.name,
+                semester = row.semester,
+                cohortYear = 2025,
+                status = AccountStatus.ACTIVE,
+                badgeStatus = badgeStatus,
+                mustChangePassword = true
+            )
+            newStudents.add(stu)
+
+            if (importHistoricalAttendance && row.weeklyAttendance.isNotEmpty()) {
+                row.weeklyAttendance.toSortedMap().forEach { (weekNum, rawStatus) ->
+                    val histKey = "$studentId|$semesterKey|$weekNum"
+                    if (rawStatus.isNotBlank() && existingHistKeys.add(histKey)) {
+                        newHistoricalRecords.add(
+                            HistoricalAttendanceRecord(
+                                studentId = studentId,
+                                studentNim = stu.nim,
+                                studentName = stu.fullName,
+                                classId = targetClass.id,
+                                className = targetClass.name,
+                                studyProgramCode = prodi.code,
+                                weekNumber = weekNum,
+                                weekLabel = "Minggu ke-$weekNum",
+                                rawStatus = rawStatus.trim(),
+                                sourceSheet = row.sheetName,
+                                semesterKey = semesterKey,
+                                importedAt = importedAtLabel,
+                                xpCalculated = false
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        val mergedStudents = newStudents + stateSnapshot.students
+        val syncedClasses = updatedClasses.map { cls ->
+            cls.copy(memberIds = mergedStudents.filter { it.classId == cls.id }.map { it.id })
+        }
+        val mergedHistorical = newHistoricalRecords + stateSnapshot.historicalAttendanceRecords
+        val afkImported = newStudents.count { it.badgeStatus == StudentBadgeStatus.AFK }
+        val normalImported = newStudents.size - afkImported
+
+        val summaryText = buildString {
+            append("Import berhasil: ${newStudents.size} akun mahasiswa dibuat ")
+            append("($normalImported Normal, $afkImported AFK Merah). ")
+            if (preview.skippedBlackCount > 0) append("${preview.skippedBlackCount} blok hitam dilewati. ")
+            if (importHistoricalAttendance && newHistoricalRecords.isNotEmpty()) {
+                append("${newHistoricalRecords.size} data absensi historis disimpan tanpa XP otomatis.")
+            }
+        }
+
+        _uiState.update { state ->
+            state.copy(
+                students = mergedStudents,
+                classes = syncedClasses,
+                historicalAttendanceRecords = mergedHistorical,
+                toastMessage = ToastMessage(summaryText, ToastType.SUCCESS)
+            )
+        }
+
+        viewModelScope.launch {
+            authRepository.adminBulkImportStudents(
+                newStudents = newStudents,
+                fileName = preview.fileName,
+                semesterKey = semesterKey,
+                importHistoricalAttendance = importHistoricalAttendance,
+                previewRowsForSync = importableRows
+            )
+            authRepository.saveClasses(syncedClasses)
+            if (newHistoricalRecords.isNotEmpty()) {
+                authRepository.saveHistoricalAttendanceRecords(mergedHistorical)
+            }
+        }
+        return null
+    }
+
+    /**
+     * Explicit Admin-confirmed calculation of XP from historical Excel attendance records.
+     * Never triggered automatically during import to prevent duplicate XP.
+     */
+    fun calculateHistoricalAttendanceXp(
+        classNameFilter: String? = null,
+        countDispenAsHadir: Boolean = false,
+        countKipAsHadir: Boolean = false
+    ): String {
+        val currentUser = _uiState.value.currentUser
+        if (currentUser?.role != UserRole.ADMIN) {
+            return "Akses ditolak: hanya Admin yang dapat menghitung XP historis."
+        }
+        val state = _uiState.value
+        val candidates = state.historicalAttendanceRecords.filter { rec ->
+            !rec.xpCalculated && (classNameFilter == null || rec.className.equals(classNameFilter, ignoreCase = true))
+        }
+        if (candidates.isEmpty()) {
+            val msg = "Tidak ada data absensi historis yang belum dihitung XP-nya."
+            showToast(msg, ToastType.INFO)
+            return msg
+        }
+
+        val nowMillis = System.currentTimeMillis()
+        val nowLabel = XpAndStreakEngine.formatWibDateTimeLabel(nowMillis)
+        val existingSourceKeys = state.rankingPoints.map { "${it.studentId}|${it.sourceId}" }.toMutableSet()
+        val newTxs = mutableListOf<RankingPointTransaction>()
+        val processedIds = mutableSetOf<String>()
+
+        // Track paid izin usage per student per semester (including existing attendance records)
+        val izinCounter = mutableMapOf<String, Int>()
+        state.attendanceRecords.filter { it.status == AttendanceStatus.IZIN }.forEach { r ->
+            val key = "${r.studentId}|${r.semesterKey}"
+            izinCounter[key] = (izinCounter[key] ?: 0) + 1
+        }
+        val maxPaidIzin = state.settings.maxPaidIzinPerSemester
+
+        candidates.sortedWith(compareBy<HistoricalAttendanceRecord> { it.studentId }.thenBy { it.weekNumber })
+            .forEach { rec ->
+                processedIds.add(rec.id)
+                val normalized = rec.rawStatus.trim().uppercase(Locale.US)
+                val sourceId = "hist-att-${rec.semesterKey}-w${rec.weekNumber}"
+                val dedupKey = "${rec.studentId}|$sourceId"
+                if (existingSourceKeys.contains(dedupKey)) return@forEach
+
+                val tx: RankingPointTransaction? = when {
+                    normalized == "HADIR" || (countDispenAsHadir && normalized == "DISPEN") || (countKipAsHadir && normalized == "KIP") -> {
+                        RankingPointTransaction(
+                            studentId = rec.studentId,
+                            sourceType = PointSourceType.ATTENDANCE,
+                            sourceId = sourceId,
+                            points = XpAndStreakEngine.XP_HADIR,
+                            description = "Absensi Historis ${rec.weekLabel} (${rec.rawStatus} • ${rec.className})",
+                            createdAt = nowLabel,
+                            updatedAt = nowLabel,
+                            timestampMillis = nowMillis,
+                            xpCategory = XpCategory.ATTENDANCE_HADIR,
+                            activityTitle = "Hadir Historis (${rec.weekLabel})",
+                            semesterKey = rec.semesterKey,
+                            adminId = currentUser.id,
+                            adminName = currentUser.fullName
+                        )
+                    }
+                    normalized == "IZIN" -> {
+                        val izinKey = "${rec.studentId}|${rec.semesterKey}"
+                        val nextCount = (izinCounter[izinKey] ?: 0) + 1
+                        izinCounter[izinKey] = nextCount
+                        val xp = if (nextCount <= maxPaidIzin) XpAndStreakEngine.XP_IZIN_PAID else 0
+                        RankingPointTransaction(
+                            studentId = rec.studentId,
+                            sourceType = PointSourceType.ATTENDANCE,
+                            sourceId = sourceId,
+                            points = xp,
+                            description = if (xp > 0) {
+                                "Absensi Historis ${rec.weekLabel}: Izin ke-$nextCount ($xp XP)"
+                            } else {
+                                "Absensi Historis ${rec.weekLabel}: Izin ke-$nextCount (melebihi kuota $maxPaidIzin izin/semester)"
+                            },
+                            createdAt = nowLabel,
+                            updatedAt = nowLabel,
+                            timestampMillis = nowMillis,
+                            xpCategory = XpCategory.ATTENDANCE_IZIN,
+                            activityTitle = "Izin Historis ke-$nextCount (${rec.weekLabel})",
+                            semesterKey = rec.semesterKey,
+                            adminId = currentUser.id,
+                            adminName = currentUser.fullName
+                        )
+                    }
+                    else -> null // ALPHA, TIDAK HADIR, or unmapped DISPEN/KIP generate 0 XP
+                }
+
+                if (tx != null && existingSourceKeys.add(dedupKey)) {
+                    newTxs.add(tx)
+                }
+            }
+
+        val updatedHistorical = state.historicalAttendanceRecords.map { rec ->
+            if (processedIds.contains(rec.id)) rec.copy(xpCalculated = true) else rec
+        }
+        val nextTxs = (newTxs + state.rankingPoints).sortedByDescending { it.timestampMillis }
+        val msg = "XP historis dikonfirmasi: ${processedIds.size} catatan diproses, ${newTxs.size} transaksi XP ditambahkan."
+
+        _uiState.update { s ->
+            s.copy(
+                historicalAttendanceRecords = updatedHistorical,
+                rankingPoints = nextTxs,
+                toastMessage = ToastMessage(msg, ToastType.SUCCESS)
+            )
+        }
+        viewModelScope.launch {
+            authRepository.saveHistoricalAttendanceRecords(updatedHistorical)
+            authRepository.saveXpTransactions(nextTxs)
+        }
+        return msg
     }
 
     // --- SCHEDULES ---

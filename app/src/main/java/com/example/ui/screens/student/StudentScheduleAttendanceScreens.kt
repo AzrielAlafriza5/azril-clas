@@ -2,6 +2,8 @@ package com.example.ui.screens.student
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -168,6 +170,7 @@ fun StudentScheduleScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun StudentAttendanceScreen(
     uiState: AzrilUiState,
@@ -177,6 +180,9 @@ fun StudentAttendanceScreen(
     val user = uiState.currentUser ?: return
     val openSessions = uiState.attendanceSessions.filter { it.state == AttendanceSessionState.OPEN }
     val myRecords = uiState.attendanceRecords.filter { it.studentId == user.id }
+    val myHistoricalRecords = uiState.historicalAttendanceRecords
+        .filter { it.studentId == user.id }
+        .sortedBy { it.weekNumber }
     val attendanceRate = if (myRecords.isEmpty()) 0f else {
         myRecords.count { it.status == AttendanceStatus.HADIR }.toFloat() / myRecords.size.toFloat()
     }
@@ -284,6 +290,29 @@ fun StudentAttendanceScreen(
                             Text("${rec.dateLabel} • Tercatat: ${rec.recordedAt}", style = MaterialTheme.typography.bodySmall, color = Slate500)
                         }
                         AzrilStatusBadge(rec.status.label, Emerald50, Emerald700)
+                    }
+                }
+            }
+        }
+
+        if (myHistoricalRecords.isNotEmpty()) {
+            AzrilCard {
+                Text("Riwayat Absensi Historis (Minggu 1–8)", style = MaterialTheme.typography.titleMedium, color = Navy900)
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "Data absensi historis dari rekap Excel kelas Anda dengan status asli yang dipertahankan.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Slate500
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    myHistoricalRecords.forEach { hr ->
+                        val isHadir = hr.rawStatus.equals("HADIR", ignoreCase = true)
+                        AzrilStatusBadge(
+                            text = "${hr.weekLabel}: ${hr.rawStatus}",
+                            containerColor = if (isHadir) Emerald50 else SurfaceMuted,
+                            contentColor = if (isHadir) Emerald700 else Slate600
+                        )
                     }
                 }
             }

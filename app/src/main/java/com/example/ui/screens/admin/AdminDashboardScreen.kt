@@ -141,8 +141,8 @@ fun AdminDashboardScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 val actions = listOf(
+                    Triple("Data Mahasiswa & Import", Icons.Rounded.PersonAdd, AdminDestination.STUDENTS),
                     Triple("Beri XP Keaktifan", Icons.Rounded.Bolt, AdminDestination.XP_KEAKTIFAN),
-                    Triple("Tambah Mahasiswa", Icons.Rounded.PersonAdd, AdminDestination.STUDENTS),
                     Triple("Buka Absensi", Icons.Rounded.FactCheck, AdminDestination.ATTENDANCE),
                     Triple("Buat Tugas", Icons.Rounded.Add, AdminDestination.ASSIGNMENTS),
                     Triple("Buat Jadwal", Icons.Rounded.CalendarMonth, AdminDestination.SCHEDULES),

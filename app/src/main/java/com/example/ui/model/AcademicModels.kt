@@ -106,6 +106,7 @@ data class UserProfile(
     val cohortYear: Int? = null,
     val status: AccountStatus = AccountStatus.ACTIVE,
     val badgeStatus: StudentBadgeStatus = StudentBadgeStatus.NEUTRAL,
+    val mustChangePassword: Boolean = false,
     val createdAt: String? = null
 )
 
@@ -143,7 +144,8 @@ data class StudentRecord(
     val semester: Int,
     val cohortYear: Int,
     val status: AccountStatus = AccountStatus.ACTIVE,
-    val badgeStatus: StudentBadgeStatus = StudentBadgeStatus.NEUTRAL
+    val badgeStatus: StudentBadgeStatus = StudentBadgeStatus.NEUTRAL,
+    val mustChangePassword: Boolean = false
 )
 
 data class ClassSchedule(
@@ -508,6 +510,84 @@ data class CsvImportPreviewRow(
     val semester: Int,
     val cohortYear: Int,
     val errorReason: String? = null
+)
+
+enum class ExcelRowColorFlag(val label: String) {
+    NONE("Normal"),
+    RED_AFK("Merah (AFK)"),
+    BLACK_SKIP("Blok Hitam (Dilewati)"),
+    OTHER_IGNORED("Warna Lain (Normal)")
+}
+
+enum class ExcelImportValidationStatus(val label: String) {
+    VALID_NORMAL("Valid - Siap Diimpor"),
+    VALID_AFK("AFK (Warna Merah)"),
+    SKIPPED_BLACK("Dilewati - Blok Hitam"),
+    ALREADY_EXISTS("Sudah Memiliki Akun"),
+    INVALID_OR_DUPLICATE("Duplikat / Tidak Valid")
+}
+
+data class ExcelSheetMapping(
+    val sheetName: String,
+    val studyProgramId: String?,
+    val studyProgramCode: String,
+    val className: String,
+    val classLabel: String,
+    val semester: Int,
+    val isRecognized: Boolean
+)
+
+data class ExcelImportPreviewRow(
+    val sheetName: String,
+    val rowNumber: Int,
+    val studentNumber: String,
+    val nim: String,
+    val fullName: String,
+    val studyProgramId: String?,
+    val studyProgramCode: String,
+    val className: String,
+    val classLabel: String,
+    val semester: Int,
+    val colorFlag: ExcelRowColorFlag,
+    val validationStatus: ExcelImportValidationStatus,
+    val issues: List<String> = emptyList(),
+    val weeklyAttendance: Map<Int, String> = emptyMap()
+) {
+    val isImportable: Boolean
+        get() = validationStatus == ExcelImportValidationStatus.VALID_NORMAL ||
+            validationStatus == ExcelImportValidationStatus.VALID_AFK
+}
+
+data class ExcelImportPreviewSummary(
+    val fileName: String,
+    val sheetMappings: List<ExcelSheetMapping>,
+    val rows: List<ExcelImportPreviewRow>
+) {
+    val validNormalCount: Int get() = rows.count { it.validationStatus == ExcelImportValidationStatus.VALID_NORMAL }
+    val validAfkCount: Int get() = rows.count { it.validationStatus == ExcelImportValidationStatus.VALID_AFK }
+    val totalImportableCount: Int get() = validNormalCount + validAfkCount
+    val skippedBlackCount: Int get() = rows.count { it.validationStatus == ExcelImportValidationStatus.SKIPPED_BLACK }
+    val alreadyExistsCount: Int get() = rows.count { it.validationStatus == ExcelImportValidationStatus.ALREADY_EXISTS }
+    val invalidOrDuplicateCount: Int get() = rows.count { it.validationStatus == ExcelImportValidationStatus.INVALID_OR_DUPLICATE }
+    val totalDuplicateOrInvalidAndExistingCount: Int get() = alreadyExistsCount + invalidOrDuplicateCount
+    val hasWeeklyAttendance: Boolean get() = rows.any { it.isImportable && it.weeklyAttendance.isNotEmpty() }
+}
+
+data class HistoricalAttendanceRecord(
+    val id: String = UUID.randomUUID().toString(),
+    val studentId: String,
+    val studentNim: String,
+    val studentName: String,
+    val classId: String?,
+    val className: String,
+    val studyProgramCode: String,
+    val weekNumber: Int,
+    val weekLabel: String,
+    val rawStatus: String,
+    val sourceSheet: String,
+    val semesterKey: String = "2026/2027-Ganjil",
+    val importedAt: String,
+    val xpCalculated: Boolean = false
 )
 
 sealed interface ScreenLoadState {

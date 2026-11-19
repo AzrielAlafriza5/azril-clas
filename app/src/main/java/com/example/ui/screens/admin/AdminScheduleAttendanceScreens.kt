@@ -368,6 +368,8 @@ fun AdminAttendanceScreen(
 ) {
     var showOpenDialog by rememberSaveable { mutableStateOf(false) }
     var showManualRecordDialog by rememberSaveable { mutableStateOf(false) }
+    var showHistoricalXpDialog by rememberSaveable { mutableStateOf(false) }
+    var historicalClassFilter by rememberSaveable { mutableStateOf("ALL") }
     var qrPreviewSession by remember { mutableStateOf<AttendanceSession?>(null) }
     var correctingRecord by remember { mutableStateOf<AttendanceRecord?>(null) }
 
@@ -529,6 +531,145 @@ fun AdminAttendanceScreen(
                 }
             }
         }
+
+        // Historical Attendance Imported from Excel (Weeks 1..8) - exact raw statuses preserved, NO automatic XP
+        if (uiState.historicalAttendanceRecords.isNotEmpty()) {
+            val histClasses = uiState.historicalAttendanceRecords.map { it.className }.distinct().sorted()
+            val filteredHist = uiState.historicalAttendanceRecords.filter {
+                historicalClassFilter == "ALL" || it.className == historicalClassFilter
+            }
+            val pendingXpCount = filteredHist.count { !it.xpCalculated }
+            val groupedByStudent = filteredHist.groupBy { it.studentId }
+
+            AzrilCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("Riwayat Absensi Historis (Excel Minggu 1–8)", style = MaterialTheme.typography.titleMedium, color = Navy900)
+                        Text(
+                            "Status asli (HADIR, IZIN, ALPHA, TIDAK HADIR, DISPEN, KIP) dipertahankan. XP historis hanya dihitung atas konfirmasi Admin.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Slate500
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(
+                        selected = historicalClassFilter == "ALL",
+                        onClick = { historicalClassFilter = "ALL" },
+                        label = { Text("Semua Kelas (${uiState.historicalAttendanceRecords.size})") }
+                    )
+                    histClasses.forEach { clsName ->
+                        FilterChip(
+                            selected = historicalClassFilter == clsName,
+                            onClick = { historicalClassFilter = clsName },
+                            label = { Text(clsName) }
+                        )
+                    }
+                }
+                if (pendingXpCount > 0) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = { showHistoricalXpDialog = true },
+                        shape = RoundedCornerShape(999.dp)
+                    ) {
+                        Text("Konfirmasi Hitung XP Historis ($pendingXpCount catatan)")
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                groupedByStudent.values.take(25).forEach { studentRecords ->
+                    val first = studentRecords.first()
+                    HorizontalDivider(color = BorderLight, modifier = Modifier.padding(vertical = 8.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("${first.studentName} (${first.studentNim})", style = MaterialTheme.typography.titleSmall, color = Navy900)
+                            AzrilStatusBadge(
+                                text = if (studentRecords.all { it.xpCalculated }) "XP Dihitung" else "Historis (0 XP)",
+                                containerColor = if (studentRecords.all { it.xpCalculated }) Emerald50 else Amber50,
+                                contentColor = if (studentRecords.all { it.xpCalculated }) Emerald700 else Amber700
+                            )
+                        }
+                        Text("${first.className} • ${first.studyProgramCode}", style = MaterialTheme.typography.labelSmall, color = Slate500)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            studentRecords.sortedBy { it.weekNumber }.forEach { hr ->
+                                val isPresent = hr.rawStatus.equals("HADIR", ignoreCase = true)
+                                val isAbsent = hr.rawStatus.equals("ALPHA", ignoreCase = true) || hr.rawStatus.equals("TIDAK HADIR", ignoreCase = true)
+                                AzrilStatusBadge(
+                                    text = "M${hr.weekNumber}: ${hr.rawStatus}",
+                                    containerColor = when {
+                                        isPresent -> Emerald50
+                                        isAbsent -> Rose50
+                                        else -> SurfaceMuted
+                                    },
+                                    contentColor = when {
+                                        isPresent -> Emerald700
+                                        isAbsent -> Rose700
+                                        else -> Slate600
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showHistoricalXpDialog) {
+        var countDispen by rememberSaveable { mutableStateOf(false) }
+        var countKip by rememberSaveable { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { showHistoricalXpDialog = false },
+            containerColor = PureWhite,
+            title = { Text("Konfirmasi Hitung XP Historis", style = MaterialTheme.typography.titleLarge, color = Navy900) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "XP hanya akan dihitung satu kali untuk catatan absensi historis yang belum pernah diproses (anti duplikasi):\n• HADIR = +20 XP\n• IZIN = +10 XP (maks. ${uiState.settings.maxPaidIzinPerSemester}x/semester)\n• ALPHA / TIDAK HADIR = 0 XP",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Slate600
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Hitung status DISPEN sebagai Hadir (+20 XP)", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                        androidx.compose.material3.Switch(checked = countDispen, onCheckedChange = { countDispen = it })
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Hitung status KIP sebagai Hadir (+20 XP)", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                        androidx.compose.material3.Switch(checked = countKip, onCheckedChange = { countKip = it })
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.calculateHistoricalAttendanceXp(
+                            classNameFilter = historicalClassFilter.takeIf { it != "ALL" },
+                            countDispenAsHadir = countDispen,
+                            countKipAsHadir = countKip
+                        )
+                        showHistoricalXpDialog = false
+                    },
+                    shape = RoundedCornerShape(999.dp)
+                ) { Text("Konfirmasi & Hitung XP") }
+            },
+            dismissButton = { TextButton(onClick = { showHistoricalXpDialog = false }) { Text("Batal") } }
+        )
     }
 
     if (showManualRecordDialog) {

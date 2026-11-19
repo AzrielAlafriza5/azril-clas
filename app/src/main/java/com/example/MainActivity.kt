@@ -51,6 +51,7 @@ import com.example.ui.screens.admin.AdminStudyProgramsScreen
 import com.example.ui.screens.admin.AdminSubmissionsScreen
 import com.example.ui.screens.admin.AdminXpParticipationScreen
 import com.example.ui.screens.admin.RoleNotificationsScreen
+import com.example.ui.screens.auth.ForceChangePasswordScreen
 import com.example.ui.screens.auth.LoginScreen
 import com.example.ui.screens.ranking.AdminRankingScreen
 import com.example.ui.screens.ranking.StudentRankingScreen
@@ -174,32 +175,45 @@ fun AzrilClasApp(
                 }
             }
             UserRole.STUDENT -> {
-                BackHandler(enabled = uiState.studentDestination != StudentDestination.DASHBOARD) {
-                    viewModel.navigateStudent(StudentDestination.DASHBOARD)
-                }
-                AzrilAdaptiveShell(
-                    user = user,
-                    destinations = StudentDestination.entries,
-                    bottomBarDestinations = StudentDestination.bottomBarItems,
-                    selectedDestination = uiState.studentDestination,
-                    unreadNotifications = uiState.unreadNotificationCount,
-                    onSelectDestination = { viewModel.navigateStudent(it) },
-                    onOpenNotifications = { viewModel.navigateStudent(StudentDestination.NOTIFICATIONS) },
-                    onRefresh = { viewModel.triggerRefresh() },
-                    onSwitchRolePreview = { viewModel.enterAdminPreview() },
-                    onLogout = { viewModel.logout() }
-                ) { isExpanded ->
-                    when (uiState.studentDestination) {
-                        StudentDestination.DASHBOARD -> StudentDashboardScreen(uiState, isExpanded) { viewModel.navigateStudent(it) }
-                        StudentDestination.XP_HISTORY -> StudentXpHistoryScreen(uiState, isExpanded)
-                        StudentDestination.MY_SCHEDULE -> StudentScheduleScreen(uiState, viewModel, isExpanded) { viewModel.navigateStudent(it) }
-                        StudentDestination.ATTENDANCE -> StudentAttendanceScreen(uiState, viewModel, isExpanded)
-                        StudentDestination.ASSIGNMENTS -> StudentAssignmentsScreen(uiState, viewModel, isExpanded)
-                        StudentDestination.MY_SUBMISSIONS -> StudentSubmissionsScreen(uiState, isExpanded)
-                        StudentDestination.GRADES_FEEDBACK -> StudentGradesScreen(uiState, isExpanded)
-                        StudentDestination.RANKING -> StudentRankingScreen(uiState, isExpanded)
-                        StudentDestination.NOTIFICATIONS -> RoleNotificationsScreen(uiState, UserRole.STUDENT, viewModel, isExpanded)
-                        StudentDestination.PROFILE -> StudentProfileScreen(uiState, viewModel, isExpanded) { viewModel.logout() }
+                if (user.mustChangePassword) {
+                    ForceChangePasswordScreen(
+                        user = user,
+                        authInProgress = uiState.authInProgress,
+                        authErrorMessage = uiState.authErrorMessage,
+                        onClearError = { viewModel.clearAuthError() },
+                        onSubmitNewPassword = { newPw, confirmPw ->
+                            viewModel.completeFirstLoginPasswordChange(newPw, confirmPw)
+                        },
+                        onLogout = { viewModel.logout() }
+                    )
+                } else {
+                    BackHandler(enabled = uiState.studentDestination != StudentDestination.DASHBOARD) {
+                        viewModel.navigateStudent(StudentDestination.DASHBOARD)
+                    }
+                    AzrilAdaptiveShell(
+                        user = user,
+                        destinations = StudentDestination.entries,
+                        bottomBarDestinations = StudentDestination.bottomBarItems,
+                        selectedDestination = uiState.studentDestination,
+                        unreadNotifications = uiState.unreadNotificationCount,
+                        onSelectDestination = { viewModel.navigateStudent(it) },
+                        onOpenNotifications = { viewModel.navigateStudent(StudentDestination.NOTIFICATIONS) },
+                        onRefresh = { viewModel.triggerRefresh() },
+                        onSwitchRolePreview = { viewModel.enterAdminPreview() },
+                        onLogout = { viewModel.logout() }
+                    ) { isExpanded ->
+                        when (uiState.studentDestination) {
+                            StudentDestination.DASHBOARD -> StudentDashboardScreen(uiState, isExpanded) { viewModel.navigateStudent(it) }
+                            StudentDestination.XP_HISTORY -> StudentXpHistoryScreen(uiState, isExpanded)
+                            StudentDestination.MY_SCHEDULE -> StudentScheduleScreen(uiState, viewModel, isExpanded) { viewModel.navigateStudent(it) }
+                            StudentDestination.ATTENDANCE -> StudentAttendanceScreen(uiState, viewModel, isExpanded)
+                            StudentDestination.ASSIGNMENTS -> StudentAssignmentsScreen(uiState, viewModel, isExpanded)
+                            StudentDestination.MY_SUBMISSIONS -> StudentSubmissionsScreen(uiState, isExpanded)
+                            StudentDestination.GRADES_FEEDBACK -> StudentGradesScreen(uiState, isExpanded)
+                            StudentDestination.RANKING -> StudentRankingScreen(uiState, isExpanded)
+                            StudentDestination.NOTIFICATIONS -> RoleNotificationsScreen(uiState, UserRole.STUDENT, viewModel, isExpanded)
+                            StudentDestination.PROFILE -> StudentProfileScreen(uiState, viewModel, isExpanded) { viewModel.logout() }
+                        }
                     }
                 }
             }
