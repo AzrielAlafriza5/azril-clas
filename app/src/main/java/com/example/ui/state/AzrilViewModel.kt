@@ -9,6 +9,8 @@ import com.example.data.auth.AuthResult
 import com.example.data.auth.AzrilAuthRepository
 import com.example.data.auth.DataStoreAuthStorage
 import com.example.data.auth.OfficialStudyPrograms
+import com.example.data.auth.RemoteDirectoryResult
+import com.example.data.auth.SupabaseStudentCrudService
 import com.example.data.export.AzrilDataExportService
 import com.example.data.export.ExportBuildResult
 import com.example.data.export.ExportDatasetSnapshot
@@ -68,6 +70,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -115,6 +118,9 @@ data class AzrilUiState(
     val assignmentChecklists: List<AssignmentChecklistRecord> = emptyList(),
     val serverClockOffsetMillis: Long = 0L,
     val isSyncingAssignments: Boolean = false,
+    val isSyncingStudents: Boolean = false,
+    val studentsSyncError: String? = null,
+    val hasLiveSupabaseSession: Boolean = false,
     val rankingPoints: List<RankingPointTransaction> = emptyList(),
     val rankingAuditLogs: List<RankingPointAuditLog> = emptyList(),
     val studentStreaks: Map<String, StudentStreakState> = emptyMap(),
@@ -133,8 +139,15 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
 
     private val authStorage = DataStoreAuthStorage(application)
     private val authRepository = AzrilAuthRepository(authStorage)
-    private val assignmentSyncService = AssignmentSyncService(authStorage)
-    private val dataExportService = AzrilDataExportService(authStorage)
+    private val assignmentSyncService = AssignmentSyncService(
+        store = authStorage,
+        activeTokenProvider = { authRepository.getActiveSupabaseJwt() }
+    )
+    private val dataExportService = AzrilDataExportService(
+        store = authStorage,
+        activeTokenProvider = { authRepository.getActiveSupabaseJwt() }
+    )
+    private var pendingStudentPersistenceJob: Job? = null
 
     private val _uiState = MutableStateFlow(
         AzrilUiState(isSupabaseConfigured = authRepository.isSupabaseConfigured())
@@ -195,12 +208,15 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             val current = _uiState.value.currentUser
+            val liveSession = authRepository.hasLiveSupabaseSession()
+            _uiState.update { it.copy(hasLiveSupabaseSession = liveSession) }
             if (current?.role == UserRole.STUDENT && !current.mustChangePassword) {
                 recordStudentDailyLogin(current.id)
                 syncAssignmentsAndChecklists(showToastOnComplete = false)
             } else if (current == null || current.role == UserRole.ADMIN) {
                 evaluateStreakRemindersForInactiveStudents()
                 if (current?.role == UserRole.ADMIN) {
+                    refreshStudentsAndClassesFromSupabase(showToastOnComplete = false, force = true)
                     syncAssignmentsAndChecklists(showToastOnComplete = false)
                 }
             }
@@ -245,6 +261,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         viewModelScope.launch {
             _uiState.update { it.copy(authInProgress = true, authErrorMessage = null) }
+            // Ensure any recent Admin student creation/import has finished persisting locally before authenticating
+            pendingStudentPersistenceJob?.join()
             when (val result = authRepository.login(identifier, password, rememberMe)) {
                 is AuthResult.Success -> {
                     _uiState.update { state ->
@@ -403,7 +421,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     fun loginAdminWithCredentials(
         username: String,
         password: String,
-        rememberMe: Boolean = false,
+        rememberMe: Boolean = true,
         nowMillis: Long = System.currentTimeMillis()
     ) {
         viewModelScope.launch {
@@ -423,12 +441,15 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         return@launch
                     }
+                    val hasLiveJwt = authRepository.hasLiveSupabaseSession()
                     _uiState.update { state ->
                         state.copy(
                             authInProgress = false,
                             authErrorMessage = null,
                             currentUser = result.profile,
                             authPortalMode = AuthPortalMode.ADMIN_LOGIN,
+                            hasLiveSupabaseSession = hasLiveJwt,
+                            studentsSyncError = null,
                             sessionExpiresAtMillis = result.sessionExpiresAt.takeIf { it > 0L }
                                 ?: (nowMillis + AzrilAuthRepository.ADMIN_SESSION_DURATION_MS),
                             adminDestination = AdminDestination.DASHBOARD,
@@ -439,6 +460,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                     evaluateStreakRemindersForInactiveStudents()
+                    refreshStudentsAndClassesFromSupabase(showToastOnComplete = false, force = true)
                     syncAssignmentsAndChecklists(showToastOnComplete = false)
                 }
                 is AuthResult.Failure -> {
@@ -549,6 +571,14 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             }
             val matchedDest = resolveAdminDestinationFromRoute(normalized)
             _uiState.update { it.copy(adminDestination = matchedDest, loadState = ScreenLoadState.Ready) }
+            if (authRepository.isSupabaseConfigured() &&
+                (matchedDest == AdminDestination.STUDENTS ||
+                    matchedDest == AdminDestination.CLASSES ||
+                    matchedDest == AdminDestination.DASHBOARD) &&
+                !_uiState.value.isSyncingStudents
+            ) {
+                refreshStudentsAndClassesFromSupabase(showToastOnComplete = false, force = false)
+            }
             return RouteAccessResult.Allowed
         }
 
@@ -657,7 +687,71 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun triggerRefresh() {
+        if (_uiState.value.currentUser?.role == UserRole.ADMIN && authRepository.isSupabaseConfigured()) {
+            refreshStudentsAndClassesFromSupabase(showToastOnComplete = false, force = true)
+        }
         syncAssignmentsAndChecklists(showToastOnComplete = true)
+    }
+
+    /**
+     * Fetches the authoritative study programs, classes, and student roster directly from Supabase
+     * (`study_programs`, `classes`, `profiles?role=eq.student`) so all Admin devices always reflect
+     * real database state rather than device-local cache.
+     */
+    fun refreshStudentsAndClassesFromSupabase(
+        showToastOnComplete: Boolean = false,
+        force: Boolean = true
+    ) {
+        if (!authRepository.isSupabaseConfigured()) return
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) return
+        if (!force && _uiState.value.isSyncingStudents) return
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isSyncingStudents = true) }
+            val result = authRepository.fetchStudentsAndClassesFromSupabase()
+            applyRemoteDirectoryResult(result, showToastOnComplete = showToastOnComplete)
+        }
+    }
+
+    private suspend fun applyRemoteDirectoryResult(
+        result: RemoteDirectoryResult,
+        showToastOnComplete: Boolean = false,
+        overrideSuccessToast: ToastMessage? = null
+    ) {
+        when (result) {
+            is RemoteDirectoryResult.Success -> {
+                val dir = result.directory
+                _uiState.update { state ->
+                    state.copy(
+                        studyPrograms = dir.studyPrograms.ifEmpty { state.studyPrograms },
+                        classes = dir.classes,
+                        students = dir.students,
+                        isSyncingStudents = false,
+                        studentsSyncError = null,
+                        hasLiveSupabaseSession = true,
+                        toastMessage = overrideSuccessToast ?: if (showToastOnComplete) {
+                            ToastMessage(
+                                "Data mahasiswa (${dir.students.size}) & kelas (${dir.classes.size}) dimuat dari Supabase.",
+                                ToastType.SUCCESS
+                            )
+                        } else state.toastMessage
+                    )
+                }
+            }
+            is RemoteDirectoryResult.Error -> {
+                val live = authRepository.hasLiveSupabaseSession()
+                _uiState.update { state ->
+                    state.copy(
+                        isSyncingStudents = false,
+                        studentsSyncError = result.message,
+                        hasLiveSupabaseSession = live,
+                        toastMessage = overrideSuccessToast ?: if (showToastOnComplete) {
+                            ToastMessage(result.message, ToastType.ERROR)
+                        } else state.toastMessage
+                    )
+                }
+            }
+        }
     }
 
     fun currentEffectiveNowMillis(localNowMillis: Long = System.currentTimeMillis()): Long =
@@ -878,13 +972,36 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         val newClass = AcademicClass(
             name = name.trim(),
             studyProgramId = prodi.id,
-            studyProgramName = prodi.name,
+            studyProgramName = prodi.code,
             semester = semester,
             academicYear = academicYear.trim(),
             cohortYear = cohortYear,
             description = description.trim(),
             isActive = isActive
         )
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            viewModelScope.launch {
+                val err = authRepository.adminSaveClassToSupabase(newClass, prodi.code)
+                if (err != null) {
+                    _uiState.update {
+                        it.copy(
+                            isSyncingStudents = false,
+                            studentsSyncError = err,
+                            toastMessage = ToastMessage(err, ToastType.ERROR)
+                        )
+                    }
+                } else {
+                    val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                    applyRemoteDirectoryResult(
+                        result = refreshed,
+                        overrideSuccessToast = ToastMessage("Kelas ${newClass.name} berhasil disimpan ke Supabase.", ToastType.SUCCESS)
+                    )
+                }
+            }
+            return null
+        }
+
         val nextClasses = listOf(newClass) + _uiState.value.classes
         _uiState.update {
             it.copy(
@@ -906,6 +1023,29 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             showToast("Kelas tidak dapat dihapus karena masih memiliki relasi mahasiswa, jadwal, atau tugas.", ToastType.ERROR)
             return
         }
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            viewModelScope.launch {
+                val err = authRepository.adminDeleteClassFromSupabase(id)
+                if (err != null) {
+                    _uiState.update {
+                        it.copy(
+                            isSyncingStudents = false,
+                            studentsSyncError = err,
+                            toastMessage = ToastMessage(err, ToastType.ERROR)
+                        )
+                    }
+                } else {
+                    val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                    applyRemoteDirectoryResult(
+                        result = refreshed,
+                        overrideSuccessToast = ToastMessage("Kelas berhasil dihapus dari Supabase.", ToastType.SUCCESS)
+                    )
+                }
+            }
+            return
+        }
+
         val nextClasses = _uiState.value.classes.filterNot { it.id == id }
         _uiState.update { state ->
             state.copy(
@@ -918,7 +1058,58 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
 
     fun assignStudentToClass(studentId: String, classId: String?) {
         val targetClass = _uiState.value.classes.find { it.id == classId }
-        val targetStudent = _uiState.value.students.find { it.id == studentId }
+        val targetStudent = _uiState.value.students.find { it.id == studentId } ?: return
+        val prodiCode = resolveStudyProgramCode(
+            targetStudent.studyProgramId,
+            targetStudent.studyProgramName,
+            _uiState.value.studyPrograms
+        )
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            viewModelScope.launch {
+                when (
+                    val res = authRepository.adminUpdateStudentAccount(
+                        studentId = targetStudent.id,
+                        fullName = targetStudent.fullName,
+                        nim = targetStudent.nim,
+                        email = targetStudent.email,
+                        studyProgramId = targetStudent.studyProgramId,
+                        studyProgramCode = prodiCode,
+                        classId = targetClass?.id,
+                        className = targetClass?.name,
+                        semester = targetStudent.semester,
+                        cohortYear = targetStudent.cohortYear,
+                        accountStatus = targetStudent.status,
+                        badgeStatus = targetStudent.badgeStatus,
+                        previousNim = targetStudent.nim,
+                        targetClass = targetClass
+                    )
+                ) {
+                    is AuthResult.Success -> {
+                        val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                        applyRemoteDirectoryResult(
+                            result = refreshed,
+                            overrideSuccessToast = ToastMessage(
+                                if (targetClass != null) "${targetStudent.fullName} ditambahkan ke ${targetClass.name} (tersimpan di Supabase)."
+                                else "${targetStudent.fullName} dikeluarkan dari kelas (tersimpan di Supabase).",
+                                ToastType.SUCCESS
+                            )
+                        )
+                    }
+                    is AuthResult.Failure -> {
+                        _uiState.update {
+                            it.copy(
+                                isSyncingStudents = false,
+                                studentsSyncError = res.message,
+                                toastMessage = ToastMessage(res.message, ToastType.ERROR)
+                            )
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         _uiState.update { state ->
             val updatedStudents = state.students.map { stu ->
                 if (stu.id == studentId) stu.copy(classId = targetClass?.id, className = targetClass?.name)
@@ -938,29 +1129,24 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 )
             )
         }
-        if (targetStudent != null) {
-            val prodiCode = resolveStudyProgramCode(
-                targetStudent.studyProgramId,
-                targetStudent.studyProgramName,
-                _uiState.value.studyPrograms
+        viewModelScope.launch {
+            authRepository.adminUpdateStudentAccount(
+                studentId = targetStudent.id,
+                fullName = targetStudent.fullName,
+                nim = targetStudent.nim,
+                email = targetStudent.email,
+                studyProgramId = targetStudent.studyProgramId,
+                studyProgramCode = prodiCode,
+                classId = targetClass?.id,
+                className = targetClass?.name,
+                semester = targetStudent.semester,
+                cohortYear = targetStudent.cohortYear,
+                accountStatus = targetStudent.status,
+                badgeStatus = targetStudent.badgeStatus,
+                previousNim = targetStudent.nim,
+                targetClass = targetClass
             )
-            viewModelScope.launch {
-                authRepository.adminUpdateStudentAccount(
-                    studentId = targetStudent.id,
-                    fullName = targetStudent.fullName,
-                    nim = targetStudent.nim,
-                    email = targetStudent.email,
-                    studyProgramId = targetStudent.studyProgramId,
-                    studyProgramCode = prodiCode,
-                    classId = targetClass?.id,
-                    className = targetClass?.name,
-                    semester = targetStudent.semester,
-                    cohortYear = targetStudent.cohortYear,
-                    accountStatus = targetStudent.status,
-                    badgeStatus = targetStudent.badgeStatus
-                )
-                authRepository.saveClasses(_uiState.value.classes)
-            }
+            authRepository.saveClasses(_uiState.value.classes)
         }
     }
 
@@ -980,9 +1166,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         if (_uiState.value.currentUser?.role != UserRole.ADMIN) {
             return "Akses ditolak: hanya Admin yang dapat menambahkan data mahasiswa."
         }
-        val cleanNim = nim.trim()
+        val cleanNim = SupabaseStudentCrudService.sanitizeNim(nim)
         val cleanName = fullName.trim()
-        val cleanEmail = email.trim().lowercase().ifBlank { "$cleanNim@mahasiswa.azrilclas.ac.id" }
+        val cleanEmail = email.trim().lowercase(Locale.US).ifBlank { "$cleanNim@mahasiswa.azrilclas.ac.id" }
         val resolvedPassword = initialPassword.trim().ifBlank { cleanNim }
         val prodi = _uiState.value.studyPrograms.find { it.id == studyProgramId }
             ?: return "Pilih program studi terlebih dahulu."
@@ -1008,6 +1194,72 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             status = status,
             badgeStatus = badgeStatus
         )
+
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            pendingStudentPersistenceJob = viewModelScope.launch {
+                when (
+                    val res = authRepository.adminCreateStudentAccount(
+                        studentId = student.id,
+                        fullName = student.fullName,
+                        nim = student.nim,
+                        email = student.email,
+                        studyProgramId = prodi.id,
+                        studyProgramCode = prodi.code,
+                        classId = selectedClass?.id,
+                        className = selectedClass?.name,
+                        semester = semester,
+                        cohortYear = cohortYear,
+                        accountStatus = status,
+                        badgeStatus = badgeStatus,
+                        initialPassword = resolvedPassword,
+                        targetClass = selectedClass
+                    )
+                ) {
+                    is AuthResult.Success -> {
+                        val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                        if (refreshed is RemoteDirectoryResult.Success) {
+                            applyRemoteDirectoryResult(
+                                result = refreshed,
+                                overrideSuccessToast = ToastMessage(
+                                    "Mahasiswa ${res.profile.fullName} (NIM ${res.profile.nim}) berhasil disimpan ke Supabase.",
+                                    ToastType.SUCCESS
+                                )
+                            )
+                        } else {
+                            // Write succeeded in Supabase; merge verified record even if immediate re-fetch had a transient error
+                            val createdRecord = res.profile.toStudentRecord()
+                            _uiState.update { state ->
+                                val merged = mergeRegisteredStudents(state.students, listOf(createdRecord))
+                                val nextClasses = state.classes.map { cls ->
+                                    cls.copy(memberIds = merged.filter { it.classId == cls.id }.map { it.id })
+                                }
+                                state.copy(
+                                    students = merged,
+                                    classes = nextClasses,
+                                    isSyncingStudents = false,
+                                    toastMessage = ToastMessage(
+                                        "Mahasiswa ${createdRecord.fullName} (NIM ${createdRecord.nim}) berhasil disimpan ke Supabase.",
+                                        ToastType.SUCCESS
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    is AuthResult.Failure -> {
+                        _uiState.update {
+                            it.copy(
+                                isSyncingStudents = false,
+                                studentsSyncError = res.message,
+                                toastMessage = ToastMessage(res.message, ToastType.ERROR)
+                            )
+                        }
+                    }
+                }
+            }
+            return null
+        }
+
         _uiState.update { state ->
             val nextStudents = listOf(student) + state.students
             val nextClasses = state.classes.map { cls ->
@@ -1022,7 +1274,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 )
             )
         }
-        viewModelScope.launch {
+        pendingStudentPersistenceJob = viewModelScope.launch {
             authRepository.adminCreateStudentAccount(
                 studentId = student.id,
                 fullName = student.fullName,
@@ -1036,7 +1288,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 cohortYear = cohortYear,
                 accountStatus = status,
                 badgeStatus = badgeStatus,
-                initialPassword = resolvedPassword
+                initialPassword = resolvedPassword,
+                targetClass = selectedClass
             )
             authRepository.saveClasses(_uiState.value.classes)
         }
@@ -1059,8 +1312,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             return "Akses ditolak: hanya Admin yang dapat mengubah data mahasiswa."
         }
         val cleanName = fullName.trim()
-        val cleanNim = nim.trim()
-        val cleanEmail = email.trim().lowercase()
+        val cleanNim = SupabaseStudentCrudService.sanitizeNim(nim)
+        val cleanEmail = email.trim().lowercase(Locale.US)
         val prodi = _uiState.value.studyPrograms.find { it.id == studyProgramId }
             ?: return "Pilih program studi terlebih dahulu."
         if (cleanName.length < 3) return "Nama lengkap minimal 3 karakter."
@@ -1071,6 +1324,103 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             return "NIM '$cleanNim' sudah terdaftar pada mahasiswa lain."
         }
         val selectedClass = _uiState.value.classes.find { it.id == classId }
+        val previousStudent = _uiState.value.students.find { it.id == studentId }
+
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            viewModelScope.launch {
+                when (
+                    val res = authRepository.adminUpdateStudentAccount(
+                        studentId = studentId,
+                        fullName = cleanName,
+                        nim = cleanNim,
+                        email = cleanEmail,
+                        studyProgramId = prodi.id,
+                        studyProgramCode = prodi.code,
+                        classId = selectedClass?.id,
+                        className = selectedClass?.name,
+                        semester = semester,
+                        cohortYear = cohortYear,
+                        accountStatus = accountStatus,
+                        badgeStatus = badgeStatus,
+                        previousNim = previousStudent?.nim,
+                        targetClass = selectedClass
+                    )
+                ) {
+                    is AuthResult.Success -> {
+                        val canonicalId = res.profile.id
+                        _uiState.update { state ->
+                            val updatedAttendance = state.attendanceRecords.map { rec ->
+                                if (rec.studentId == studentId || rec.studentId == canonicalId) {
+                                    rec.copy(studentNim = cleanNim, studentName = cleanName)
+                                } else rec
+                            }
+                            val updatedHistorical = state.historicalAttendanceRecords.map { rec ->
+                                if (rec.studentId == studentId || rec.studentId == canonicalId) rec.copy(
+                                    studentNim = cleanNim,
+                                    studentName = cleanName,
+                                    classId = selectedClass?.id ?: rec.classId,
+                                    className = selectedClass?.name ?: rec.className,
+                                    studyProgramCode = prodi.code
+                                ) else rec
+                            }
+                            val updatedSubmissions = state.submissions.map { sub ->
+                                if (sub.studentId == studentId || sub.studentId == canonicalId) {
+                                    sub.copy(studentNim = cleanNim, studentName = cleanName)
+                                } else sub
+                            }
+                            state.copy(
+                                attendanceRecords = updatedAttendance,
+                                historicalAttendanceRecords = updatedHistorical,
+                                submissions = updatedSubmissions
+                            )
+                        }
+                        authRepository.saveAttendanceRecords(_uiState.value.attendanceRecords)
+                        authRepository.saveHistoricalAttendanceRecords(_uiState.value.historicalAttendanceRecords)
+
+                        val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                        if (refreshed is RemoteDirectoryResult.Success) {
+                            applyRemoteDirectoryResult(
+                                result = refreshed,
+                                overrideSuccessToast = ToastMessage(
+                                    "Perubahan data $cleanName (NIM $cleanNim) berhasil disimpan ke Supabase.",
+                                    ToastType.SUCCESS
+                                )
+                            )
+                        } else {
+                            val updatedRec = res.profile.toStudentRecord()
+                            _uiState.update { state ->
+                                val nextStudents = state.students.map { stu ->
+                                    if (stu.id == studentId || stu.id == canonicalId) updatedRec else stu
+                                }
+                                val nextClasses = state.classes.map { cls ->
+                                    cls.copy(memberIds = nextStudents.filter { it.classId == cls.id }.map { it.id })
+                                }
+                                state.copy(
+                                    students = nextStudents,
+                                    classes = nextClasses,
+                                    isSyncingStudents = false,
+                                    toastMessage = ToastMessage(
+                                        "Perubahan data $cleanName (NIM $cleanNim) berhasil disimpan ke Supabase.",
+                                        ToastType.SUCCESS
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    is AuthResult.Failure -> {
+                        _uiState.update {
+                            it.copy(
+                                isSyncingStudents = false,
+                                studentsSyncError = res.message,
+                                toastMessage = ToastMessage(res.message, ToastType.ERROR)
+                            )
+                        }
+                    }
+                }
+            }
+            return null
+        }
 
         _uiState.update { state ->
             val updatedStudents = state.students.map { stu ->
@@ -1132,7 +1482,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 semester = semester,
                 cohortYear = cohortYear,
                 accountStatus = accountStatus,
-                badgeStatus = badgeStatus
+                badgeStatus = badgeStatus,
+                previousNim = previousStudent?.nim,
+                targetClass = selectedClass
             )
             authRepository.saveClasses(_uiState.value.classes)
             authRepository.saveAttendanceRecords(_uiState.value.attendanceRecords)
@@ -1147,19 +1499,52 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         }
         val student = _uiState.value.students.find { it.id == studentId }
             ?: return "Mahasiswa tidak ditemukan."
+        val successToast = ToastMessage(
+            "Status mahasiswa ${student.fullName} diubah menjadi ${badgeStatus.label}.",
+            when (badgeStatus) {
+                StudentBadgeStatus.AFK -> ToastType.WARNING
+                StudentBadgeStatus.LULUS -> ToastType.SUCCESS
+                StudentBadgeStatus.NEUTRAL -> ToastType.INFO
+            }
+        )
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            viewModelScope.launch {
+                val err = authRepository.adminUpdateStudentBadgeStatusResult(studentId, student.nim, badgeStatus)
+                if (err != null) {
+                    _uiState.update {
+                        it.copy(
+                            isSyncingStudents = false,
+                            studentsSyncError = err,
+                            toastMessage = ToastMessage(err, ToastType.ERROR)
+                        )
+                    }
+                } else {
+                    val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                    if (refreshed is RemoteDirectoryResult.Success) {
+                        applyRemoteDirectoryResult(refreshed, overrideSuccessToast = successToast)
+                    } else {
+                        _uiState.update { state ->
+                            state.copy(
+                                students = state.students.map { stu ->
+                                    if (stu.id == studentId) stu.copy(badgeStatus = badgeStatus) else stu
+                                },
+                                isSyncingStudents = false,
+                                toastMessage = successToast
+                            )
+                        }
+                    }
+                }
+            }
+            return null
+        }
+
         _uiState.update { state ->
             state.copy(
                 students = state.students.map { stu ->
                     if (stu.id == studentId) stu.copy(badgeStatus = badgeStatus) else stu
                 },
-                toastMessage = ToastMessage(
-                    "Status mahasiswa ${student.fullName} diubah menjadi ${badgeStatus.label}.",
-                    when (badgeStatus) {
-                        StudentBadgeStatus.AFK -> ToastType.WARNING
-                        StudentBadgeStatus.LULUS -> ToastType.SUCCESS
-                        StudentBadgeStatus.NEUTRAL -> ToastType.INFO
-                    }
-                )
+                toastMessage = successToast
             )
         }
         viewModelScope.launch {
@@ -1180,22 +1565,22 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         if (cleanPw.length < 6) return "Kata sandi baru minimal 6 karakter."
         val student = _uiState.value.students.find { it.id == studentId }
             ?: return "Data mahasiswa tidak ditemukan."
-        _uiState.update { state ->
-            state.copy(
-                students = state.students.map { stu ->
-                    if (stu.id == studentId) stu.copy(mustChangePassword = requirePasswordChange) else stu
-                }
-            )
-        }
         viewModelScope.launch {
             val err = authRepository.adminResetStudentPassword(studentId, cleanPw, requirePasswordChange)
             if (err != null) {
                 showToast(err, ToastType.ERROR)
             } else {
-                showToast(
-                    "Kata sandi untuk ${student.fullName} (NIM ${student.nim}) berhasil direset. Mahasiswa wajib mengganti password saat login berikutnya.",
-                    ToastType.SUCCESS
-                )
+                _uiState.update { state ->
+                    state.copy(
+                        students = state.students.map { stu ->
+                            if (stu.id == studentId) stu.copy(mustChangePassword = requirePasswordChange) else stu
+                        },
+                        toastMessage = ToastMessage(
+                            "Kata sandi untuk ${student.fullName} (NIM ${student.nim}) berhasil direset. Mahasiswa wajib mengganti password saat login berikutnya.",
+                            ToastType.SUCCESS
+                        )
+                    )
+                }
             }
         }
         return null
@@ -1206,6 +1591,42 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             showToast("Hanya Admin yang dapat menghapus data mahasiswa.", ToastType.ERROR)
             return
         }
+        val target = _uiState.value.students.find { it.id == id }
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            viewModelScope.launch {
+                val err = authRepository.adminDeleteStudentAccount(id, target?.nim)
+                if (err != null) {
+                    _uiState.update {
+                        it.copy(
+                            isSyncingStudents = false,
+                            studentsSyncError = err,
+                            toastMessage = ToastMessage(err, ToastType.ERROR)
+                        )
+                    }
+                } else {
+                    val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                    val successToast = ToastMessage(
+                        "Data mahasiswa ${target?.fullName ?: ""} berhasil dihapus dari database Supabase.",
+                        ToastType.SUCCESS
+                    )
+                    if (refreshed is RemoteDirectoryResult.Success) {
+                        applyRemoteDirectoryResult(refreshed, overrideSuccessToast = successToast)
+                    } else {
+                        _uiState.update { state ->
+                            state.copy(
+                                students = state.students.filterNot { it.id == id },
+                                classes = state.classes.map { cls -> cls.copy(memberIds = cls.memberIds.filterNot { m -> m == id }) },
+                                isSyncingStudents = false,
+                                toastMessage = successToast
+                            )
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         _uiState.update { state ->
             state.copy(
                 students = state.students.filterNot { it.id == id },
@@ -1214,7 +1635,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch {
-            authRepository.adminDeleteStudentAccount(id)
+            authRepository.adminDeleteStudentAccount(id, target?.nim)
             authRepository.saveClasses(_uiState.value.classes)
         }
     }
@@ -1223,6 +1644,54 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         if (_uiState.value.currentUser?.role != UserRole.ADMIN) return
         val target = _uiState.value.students.find { it.id == id } ?: return
         val next = if (target.status == AccountStatus.ACTIVE) AccountStatus.INACTIVE else AccountStatus.ACTIVE
+        val prodiCode = resolveStudyProgramCode(target.studyProgramId, target.studyProgramName, _uiState.value.studyPrograms)
+        val currentClass = _uiState.value.classes.find { it.id == target.classId }
+
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            viewModelScope.launch {
+                when (
+                    val res = authRepository.adminUpdateStudentAccount(
+                        studentId = target.id,
+                        fullName = target.fullName,
+                        nim = target.nim,
+                        email = target.email,
+                        studyProgramId = target.studyProgramId,
+                        studyProgramCode = prodiCode,
+                        classId = target.classId,
+                        className = target.className,
+                        semester = target.semester,
+                        cohortYear = target.cohortYear,
+                        accountStatus = next,
+                        badgeStatus = target.badgeStatus,
+                        previousNim = target.nim,
+                        targetClass = currentClass
+                    )
+                ) {
+                    is AuthResult.Success -> {
+                        val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                        applyRemoteDirectoryResult(
+                            result = refreshed,
+                            overrideSuccessToast = ToastMessage(
+                                "Status akun ${target.fullName} diubah menjadi ${next.label} di Supabase.",
+                                ToastType.SUCCESS
+                            )
+                        )
+                    }
+                    is AuthResult.Failure -> {
+                        _uiState.update {
+                            it.copy(
+                                isSyncingStudents = false,
+                                studentsSyncError = res.message,
+                                toastMessage = ToastMessage(res.message, ToastType.ERROR)
+                            )
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         _uiState.update { state ->
             state.copy(
                 students = state.students.map { stu ->
@@ -1231,7 +1700,6 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 toastMessage = ToastMessage("Status akun ${target.fullName}: ${next.label}.", ToastType.INFO)
             )
         }
-        val prodiCode = resolveStudyProgramCode(target.studyProgramId, target.studyProgramName, _uiState.value.studyPrograms)
         viewModelScope.launch {
             authRepository.adminUpdateStudentAccount(
                 studentId = target.id,
@@ -1245,7 +1713,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 semester = target.semester,
                 cohortYear = target.cohortYear,
                 accountStatus = next,
-                badgeStatus = target.badgeStatus
+                badgeStatus = target.badgeStatus,
+                previousNim = target.nim,
+                targetClass = currentClass
             )
         }
     }
@@ -1299,7 +1769,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         val created = validRows.map {
             StudentRecord(
                 fullName = it.fullName,
-                nim = it.nim,
+                nim = SupabaseStudentCrudService.sanitizeNim(it.nim),
                 email = it.email,
                 studyProgramId = prodi.id,
                 studyProgramName = prodi.code,
@@ -1311,7 +1781,64 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 badgeStatus = StudentBadgeStatus.NEUTRAL
             )
         }
-        val failedCount = rows.size - validRows.size
+        val invalidRowCount = rows.size - validRows.size
+
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            pendingStudentPersistenceJob = viewModelScope.launch {
+                var savedCount = 0
+                var failedCount = invalidRowCount
+                var lastError: String? = null
+                created.forEach { stu ->
+                    when (
+                        val res = authRepository.adminCreateStudentAccount(
+                            studentId = stu.id,
+                            fullName = stu.fullName,
+                            nim = stu.nim,
+                            email = stu.email,
+                            studyProgramId = prodi.id,
+                            studyProgramCode = prodi.code,
+                            classId = stu.classId,
+                            className = stu.className,
+                            semester = stu.semester,
+                            cohortYear = stu.cohortYear,
+                            accountStatus = stu.status,
+                            badgeStatus = stu.badgeStatus,
+                            initialPassword = stu.nim,
+                            targetClass = selectedClass
+                        )
+                    ) {
+                        is AuthResult.Success -> savedCount++
+                        is AuthResult.Failure -> {
+                            failedCount++
+                            lastError = res.message
+                        }
+                    }
+                }
+                val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                val toast = when {
+                    savedCount > 0 && failedCount == 0 -> ToastMessage(
+                        "Impor CSV ke Supabase selesai: $savedCount mahasiswa berhasil disimpan.",
+                        ToastType.SUCCESS
+                    )
+                    savedCount > 0 -> ToastMessage(
+                        "Impor CSV sebagian berhasil: $savedCount tersimpan di Supabase, $failedCount gagal (${lastError.orEmpty()}).",
+                        ToastType.WARNING
+                    )
+                    else -> ToastMessage(
+                        lastError ?: "Gagal mengimpor data CSV ke Supabase.",
+                        ToastType.ERROR
+                    )
+                }
+                if (refreshed is RemoteDirectoryResult.Success) {
+                    applyRemoteDirectoryResult(refreshed, overrideSuccessToast = toast)
+                } else {
+                    _uiState.update { it.copy(isSyncingStudents = false, studentsSyncError = lastError, toastMessage = toast) }
+                }
+            }
+            return
+        }
+
         _uiState.update { state ->
             val nextStudents = created + state.students
             val nextClasses = state.classes.map { cls ->
@@ -1321,12 +1848,12 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 students = nextStudents,
                 classes = nextClasses,
                 toastMessage = ToastMessage(
-                    "Impor selesai: ${created.size} berhasil (password awal = NIM masing-masing), $failedCount gagal dilewati.",
-                    if (failedCount == 0) ToastType.SUCCESS else ToastType.WARNING
+                    "Impor selesai: ${created.size} berhasil (password awal = NIM masing-masing), $invalidRowCount gagal dilewati.",
+                    if (invalidRowCount == 0) ToastType.SUCCESS else ToastType.WARNING
                 )
             )
         }
-        viewModelScope.launch {
+        pendingStudentPersistenceJob = viewModelScope.launch {
             created.forEach { stu ->
                 authRepository.adminCreateStudentAccount(
                     studentId = stu.id,
@@ -1341,7 +1868,8 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                     cohortYear = stu.cohortYear,
                     accountStatus = stu.status,
                     badgeStatus = stu.badgeStatus,
-                    initialPassword = stu.nim
+                    initialPassword = stu.nim,
+                    targetClass = selectedClass
                 )
             }
             authRepository.saveClasses(_uiState.value.classes)
@@ -1419,6 +1947,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
 
         importableRows.forEach { row ->
             val prodi = stateSnapshot.studyPrograms.find { it.id == row.studyProgramId }
+                ?: stateSnapshot.studyPrograms.find { it.code.equals(row.studyProgramCode, ignoreCase = true) }
                 ?: OfficialStudyPrograms.findByCode(row.studyProgramCode)
                 ?: return@forEach
             val targetClass = ensureClassForRow(row.className, prodi.id, prodi.code, row.semester)
@@ -1428,11 +1957,12 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 StudentBadgeStatus.NEUTRAL
             }
             val studentId = UUID.randomUUID().toString()
+            val cleanNim = SupabaseStudentCrudService.sanitizeNim(row.nim)
             val stu = StudentRecord(
                 id = studentId,
                 fullName = row.fullName,
-                nim = row.nim,
-                email = "${row.nim.lowercase(Locale.US)}@mahasiswa.azrilclas.ac.id",
+                nim = cleanNim,
+                email = "${cleanNim.lowercase(Locale.US)}@mahasiswa.azrilclas.ac.id",
                 studyProgramId = prodi.id,
                 studyProgramName = prodi.code,
                 classId = targetClass.id,
@@ -1488,6 +2018,79 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        if (authRepository.isSupabaseConfigured()) {
+            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+            pendingStudentPersistenceJob = viewModelScope.launch {
+                val createdClasses = syncedClasses.filter { cls ->
+                    stateSnapshot.classes.none { it.id == cls.id }
+                }
+                createdClasses.forEach { cls ->
+                    authRepository.adminSaveClassToSupabase(cls, cls.studyProgramName)
+                }
+                val report = authRepository.adminBulkImportStudentsToSupabase(
+                    newStudents = newStudents,
+                    classes = syncedClasses,
+                    fileName = preview.fileName,
+                    semesterKey = semesterKey,
+                    importHistoricalAttendance = importHistoricalAttendance,
+                    previewRowsForSync = importableRows
+                )
+                val persistedAny = report.usedEdgeFunction || report.syncedToSupabaseCount > 0
+                if (persistedAny) {
+                    authRepository.saveClasses(syncedClasses)
+                    if (newHistoricalRecords.isNotEmpty()) {
+                        authRepository.saveHistoricalAttendanceRecords(mergedHistorical)
+                        _uiState.update { it.copy(historicalAttendanceRecords = mergedHistorical) }
+                    }
+                }
+                val importToast = when {
+                    report.usedEdgeFunction -> ToastMessage(summaryText, ToastType.SUCCESS)
+                    report.syncedToSupabaseCount > 0 && report.diagnosticMessage.isNullOrBlank() -> ToastMessage(
+                        buildString {
+                            append("Import Excel ke Supabase selesai: ${report.syncedToSupabaseCount} mahasiswa baru disimpan")
+                            if (report.alreadyInSupabaseCount > 0) append(", ${report.alreadyInSupabaseCount} sudah terdaftar")
+                            if (preview.skippedBlackCount > 0) append(", ${preview.skippedBlackCount} blok hitam dilewati")
+                            append(".")
+                        },
+                        ToastType.SUCCESS
+                    )
+                    report.syncedToSupabaseCount > 0 -> ToastMessage(
+                        "Import sebagian berhasil: ${report.syncedToSupabaseCount}/${report.totalProcessed} tersimpan di Supabase (${report.diagnosticMessage.orEmpty()}).",
+                        ToastType.WARNING
+                    )
+                    report.alreadyInSupabaseCount > 0 && report.diagnosticMessage.isNullOrBlank() -> ToastMessage(
+                        "Seluruh ${report.alreadyInSupabaseCount} mahasiswa pada file sudah terdaftar di Supabase (tidak diduplikasi).",
+                        ToastType.INFO
+                    )
+                    else -> ToastMessage(
+                        report.diagnosticMessage ?: "Gagal menyimpan hasil Import Excel ke database Supabase.",
+                        ToastType.ERROR
+                    )
+                }
+
+                val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                if (refreshed is RemoteDirectoryResult.Success) {
+                    applyRemoteDirectoryResult(
+                        result = refreshed,
+                        overrideSuccessToast = importToast
+                    )
+                    if (importToast.type == ToastType.ERROR && !report.diagnosticMessage.isNullOrBlank()) {
+                        _uiState.update { it.copy(studentsSyncError = report.diagnosticMessage) }
+                    }
+                } else {
+                    val errMsg = report.diagnosticMessage ?: (refreshed as? RemoteDirectoryResult.Error)?.message
+                    _uiState.update {
+                        it.copy(
+                            isSyncingStudents = false,
+                            studentsSyncError = errMsg,
+                            toastMessage = importToast
+                        )
+                    }
+                }
+            }
+            return null
+        }
+
         _uiState.update { state ->
             state.copy(
                 students = mergedStudents,
@@ -1497,7 +2100,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        viewModelScope.launch {
+        pendingStudentPersistenceJob = viewModelScope.launch {
             authRepository.adminBulkImportStudents(
                 newStudents = newStudents,
                 fileName = preview.fileName,
@@ -1511,6 +2114,58 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         return null
+    }
+
+    /**
+     * Admin action to repair local student login records, push all student accounts
+     * to Supabase, and re-fetch authoritative profiles/classes from Supabase.
+     */
+    fun syncAllStudentsToSupabase() {
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) {
+            showToast("Akses ditolak: hanya Admin yang dapat menyinkronkan akun mahasiswa.", ToastType.ERROR)
+            return
+        }
+        val currentStudents = _uiState.value.students
+        if (_uiState.value.isSyncingStudents) return
+
+        val semesterKey = _uiState.value.settings.activeSemesterKey
+        _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
+        pendingStudentPersistenceJob = viewModelScope.launch {
+            if (currentStudents.isEmpty()) {
+                val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                applyRemoteDirectoryResult(refreshed, showToastOnComplete = true)
+                return@launch
+            }
+            val report = authRepository.syncStudentsToSupabase(currentStudents, semesterKey)
+            val toast = when {
+                report.usedEdgeFunction -> ToastMessage(
+                    "Sinkronisasi Supabase selesai: ${report.totalProcessed} akun mahasiswa siap login dari perangkat mana pun.",
+                    ToastType.SUCCESS
+                )
+                report.rateLimited -> ToastMessage(
+                    "Berhasil sinkron ${report.syncedToSupabaseCount + report.alreadyInSupabaseCount}/${report.totalProcessed} akun (${report.localRepairedCount} lokal diperbaiki). ${report.diagnosticMessage.orEmpty()}",
+                    ToastType.WARNING
+                )
+                report.emailConfirmationPending -> ToastMessage(
+                    "${report.syncedToSupabaseCount} akun dibuat di Supabase, tetapi 'Confirm email' masih aktif di Supabase Auth Settings. Matikan 'Confirm email' agar mahasiswa bisa langsung login.",
+                    ToastType.WARNING
+                )
+                report.syncedToSupabaseCount > 0 || report.alreadyInSupabaseCount > 0 -> ToastMessage(
+                    "Sinkron Supabase berhasil: ${report.syncedToSupabaseCount} baru, ${report.alreadyInSupabaseCount} sudah terdaftar (${report.localRepairedCount} lokal diperbaiki).",
+                    ToastType.SUCCESS
+                )
+                else -> ToastMessage(
+                    report.diagnosticMessage ?: "Akun lokal diperbaiki (${report.localRepairedCount}), namun sinkronisasi ke Supabase belum berhasil.",
+                    ToastType.WARNING
+                )
+            }
+            val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+            if (refreshed is RemoteDirectoryResult.Success) {
+                applyRemoteDirectoryResult(refreshed, overrideSuccessToast = toast)
+            } else {
+                _uiState.update { it.copy(isSyncingStudents = false, toastMessage = toast) }
+            }
+        }
     }
 
     /**
@@ -2499,7 +3154,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 state.copy(
                     studyPrograms = liveSnapshot.studyPrograms,
                     classes = liveSnapshot.classes,
-                    students = liveSnapshot.students,
+                    students = mergeRegisteredStudents(state.students, liveSnapshot.students),
                     attendanceRecords = liveSnapshot.attendanceRecords,
                     historicalAttendanceRecords = liveSnapshot.historicalAttendanceRecords,
                     assignments = liveSnapshot.assignments,

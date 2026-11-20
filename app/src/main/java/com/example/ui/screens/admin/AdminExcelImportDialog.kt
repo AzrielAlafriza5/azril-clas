@@ -1,5 +1,6 @@
 package com.example.ui.screens.admin
 
+import android.content.ActivityNotFoundException
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -38,6 +39,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -45,9 +47,11 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -59,6 +63,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import com.example.data.importer.ExcelStudentImportParser
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.example.ui.components.AzrilStatusBadge
 import com.example.ui.model.ExcelImportPreviewRow
 import com.example.ui.model.ExcelImportPreviewSummary
@@ -95,42 +107,108 @@ fun AdminExcelImportDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var previewSummary by remember { mutableStateOf<ExcelImportPreviewSummary?>(null) }
     var parseError by rememberSaveable { mutableStateOf<String?>(null) }
+    var isParsingFile by remember { mutableStateOf(false) }
+    var parsingFileName by remember { mutableStateOf<String?>(null) }
+    var activeParseJob by remember { mutableStateOf<Job?>(null) }
     var filterTab by rememberSaveable { mutableStateOf("ALL") }
     var selectedSheetFilter by rememberSaveable { mutableStateOf("ALL") }
     var importHistoricalAttendance by rememberSaveable { mutableStateOf(true) }
     var showConfirmDialog by rememberSaveable { mutableStateOf(false) }
 
+    DisposableEffect(Unit) {
+        onDispose {
+            activeParseJob?.cancel()
+        }
+    }
+
     val openXlsxLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
+        activeParseJob?.cancel()
         parseError = null
-        val displayName = runCatching {
-            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-                if (c.moveToFirst()) c.getString(0) else null
+        previewSummary = null
+        isParsingFile = true
+
+        activeParseJob = scope.launch {
+            try {
+                val (displayName, reportedSizeBytes) = withContext(Dispatchers.IO) {
+                    var name: String? = null
+                    var size: Long = -1L
+                    runCatching {
+                        context.contentResolver.query(
+                            uri,
+                            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                            null,
+                            null,
+                            null
+                        )?.use { c ->
+                            if (c.moveToFirst()) {
+                                val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                                if (nameIdx >= 0) name = c.getString(nameIdx)
+                                if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
+                            }
+                        }
+                    }
+                    (name ?: uri.lastPathSegment ?: "import_mahasiswa.xlsx") to size
+                }
+                parsingFileName = displayName
+
+                if (reportedSizeBytes > ExcelStudentImportParser.MAX_XLSX_FILE_BYTES) {
+                    val mb = (reportedSizeBytes / (1024L * 1024L)).coerceAtLeast(1L)
+                    parseError = "Ukuran file '$displayName' terlalu besar ($mb MB). Batas maksimal file Excel adalah 15 MB."
+                    isParsingFile = false
+                    return@launch
+                }
+
+                if (displayName.endsWith(".xls", ignoreCase = true) && !displayName.endsWith(".xlsx", ignoreCase = true)) {
+                    parseError = "File '$displayName' menggunakan format .xls lama. Simpan ulang sebagai Excel Workbook (.xlsx) lalu pilih kembali."
+                    isParsingFile = false
+                    return@launch
+                }
+
+                val parseResult = withContext(Dispatchers.IO) {
+                    ensureActive()
+                    val bytes = context.contentResolver.openInputStream(uri)?.use { stream ->
+                        readStreamBounded(stream, ExcelStudentImportParser.MAX_XLSX_FILE_BYTES)
+                    } ?: return@withContext Result.failure<ExcelImportPreviewSummary>(
+                        IllegalStateException("Gagal membuka file '$displayName'. Pastikan file masih tersedia di penyimpanan perangkat.")
+                    )
+                    if (bytes.isEmpty()) {
+                        return@withContext Result.failure<ExcelImportPreviewSummary>(
+                            IllegalArgumentException("File '$displayName' kosong.")
+                        )
+                    }
+                    ensureActive()
+                    viewModel.parseExcelStudentImport(displayName, bytes)
+                }
+
+                parseResult.onSuccess { summary ->
+                    previewSummary = summary
+                    filterTab = "ALL"
+                    selectedSheetFilter = "ALL"
+                    importHistoricalAttendance = summary.hasWeeklyAttendance
+                    parseError = null
+                }.onFailure { err ->
+                    previewSummary = null
+                    parseError = err.message ?: "File Excel (.xlsx) tidak dapat dibaca."
+                }
+            } catch (_: CancellationException) {
+                parseError = "Pembacaan file Excel dibatalkan."
+            } catch (_: SecurityException) {
+                parseError = "Izin akses ke file ditolak oleh sistem Android. Pilih ulang file Excel dari penyimpanan lokal."
+            } catch (_: OutOfMemoryError) {
+                parseError = "Memori perangkat tidak mencukupi untuk file ini. Hapus gambar/baris kosong di Excel atau bagi per kelas."
+            } catch (t: Throwable) {
+                parseError = t.message?.takeIf { it.isNotBlank() }
+                    ?: "Terjadi kesalahan saat membaca file Excel (.xlsx). Pastikan file valid dan tidak rusak."
+            } finally {
+                isParsingFile = false
             }
-        }.getOrNull() ?: uri.lastPathSegment ?: "import_mahasiswa.xlsx"
-
-        val bytes = runCatching {
-            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-        }.getOrNull()
-
-        if (bytes == null || bytes.isEmpty()) {
-            parseError = "Gagal membaca file '$displayName'. Pastikan file berformat Excel (.xlsx)."
-            return@rememberLauncherForActivityResult
-        }
-
-        val result = viewModel.parseExcelStudentImport(displayName, bytes)
-        result.onSuccess { summary ->
-            previewSummary = summary
-            filterTab = "ALL"
-            selectedSheetFilter = "ALL"
-            importHistoricalAttendance = summary.hasWeeklyAttendance
-        }.onFailure { err ->
-            previewSummary = null
-            parseError = err.message ?: "File Excel (.xlsx) tidak dapat dibaca."
         }
     }
 
@@ -138,21 +216,29 @@ fun AdminExcelImportDialog(
         contract = ActivityResultContracts.CreateDocument("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
-        runCatching {
-            val templateBytes = ExcelStudentImportParser.buildBlankTemplateXlsx()
-            context.contentResolver.openOutputStream(uri)?.use { out ->
-                out.write(templateBytes)
-                out.flush()
+        scope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                runCatching {
+                    val templateBytes = ExcelStudentImportParser.buildBlankTemplateXlsx()
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(templateBytes)
+                        out.flush()
+                    } ?: error("Gagal membuka lokasi penyimpanan.")
+                }
             }
-        }.onSuccess {
-            viewModel.showToast("Template Excel (.xlsx) berhasil disimpan (sheet PJKR-3B, FARMASI-3, HES-3B).", ToastType.SUCCESS)
-        }.onFailure {
-            viewModel.showToast("Gagal menyimpan template Excel.", ToastType.ERROR)
+            saved.onSuccess {
+                viewModel.showToast("Template Excel (.xlsx) berhasil disimpan (sheet PJKR-3B, FARMASI-3, HES-3B).", ToastType.SUCCESS)
+            }.onFailure {
+                viewModel.showToast("Gagal menyimpan template Excel: ${it.message ?: "kesalahan penyimpanan"}.", ToastType.ERROR)
+            }
         }
     }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            activeParseJob?.cancel()
+            onDismiss()
+        },
         properties = DialogProperties(usePlatformDefaultWidth = false),
         modifier = Modifier
             .fillMaxWidth(0.95f)
@@ -195,21 +281,33 @@ fun AdminExcelImportDialog(
                 ) {
                     Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text(
-                            text = "Pilih file Excel (.xlsx) dengan sheet kelas (contoh: PJKR-3B, FARMASI-3, HES-3B). Sistem membaca warna sel langsung: Blok Hitam dilewati total, Warna Merah masuk kategori AFK, warna lain diproses normal.",
+                            text = "Pilih file Excel (.xlsx, maks. 15 MB) dengan sheet kelas (contoh: PJKR-3B, FARMASI-3, HES-3B). Sistem membaca warna sel langsung: Blok Hitam dilewati total, Warna Merah masuk kategori AFK, warna lain diproses normal.",
                             style = MaterialTheme.typography.bodySmall,
                             color = InkMuted
                         )
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(
                                 onClick = {
-                                    openXlsxLauncher.launch(
-                                        arrayOf(
-                                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                            "application/vnd.ms-excel",
-                                            "*/*"
+                                    parseError = null
+                                    try {
+                                        openXlsxLauncher.launch(
+                                            arrayOf(
+                                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                "application/octet-stream",
+                                                "*/*"
+                                            )
                                         )
-                                    )
+                                    } catch (_: ActivityNotFoundException) {
+                                        try {
+                                            openXlsxLauncher.launch(arrayOf("*/*"))
+                                        } catch (_: Throwable) {
+                                            parseError = "Tidak ditemukan aplikasi pemilih file (File Manager) di perangkat Android ini."
+                                        }
+                                    } catch (t: Throwable) {
+                                        parseError = "Gagal membuka pemilih file: ${t.message ?: "kesalahan sistem"}."
+                                    }
                                 },
+                                enabled = !isParsingFile,
                                 shape = RoundedCornerShape(999.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
                                 modifier = Modifier.testTag("pick_excel_file_button")
@@ -219,7 +317,14 @@ fun AdminExcelImportDialog(
                                 Text(if (previewSummary == null) "Pilih File Excel (.xlsx)" else "Ganti File Excel")
                             }
                             OutlinedButton(
-                                onClick = { saveTemplateLauncher.launch("Template_Absensi_AzrilClas.xlsx") },
+                                onClick = {
+                                    try {
+                                        saveTemplateLauncher.launch("Template_Absensi_AzrilClas.xlsx")
+                                    } catch (_: Throwable) {
+                                        parseError = "Gagal membuka dialog penyimpanan template di perangkat ini."
+                                    }
+                                },
+                                enabled = !isParsingFile,
                                 shape = RoundedCornerShape(999.dp),
                                 modifier = Modifier.testTag("download_excel_template_button")
                             ) {
@@ -231,12 +336,54 @@ fun AdminExcelImportDialog(
                     }
                 }
 
+                if (isParsingFile) {
+                    Surface(
+                        color = LightGreenSecondary.copy(alpha = 0.45f),
+                        shape = RoundedCornerShape(16.dp),
+                        border = BorderStroke(1.dp, BorderMint),
+                        modifier = Modifier.fillMaxWidth().testTag("excel_parsing_loading_card")
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Membaca file ${parsingFileName ?: "Excel"}...",
+                                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = InkText
+                                )
+                                TextButton(
+                                    onClick = { activeParseJob?.cancel() },
+                                    modifier = Modifier.testTag("cancel_excel_parse_button")
+                                ) {
+                                    Text("Batalkan", color = Rose700, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                            LinearProgressIndicator(
+                                modifier = Modifier.fillMaxWidth(),
+                                color = DarkCardBg,
+                                trackColor = PureWhite
+                            )
+                            Text(
+                                text = "Memproses sheet, warna sel, dan validasi NIM di latar belakang tanpa membekukan aplikasi.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = InkMuted
+                            )
+                        }
+                    }
+                }
+
                 parseError?.let { err ->
                     Surface(
                         color = Rose50,
                         shape = RoundedCornerShape(14.dp),
                         border = BorderStroke(1.dp, Rose600.copy(alpha = 0.3f)),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().testTag("excel_parse_error_banner")
                     ) {
                         Row(modifier = Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = Rose700, modifier = Modifier.size(18.dp))
@@ -455,7 +602,7 @@ fun AdminExcelImportDialog(
             val summary = previewSummary
             Button(
                 onClick = { showConfirmDialog = true },
-                enabled = summary != null && summary.totalImportableCount > 0,
+                enabled = !isParsingFile && summary != null && summary.totalImportableCount > 0,
                 shape = RoundedCornerShape(999.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = LimePrimary, contentColor = InkText),
                 modifier = Modifier.testTag("confirm_excel_import_button")
@@ -467,7 +614,10 @@ fun AdminExcelImportDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Tutup") }
+            TextButton(onClick = {
+                activeParseJob?.cancel()
+                onDismiss()
+            }) { Text("Tutup") }
         }
     )
 
@@ -599,6 +749,24 @@ private fun PreviewStudentRowCard(row: ExcelImportPreviewRow) {
             }
         }
     }
+}
+
+private fun readStreamBounded(input: InputStream, maxBytes: Long): ByteArray {
+    val out = ByteArrayOutputStream()
+    val buffer = ByteArray(16 * 1024)
+    var totalRead = 0L
+    while (true) {
+        val read = input.read(buffer)
+        if (read <= 0) break
+        totalRead += read
+        if (totalRead > maxBytes) {
+            throw IllegalArgumentException(
+                "Ukuran file melebihi batas maksimal 15 MB. Perkecil ukuran file Excel lalu coba lagi."
+            )
+        }
+        out.write(buffer, 0, read)
+    }
+    return out.toByteArray()
 }
 
 private data class Quintuple<A, B, C, D, E>(val first: A, val second: B, val third: C, val fourth: D, val fifth: E)

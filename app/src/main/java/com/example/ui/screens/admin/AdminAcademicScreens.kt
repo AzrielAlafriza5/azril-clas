@@ -23,17 +23,20 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Class
+import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.LockReset
 import androidx.compose.material.icons.rounded.PendingActions
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.School
 import androidx.compose.material.icons.rounded.TableChart
 import androidx.compose.material.icons.rounded.UploadFile
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -42,6 +45,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -701,8 +705,33 @@ fun AdminStudentsScreen(
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Ekspor")
                     }
+                    if (uiState.isSupabaseConfigured) {
+                        OutlinedButton(
+                            onClick = { viewModel.refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true) },
+                            enabled = !uiState.isSyncingStudents,
+                            shape = RoundedCornerShape(999.dp),
+                            modifier = Modifier.testTag("refresh_students_supabase_button")
+                        ) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(if (uiState.isSyncingStudents) "Memuat..." else "Muat Ulang")
+                        }
+                        if (uiState.students.isNotEmpty()) {
+                            OutlinedButton(
+                                onClick = { viewModel.syncAllStudentsToSupabase() },
+                                enabled = !uiState.isSyncingStudents,
+                                shape = RoundedCornerShape(999.dp),
+                                modifier = Modifier.testTag("sync_students_supabase_button")
+                            ) {
+                                Icon(Icons.Rounded.CloudSync, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(if (uiState.isSyncingStudents) "Menyinkronkan..." else "Sinkron Supabase")
+                            }
+                        }
+                    }
                     Button(
                         onClick = { showAddDialog = true },
+                        enabled = !uiState.isSyncingStudents,
                         shape = RoundedCornerShape(999.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
                         modifier = Modifier.testTag("add_student_button")
@@ -714,6 +743,49 @@ fun AdminStudentsScreen(
                 }
             }
         )
+
+        if (uiState.isSyncingStudents) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth().testTag("students_sync_progress"),
+                color = LimePrimary,
+                trackColor = LightGreenSecondary
+            )
+        }
+
+        if (uiState.isSupabaseConfigured && !uiState.studentsSyncError.isNullOrBlank()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().testTag("students_sync_error_banner"),
+                shape = RoundedCornerShape(20.dp),
+                color = Rose50,
+                border = BorderStroke(1.dp, Rose600.copy(alpha = 0.35f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(Icons.Rounded.Warning, contentDescription = "Kendala sinkronisasi Supabase", tint = Rose700)
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = "Sinkronisasi Database Supabase",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            color = Rose700
+                        )
+                        Text(
+                            text = uiState.studentsSyncError,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Rose700
+                        )
+                    }
+                    TextButton(
+                        onClick = { viewModel.refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true) },
+                        enabled = !uiState.isSyncingStudents
+                    ) {
+                        Text("Coba Lagi", color = Rose700, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
 
         // 6 Required Statistics Cards
         val statCards = listOf(

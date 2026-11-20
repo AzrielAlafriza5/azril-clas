@@ -113,6 +113,245 @@ Deno.serve(async (req) => {
       });
     }
 
+    if (action === "create_student") {
+      const cleanNim = String(body.nim ?? "").replace(/[\s\u00A0\u200B-\u200D\uFEFF]+/g, "").trim();
+      const cleanName = String(body.fullName ?? "").trim();
+      const cleanEmail = String(body.email ?? "").trim().toLowerCase() || `${cleanNim.toLowerCase()}@mahasiswa.azrilclas.ac.id`;
+      const initialPassword = String(body.password ?? cleanNim).trim();
+      const prodiCode = String(body.studyProgramCode ?? "HES").trim().toUpperCase();
+      const classIdInput = body.classId ? String(body.classId).trim() : null;
+      const classNameInput = body.className ? String(body.className).trim() : null;
+      const semester = Number(body.semester ?? 1) || 1;
+      const cohortYear = Number(body.cohortYear ?? 2026) || 2026;
+      const accountStatus = String(body.accountStatus ?? "active").trim().toLowerCase();
+      const badgeStatus = String(body.badgeStatus ?? "neutral").trim().toLowerCase();
+      const mustChangePassword = body.mustChangePassword === true || initialPassword.toLowerCase() === cleanNim.toLowerCase();
+
+      if (cleanName.length < 3 || cleanNim.length < 5 || initialPassword.length < 6) {
+        return new Response(
+          JSON.stringify({ error: "Nama (min 3), NIM (min 5), dan password (min 6) wajib valid." }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const { data: dupNim } = await adminClient
+        .from("profiles")
+        .select("id")
+        .ilike("nim", cleanNim)
+        .maybeSingle();
+      if (dupNim) {
+        return new Response(
+          JSON.stringify({ error: `NIM '${cleanNim}' sudah terdaftar di database.` }),
+          { status: 409, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const { data: prodiRow } = await adminClient
+        .from("study_programs")
+        .select("id, code")
+        .ilike("code", prodiCode)
+        .maybeSingle();
+      if (!prodiRow?.id) {
+        return new Response(
+          JSON.stringify({ error: `Program studi '${prodiCode}' tidak ditemukan.` }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      let resolvedClassId = classIdInput;
+      if (resolvedClassId && classNameInput) {
+        await adminClient.from("classes").upsert(
+          {
+            id: resolvedClassId,
+            name: classNameInput,
+            study_program_id: prodiRow.id,
+            study_program_code: prodiRow.code,
+            semester,
+            academic_year: "2026/2027",
+            cohort_year: cohortYear,
+            is_active: true,
+          },
+          { onConflict: "id" }
+        );
+      }
+
+      const internalEmail = internalAuthEmailForNim(cleanNim);
+      const { data: createdAuth, error: createErr } = await adminClient.auth.admin.createUser({
+        email: internalEmail,
+        password: initialPassword,
+        email_confirm: true,
+        user_metadata: {
+          full_name: cleanName,
+          nim: cleanNim,
+          username: cleanNim,
+          academic_email: cleanEmail,
+          study_program_code: prodiRow.code,
+          study_program_id: prodiRow.id,
+          class_id: resolvedClassId,
+          class_name: classNameInput ?? "",
+          semester,
+          cohort_year: cohortYear,
+          student_badge_status: badgeStatus,
+          must_change_password: mustChangePassword,
+          role: "student",
+        },
+      });
+      if (createErr || !createdAuth?.user) {
+        return new Response(
+          JSON.stringify({ error: createErr?.message ?? "Gagal membuat akun auth mahasiswa." }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const newUserId = createdAuth.user.id;
+      const { data: savedProfile, error: profErr } = await adminClient
+        .from("profiles")
+        .upsert(
+          {
+            id: newUserId,
+            full_name: cleanName,
+            nim: cleanNim,
+            username: cleanNim,
+            email: cleanEmail,
+            internal_auth_email: internalEmail,
+            study_program_id: prodiRow.id,
+            class_id: resolvedClassId,
+            semester,
+            cohort_year: cohortYear,
+            role: "student",
+            account_status: accountStatus,
+            student_badge_status: badgeStatus,
+            must_change_password: mustChangePassword,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "id" }
+        )
+        .select("*")
+        .single();
+
+      if (profErr) {
+        await adminClient.auth.admin.deleteUser(newUserId);
+        return new Response(
+          JSON.stringify({ error: profErr.message }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      return new Response(JSON.stringify({ ok: true, id: newUserId, student: savedProfile }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "update_student") {
+      const studentId = String(body.studentId ?? "").trim();
+      const cleanNim = String(body.nim ?? "").replace(/[\s\u00A0\u200B-\u200D\uFEFF]+/g, "").trim();
+      const cleanName = String(body.fullName ?? "").trim();
+      const cleanEmail = String(body.email ?? "").trim().toLowerCase();
+      const prodiCode = String(body.studyProgramCode ?? "").trim().toUpperCase();
+      const classId = body.classId ? String(body.classId).trim() : null;
+      const semester = Number(body.semester ?? 1) || 1;
+      const cohortYear = Number(body.cohortYear ?? 2026) || 2026;
+      const accountStatus = String(body.accountStatus ?? "active").trim().toLowerCase();
+      const badgeStatus = String(body.badgeStatus ?? "neutral").trim().toLowerCase();
+
+      if (!studentId || cleanName.length < 3 || cleanNim.length < 5) {
+        return new Response(
+          JSON.stringify({ error: "Data pembaruan mahasiswa tidak lengkap." }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const { data: conflict } = await adminClient
+        .from("profiles")
+        .select("id")
+        .ilike("nim", cleanNim)
+        .neq("id", studentId)
+        .maybeSingle();
+      if (conflict) {
+        return new Response(
+          JSON.stringify({ error: `NIM '${cleanNim}' sudah digunakan mahasiswa lain.` }),
+          { status: 409, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      let prodiId = body.studyProgramId ? String(body.studyProgramId).trim() : null;
+      if (prodiCode) {
+        const { data: prodiRow } = await adminClient
+          .from("study_programs")
+          .select("id")
+          .ilike("code", prodiCode)
+          .maybeSingle();
+        if (prodiRow?.id) prodiId = prodiRow.id;
+      }
+
+      const newInternalEmail = internalAuthEmailForNim(cleanNim);
+      await adminClient.auth.admin.updateUserById(studentId, {
+        email: newInternalEmail,
+        email_confirm: true,
+        user_metadata: { full_name: cleanName, nim: cleanNim, username: cleanNim },
+      });
+
+      const { data: updatedProfile, error: updateErr } = await adminClient
+        .from("profiles")
+        .update({
+          full_name: cleanName,
+          nim: cleanNim,
+          username: cleanNim,
+          email: cleanEmail,
+          internal_auth_email: newInternalEmail,
+          study_program_id: prodiId,
+          class_id: classId,
+          semester,
+          cohort_year: cohortYear,
+          account_status: accountStatus,
+          student_badge_status: badgeStatus,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", studentId)
+        .select("*")
+        .single();
+
+      if (updateErr) {
+        return new Response(
+          JSON.stringify({ error: updateErr.message }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      await adminClient
+        .from("historical_attendance_records")
+        .update({ student_nim: cleanNim, student_name: cleanName })
+        .eq("student_id", studentId);
+
+      return new Response(JSON.stringify({ ok: true, student: updatedProfile }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "delete_student") {
+      const studentId = String(body.studentId ?? "").trim();
+      if (!studentId) {
+        return new Response(
+          JSON.stringify({ error: "ID mahasiswa wajib diisi." }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      const { error: delAuthErr } = await adminClient.auth.admin.deleteUser(studentId);
+      const { error: delProfErr } = await adminClient.from("profiles").delete().eq("id", studentId);
+      if (delAuthErr && delProfErr) {
+        return new Response(
+          JSON.stringify({ error: delProfErr.message || delAuthErr.message }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      return new Response(JSON.stringify({ ok: true, deletedId: studentId }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     if (action === "update_nim") {
       const studentId = String(body.studentId ?? "").trim();
       const newNim = String(body.newNim ?? "").trim();

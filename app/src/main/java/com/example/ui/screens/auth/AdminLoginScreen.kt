@@ -96,7 +96,7 @@ fun AdminLoginScreen(
     var username by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
     var passwordVisible by rememberSaveable { mutableStateOf(false) }
-    var rememberSession by rememberSaveable { mutableStateOf(false) }
+    var rememberSession by rememberSaveable { mutableStateOf(true) }
     var usernameError by rememberSaveable { mutableStateOf<String?>(null) }
     var passwordError by rememberSaveable { mutableStateOf<String?>(null) }
 
@@ -382,13 +382,13 @@ private fun AdminLoginCard(
             OutlinedTextField(
                 value = username,
                 onValueChange = onUsernameChange,
-                label = { Text("Username Administrator") },
-                placeholder = { Text("Masukkan username admin") },
+                label = { Text("Username atau Email Admin") },
+                placeholder = { Text("Contoh: Azril12v atau email Admin Supabase") },
                 leadingIcon = { Icon(Icons.Rounded.Person, contentDescription = null, tint = InkMuted) },
                 isError = usernameError != null,
                 supportingText = usernameError?.let { err -> { Text(err) } },
                 singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
                 shape = RoundedCornerShape(16.dp),
                 colors = fieldColors,
                 modifier = Modifier.fillMaxWidth().testTag("admin_login_username_input")

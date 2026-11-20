@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.BuildConfig
+import com.example.data.network.SupabaseNetworkClient
 import com.example.ui.model.AcademicClass
 import com.example.ui.model.AccountStatus
 import com.example.ui.model.Assignment
@@ -93,14 +94,16 @@ object OfficialStudyPrograms {
 object PasswordHasher {
     private const val ALGORITHM = "PBKDF2WithHmacSHA256"
     private const val ITERATIONS = 65_536
+    const val BULK_STUDENT_ITERATIONS = 10_000
     private const val KEY_LENGTH_BITS = 256
 
-    fun hashPassword(password: String): String {
+    fun hashPassword(password: String, iterations: Int = ITERATIONS): String {
+        val safeIterations = iterations.coerceAtLeast(1_000)
         val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
-        val derived = derive(password, salt)
+        val derived = derive(password, salt, safeIterations)
         val saltB64 = encodeBase64(salt)
         val hashB64 = encodeBase64(derived)
-        return "pbkdf2_sha256$$ITERATIONS$$saltB64$$hashB64"
+        return "pbkdf2_sha256$$safeIterations$$saltB64$$hashB64"
     }
 
     fun verifyPassword(password: String, encoded: String): Boolean {
@@ -115,8 +118,8 @@ object PasswordHasher {
         return MessageDigest.isEqual(expectedHash, actualHash)
     }
 
-    private fun derive(password: String, salt: ByteArray): ByteArray {
-        val spec = PBEKeySpec(password.toCharArray(), salt, ITERATIONS, KEY_LENGTH_BITS)
+    private fun derive(password: String, salt: ByteArray, iterations: Int): ByteArray {
+        val spec = PBEKeySpec(password.toCharArray(), salt, iterations, KEY_LENGTH_BITS)
         val encoded = SecretKeyFactory.getInstance(ALGORITHM).generateSecret(spec).encoded
         spec.clearPassword()
         return encoded
@@ -202,6 +205,17 @@ data class RestoredSession(
     val sessionExpiresAt: Long? = null
 )
 
+data class SupabaseStudentSyncReport(
+    val totalProcessed: Int = 0,
+    val localRepairedCount: Int = 0,
+    val syncedToSupabaseCount: Int = 0,
+    val alreadyInSupabaseCount: Int = 0,
+    val usedEdgeFunction: Boolean = false,
+    val rateLimited: Boolean = false,
+    val emailConfirmationPending: Boolean = false,
+    val diagnosticMessage: String? = null
+)
+
 data class StoredAccountRecord(
     val id: String,
     val fullName: String,
@@ -259,14 +273,25 @@ data class StoredAccountRecord(
 
 class AzrilAuthRepository(
     private val store: AuthKeyValueStore,
-    private val supabaseUrl: String = BuildConfig.SUPABASE_URL,
+    supabaseUrl: String = BuildConfig.SUPABASE_URL,
     private val supabaseAnonKey: String = BuildConfig.SUPABASE_ANON_KEY,
-    private val httpClient: OkHttpClient = OkHttpClient()
+    private val httpClient: OkHttpClient = SupabaseNetworkClient.defaultHttpClient
 ) {
+    private val supabaseUrl: String = SupabaseNetworkClient.normalizeBaseUrl(supabaseUrl)
     private val accountsMutex = Mutex()
+    @Volatile
+    private var activeAccessToken: String? = null
+    @Volatile
+    private var activeRefreshToken: String? = null
+    private val studentCrudService = SupabaseStudentCrudService(
+        supabaseUrl = this.supabaseUrl,
+        supabaseAnonKey = this.supabaseAnonKey,
+        httpClient = this.httpClient
+    )
 
     companion object {
         private const val KEY_SESSION_TOKEN = "session_token"
+        private const val KEY_SESSION_REFRESH_TOKEN = "session_refresh_token"
         private const val KEY_SESSION_USER_ID = "session_user_id"
         private const val KEY_SESSION_ROLE = "session_role"
         private const val KEY_SESSION_PROFILE_JSON = "session_profile_json"
@@ -305,17 +330,166 @@ class AzrilAuthRepository(
         }
     }
 
-    fun isSupabaseConfigured(): Boolean {
-        val cleanUrl = supabaseUrl.trim()
-        val cleanKey = supabaseAnonKey.trim()
-        return cleanUrl.startsWith("https://") &&
-            !cleanUrl.contains("YOUR_PROJECT_REF") &&
-            cleanKey.length > 20 &&
-            !cleanKey.contains("YOUR_SUPABASE_ANON_KEY")
-    }
+    fun isSupabaseConfigured(): Boolean =
+        SupabaseNetworkClient.isConfigured(supabaseUrl, supabaseAnonKey)
 
     private fun isLocalSessionToken(token: String?): Boolean =
         token.isNullOrBlank() || token.startsWith("azr_sess_") || token.startsWith("azr_admin_sess_")
+
+    suspend fun getActiveSupabaseJwt(): String? {
+        val inMemory = activeAccessToken
+        if (!isLocalSessionToken(inMemory)) return inMemory
+        val persisted = store.getString(KEY_SESSION_TOKEN)
+        if (!isLocalSessionToken(persisted)) {
+            activeAccessToken = persisted
+            return persisted
+        }
+        return null
+    }
+
+    private suspend fun getActiveRefreshToken(): String? {
+        val inMemory = activeRefreshToken
+        if (!inMemory.isNullOrBlank()) return inMemory
+        val persisted = store.getString(KEY_SESSION_REFRESH_TOKEN)
+        if (!persisted.isNullOrBlank()) {
+            activeRefreshToken = persisted
+            return persisted
+        }
+        return null
+    }
+
+    /**
+     * Exchanges the stored Supabase `refresh_token` for a fresh short-lived JWT access token
+     * so Admin and Student sessions remain connected to Supabase Auth across 1-hour expiry windows
+     * and Android app restarts.
+     */
+    suspend fun refreshSupabaseAccessTokenIfNeeded(
+        nowMillis: Long = System.currentTimeMillis()
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isSupabaseConfigured()) return@withContext null
+        val refreshToken = getActiveRefreshToken() ?: return@withContext null
+        runCatching {
+            val base = supabaseUrl.trimEnd('/')
+            val payload = JSONObject().apply { put("refresh_token", refreshToken) }
+            val req = Request.Builder()
+                .url("$base/auth/v1/token?grant_type=refresh_token")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Content-Type", "application/json")
+                .build()
+
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                val body = resp.body?.string().orEmpty()
+                val json = JSONObject(body)
+                val newAccess = json.optString("access_token")
+                if (newAccess.isBlank()) return@use null
+                val newRefresh = json.optString("refresh_token").ifBlank { refreshToken }
+                val storedRole = store.getString(KEY_SESSION_ROLE)
+                val maxDuration = if (storedRole.equals(UserRole.ADMIN.name, ignoreCase = true)) {
+                    ADMIN_SESSION_DURATION_MS
+                } else {
+                    REMEMBER_SESSION_DURATION_MS
+                }
+                val newExpiresAt = nowMillis + maxDuration
+                activeAccessToken = newAccess
+                activeRefreshToken = newRefresh
+                if (store.getBoolean(KEY_REMEMBER_ME, true)) {
+                    store.putString(KEY_SESSION_TOKEN, newAccess)
+                    store.putString(KEY_SESSION_REFRESH_TOKEN, newRefresh)
+                    store.putLong(KEY_SESSION_EXPIRES_AT, newExpiresAt)
+                }
+                newAccess
+            }
+        }.getOrNull()
+    }
+
+    suspend fun hasLiveSupabaseSession(): Boolean =
+        isSupabaseConfigured() && getActiveSupabaseJwt() != null
+
+    /**
+     * Fetches the authoritative study programs, classes, and student list directly from Supabase
+     * (`study_programs`, `classes`, `profiles?role=eq.student`) and updates the local cache
+     * so all Admin devices see identical database state.
+     * Automatically refreshes an expired Supabase JWT once via `refresh_token` if available.
+     */
+    suspend fun fetchStudentsAndClassesFromSupabase(): RemoteDirectoryResult = withContext(Dispatchers.IO) {
+        if (!isSupabaseConfigured()) {
+            return@withContext RemoteDirectoryResult.Error("Konfigurasi Supabase belum aktif.")
+        }
+        var jwt = getActiveSupabaseJwt().orEmpty()
+        var result = studentCrudService.fetchDirectory(jwt)
+        if (result is RemoteDirectoryResult.Error && result.isUnauthorized) {
+            val refreshed = refreshSupabaseAccessTokenIfNeeded()
+            if (!refreshed.isNullOrBlank() && refreshed != jwt) {
+                jwt = refreshed
+                result = studentCrudService.fetchDirectory(jwt)
+            }
+        }
+        when (result) {
+            is RemoteDirectoryResult.Success -> {
+                // Synchronize local account cache with authoritative Supabase student rows
+                // while preserving any locally hashed credentials for offline fallback if present.
+                accountsMutex.withLock {
+                    val existing = loadLocalAccounts()
+                    val existingAdmins = existing.filter { it.role == UserRole.ADMIN }
+                    val existingById = existing.associateBy { it.id }
+                    val existingByNim = existing.associateBy { it.nim.trim().lowercase(Locale.US) }
+                    val now = nowIso()
+                    val refreshedStudents = result.directory.students.map { stu ->
+                        val prev = existingById[stu.id] ?: existingByNim[stu.nim.trim().lowercase(Locale.US)]
+                        StoredAccountRecord(
+                            id = stu.id,
+                            fullName = stu.fullName,
+                            nim = stu.nim,
+                            email = stu.email,
+                            username = stu.nim,
+                            studyProgramId = stu.studyProgramId,
+                            studyProgramCode = stu.studyProgramName,
+                            classId = stu.classId,
+                            className = stu.className,
+                            semester = stu.semester,
+                            cohortYear = stu.cohortYear,
+                            accountStatus = stu.status,
+                            badgeStatus = stu.badgeStatus,
+                            mustChangePassword = stu.mustChangePassword,
+                            role = UserRole.STUDENT,
+                            passwordHash = prev?.passwordHash
+                                ?: PasswordHasher.hashPassword(stu.nim, PasswordHasher.BULK_STUDENT_ITERATIONS),
+                            createdAt = prev?.createdAt ?: now
+                        )
+                    }
+                    saveLocalAccounts(refreshedStudents + existingAdmins)
+                }
+                if (result.directory.classes.isNotEmpty()) {
+                    saveClasses(result.directory.classes)
+                }
+                result
+            }
+            is RemoteDirectoryResult.Error -> result
+        }
+    }
+
+    suspend fun adminSaveClassToSupabase(
+        academicClass: AcademicClass,
+        studyProgramCode: String
+    ): String? = withContext(Dispatchers.IO) {
+        if (!isSupabaseConfigured()) return@withContext null
+        val jwt = getActiveSupabaseJwt().orEmpty()
+        when (val res = studentCrudService.upsertClass(jwt, academicClass, studyProgramCode)) {
+            is RemoteDeleteResult.Error -> res.message
+            RemoteDeleteResult.Success -> null
+        }
+    }
+
+    suspend fun adminDeleteClassFromSupabase(classId: String): String? = withContext(Dispatchers.IO) {
+        if (!isSupabaseConfigured()) return@withContext null
+        val jwt = getActiveSupabaseJwt().orEmpty()
+        when (val res = studentCrudService.deleteClass(jwt, classId)) {
+            is RemoteDeleteResult.Error -> res.message
+            RemoteDeleteResult.Success -> null
+        }
+    }
 
     private fun nowIso(): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(Date())
@@ -332,16 +506,34 @@ class AzrilAuthRepository(
 
     private suspend fun clearStoredSessionKeys() {
         store.putString(KEY_SESSION_TOKEN, null)
+        store.putString(KEY_SESSION_REFRESH_TOKEN, null)
         store.putString(KEY_SESSION_USER_ID, null)
         store.putString(KEY_SESSION_ROLE, null)
         store.putString(KEY_SESSION_PROFILE_JSON, null)
         store.putLong(KEY_SESSION_EXPIRES_AT, 0L)
     }
 
+    private suspend fun verifyAdminJwtOrFallbackProfile(
+        jwt: String,
+        userId: String,
+        fallbackEmail: String
+    ): Boolean {
+        val rpcResult = verifyAdminSessionWithSupabaseDetailed(jwt)
+        if (rpcResult == true) return true
+        if (rpcResult == null) {
+            // `verify_admin_session` RPC is not deployed (HTTP 404); verify directly via profiles.role
+            val base = supabaseUrl.trimEnd('/')
+            val profile = fetchSupabaseProfile(base, jwt, userId, fallbackEmail)
+            return profile?.role == UserRole.ADMIN && profile.status == AccountStatus.ACTIVE
+        }
+        return false
+    }
+
     suspend fun restoreSession(nowMillis: Long = System.currentTimeMillis()): RestoredSession = withContext(Dispatchers.IO) {
         val rememberMe = store.getBoolean(KEY_REMEMBER_ME, true)
         val rememberedIdentifier = store.getString(KEY_REMEMBERED_IDENTIFIER).orEmpty()
         val token = store.getString(KEY_SESSION_TOKEN)
+        val savedRefreshToken = store.getString(KEY_SESSION_REFRESH_TOKEN)
         val storedRole = store.getString(KEY_SESSION_ROLE)
         val expiresAt = store.getLong(KEY_SESSION_EXPIRES_AT, 0L)
         val accounts = accountsMutex.withLock { loadLocalAccounts() }
@@ -357,8 +549,11 @@ class AzrilAuthRepository(
         var sessionExpired = false
         var activeExpiresAt: Long? = null
         val restoredProfile = if (rememberMe && !token.isNullOrBlank()) {
-            if (expiresAt <= 0L || nowMillis >= expiresAt) {
+            val isWindowExpired = expiresAt <= 0L || nowMillis >= expiresAt
+            if (isWindowExpired) {
                 sessionExpired = true
+                activeAccessToken = null
+                activeRefreshToken = null
                 clearStoredSessionKeys()
                 null
             } else {
@@ -369,20 +564,44 @@ class AzrilAuthRepository(
 
                 if (candidate == null || roleMismatch || candidate.status == AccountStatus.INACTIVE) {
                     sessionExpired = true
+                    activeAccessToken = null
+                    activeRefreshToken = null
                     clearStoredSessionKeys()
                     null
-                } else if (candidate.role == UserRole.ADMIN && isSupabaseConfigured() && !token.startsWith("azr_admin_sess_")) {
-                    // Re-verify Admin JWT & role with Supabase backend on session restore
-                    val verified = verifyAdminSessionWithSupabase(token)
-                    if (verified) {
-                        activeExpiresAt = expiresAt
+                } else if (candidate.role == UserRole.ADMIN && isSupabaseConfigured() && !isLocalSessionToken(token)) {
+                    // Re-verify Admin JWT & role with Supabase backend on session restore.
+                    // Supports both `verify_admin_session` RPC AND fallback profile role check (when RPC is 404),
+                    // plus automatic refresh via `refresh_token` if the 1-hour access token expired.
+                    activeRefreshToken = savedRefreshToken
+                    var verifiedToken: String? = if (
+                        verifyAdminJwtOrFallbackProfile(token, candidate.id, candidate.email)
+                    ) {
+                        token
+                    } else {
+                        null
+                    }
+                    if (verifiedToken == null && !savedRefreshToken.isNullOrBlank()) {
+                        val refreshed = refreshSupabaseAccessTokenIfNeeded(nowMillis)
+                        if (!refreshed.isNullOrBlank() &&
+                            verifyAdminJwtOrFallbackProfile(refreshed, candidate.id, candidate.email)
+                        ) {
+                            verifiedToken = refreshed
+                        }
+                    }
+                    if (verifiedToken != null) {
+                        activeAccessToken = verifiedToken
+                        activeExpiresAt = store.getLong(KEY_SESSION_EXPIRES_AT, expiresAt).takeIf { it > 0L } ?: expiresAt
                         candidate
                     } else {
                         sessionExpired = true
+                        activeAccessToken = null
+                        activeRefreshToken = null
                         clearStoredSessionKeys()
                         null
                     }
                 } else {
+                    activeAccessToken = token
+                    activeRefreshToken = savedRefreshToken
                     activeExpiresAt = expiresAt
                     candidate
                 }
@@ -391,6 +610,8 @@ class AzrilAuthRepository(
             if (!token.isNullOrBlank() && expiresAt > 0L && nowMillis >= expiresAt) {
                 sessionExpired = true
             }
+            activeAccessToken = null
+            activeRefreshToken = null
             clearStoredSessionKeys()
             null
         }
@@ -431,10 +652,11 @@ class AzrilAuthRepository(
         accountStatus: AccountStatus,
         badgeStatus: StudentBadgeStatus,
         initialPassword: String,
-        mustChangePassword: Boolean = initialPassword.trim().equals(nim.trim(), ignoreCase = true)
+        mustChangePassword: Boolean = initialPassword.trim().equals(nim.trim(), ignoreCase = true),
+        targetClass: AcademicClass? = null
     ): AuthResult = withContext(Dispatchers.IO) {
         val cleanName = fullName.trim()
-        val cleanNim = nim.trim()
+        val cleanNim = SupabaseStudentCrudService.sanitizeNim(nim)
         val cleanEmail = email.trim().lowercase(Locale.US)
 
         if (cleanName.length < 3) return@withContext AuthResult.Failure("Nama lengkap minimal 3 karakter.")
@@ -443,35 +665,75 @@ class AzrilAuthRepository(
         if (!cleanEmail.contains("@") || !cleanEmail.contains(".")) return@withContext AuthResult.Failure("Format email akademik tidak valid.")
         if (initialPassword.length < 6) return@withContext AuthResult.Failure("Password awal mahasiswa minimal 6 karakter.")
 
+        var canonicalStudent = StudentRecord(
+            id = studentId,
+            fullName = cleanName,
+            nim = cleanNim,
+            email = cleanEmail,
+            studyProgramId = studyProgramId,
+            studyProgramName = studyProgramCode,
+            classId = classId,
+            className = className,
+            semester = semester,
+            cohortYear = cohortYear,
+            status = accountStatus,
+            badgeStatus = badgeStatus,
+            mustChangePassword = mustChangePassword
+        )
+
+        // When Supabase is configured, ALWAYS execute authoritative INSERT in Supabase FIRST.
+        // Never fake success or leave device-only ghost records when Supabase fails.
+        if (isSupabaseConfigured()) {
+            val jwt = getActiveSupabaseJwt().orEmpty()
+            when (
+                val remoteWrite = studentCrudService.createStudent(
+                    jwt = jwt,
+                    student = canonicalStudent,
+                    initialPassword = initialPassword,
+                    targetClass = targetClass
+                )
+            ) {
+                is RemoteStudentWriteResult.Error -> return@withContext AuthResult.Failure(remoteWrite.message)
+                is RemoteStudentWriteResult.Success -> {
+                    canonicalStudent = remoteWrite.student
+                }
+            }
+        }
+
         val record = accountsMutex.withLock {
             val accounts = loadLocalAccounts()
-            if (accounts.any { it.nim.equals(cleanNim, ignoreCase = true) }) {
-                return@withContext AuthResult.Failure("NIM '$cleanNim' sudah terdaftar pada akun mahasiswa lain.")
-            }
-            if (accounts.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
-                return@withContext AuthResult.Failure("Email '$cleanEmail' sudah digunakan oleh akun lain.")
+            if (!isSupabaseConfigured()) {
+                if (accounts.any { it.nim.equals(cleanNim, ignoreCase = true) }) {
+                    return@withContext AuthResult.Failure("NIM '$cleanNim' sudah terdaftar pada akun mahasiswa lain.")
+                }
+                if (accounts.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
+                    return@withContext AuthResult.Failure("Email '$cleanEmail' sudah digunakan oleh akun lain.")
+                }
             }
 
             val created = StoredAccountRecord(
-                id = studentId,
-                fullName = cleanName,
-                nim = cleanNim,
-                email = cleanEmail,
-                username = cleanNim,
-                studyProgramId = studyProgramId,
-                studyProgramCode = studyProgramCode,
-                classId = classId,
-                className = className,
-                semester = semester,
-                cohortYear = cohortYear,
-                accountStatus = accountStatus,
-                badgeStatus = badgeStatus,
-                mustChangePassword = mustChangePassword,
+                id = canonicalStudent.id,
+                fullName = canonicalStudent.fullName,
+                nim = canonicalStudent.nim,
+                email = canonicalStudent.email,
+                username = canonicalStudent.nim,
+                studyProgramId = canonicalStudent.studyProgramId,
+                studyProgramCode = canonicalStudent.studyProgramName,
+                classId = canonicalStudent.classId,
+                className = canonicalStudent.className,
+                semester = canonicalStudent.semester,
+                cohortYear = canonicalStudent.cohortYear,
+                accountStatus = canonicalStudent.status,
+                badgeStatus = canonicalStudent.badgeStatus,
+                mustChangePassword = canonicalStudent.mustChangePassword,
                 role = UserRole.STUDENT,
-                passwordHash = PasswordHasher.hashPassword(initialPassword),
+                passwordHash = PasswordHasher.hashPassword(initialPassword, PasswordHasher.BULK_STUDENT_ITERATIONS),
                 createdAt = nowIso()
             )
-            saveLocalAccounts(listOf(created) + accounts)
+            val deduped = accounts.filterNot {
+                it.id == created.id || it.nim.equals(created.nim, ignoreCase = true)
+            }
+            saveLocalAccounts(listOf(created) + deduped)
             created
         }
         AuthResult.Success(profile = record.toUserProfile(), usingSupabase = isSupabaseConfigured())
@@ -482,7 +744,10 @@ class AzrilAuthRepository(
      * - Username = NIM, Initial Password = NIM (hashed with PBKDF2, NEVER stored in plaintext).
      * - Sets mustChangePassword = true so student MUST change password on first login.
      * - Strictly skips existing NIMs (never overwrites existing accounts).
-     * - When Supabase is configured, delegates server-side account creation to Edge Function `admin-bulk-import-students`.
+     * - Hashes passwords before acquiring [accountsMutex] using [PasswordHasher.BULK_STUDENT_ITERATIONS]
+     *   so large imports save to DataStore in <1s without blocking login.
+     * - When Supabase is configured, syncs via Edge Function `admin-bulk-import-students` first,
+     *   falling back to Supabase Auth `/auth/v1/signup` when the Edge Function isn't deployed.
      */
     suspend fun adminBulkImportStudents(
         newStudents: List<StudentRecord>,
@@ -491,20 +756,18 @@ class AzrilAuthRepository(
         importHistoricalAttendance: Boolean,
         previewRowsForSync: List<ExcelImportPreviewRow> = emptyList()
     ): List<StudentRecord> = withContext(Dispatchers.IO) {
-        val createdStudents = mutableListOf<StudentRecord>()
-        val createdAny = accountsMutex.withLock {
-            val existingAccounts = loadLocalAccounts()
-            val existingNimSet = existingAccounts.map { it.nim.trim().lowercase(Locale.US) }.toMutableSet()
-            val createdRecords = mutableListOf<StoredAccountRecord>()
-            val createdIso = nowIso()
-
-            newStudents.forEach { stu ->
-                val cleanNim = stu.nim.trim()
-                val nimKey = cleanNim.lowercase(Locale.US)
-                if (cleanNim.length >= 5 && !cleanNim.contains(" ") && existingNimSet.add(nimKey)) {
-                    val safeEmail = stu.email.trim().lowercase(Locale.US)
-                        .ifBlank { "${cleanNim.lowercase(Locale.US)}@mahasiswa.azrilclas.ac.id" }
-                    val rec = StoredAccountRecord(
+        val createdIso = nowIso()
+        // Pre-compute salted PBKDF2 hashes outside mutex so large batches save immediately
+        val prepared = mutableListOf<StoredAccountRecord>()
+        val seenBatch = mutableSetOf<String>()
+        newStudents.forEach { stu ->
+            val cleanNim = stu.nim.trim()
+            val nimKey = cleanNim.lowercase(Locale.US)
+            if (cleanNim.length >= 5 && !cleanNim.contains(" ") && seenBatch.add(nimKey)) {
+                val safeEmail = stu.email.trim().lowercase(Locale.US)
+                    .ifBlank { "${cleanNim.lowercase(Locale.US)}@mahasiswa.azrilclas.ac.id" }
+                prepared.add(
+                    StoredAccountRecord(
                         id = stu.id,
                         fullName = stu.fullName.trim(),
                         nim = cleanNim,
@@ -520,31 +783,263 @@ class AzrilAuthRepository(
                         badgeStatus = stu.badgeStatus,
                         mustChangePassword = true,
                         role = UserRole.STUDENT,
-                        passwordHash = PasswordHasher.hashPassword(cleanNim),
+                        passwordHash = PasswordHasher.hashPassword(cleanNim, PasswordHasher.BULK_STUDENT_ITERATIONS),
                         createdAt = createdIso
                     )
-                    createdRecords.add(rec)
-                    createdStudents.add(rec.toStudentRecord())
-                }
+                )
             }
+        }
 
-            if (createdRecords.isNotEmpty()) {
-                saveLocalAccounts(createdRecords + existingAccounts)
+        val createdStudents = mutableListOf<StudentRecord>()
+        val createdAny = accountsMutex.withLock {
+            val existingAccounts = loadLocalAccounts()
+            val existingNimSet = existingAccounts.map { it.nim.trim().lowercase(Locale.US) }.toMutableSet()
+            val toInsert = prepared.filter { existingNimSet.add(it.nim.trim().lowercase(Locale.US)) }
+            if (toInsert.isNotEmpty()) {
+                saveLocalAccounts(toInsert + existingAccounts)
+                createdStudents.addAll(toInsert.map { it.toStudentRecord() })
                 true
             } else {
                 false
             }
         }
 
-        if (createdAny) {
-            syncBulkImportToSupabaseEdgeFunctionIfConnected(
+        if (createdAny && isSupabaseConfigured()) {
+            val edgeOk = syncBulkImportToSupabaseEdgeFunctionIfConnected(
                 fileName = fileName,
                 semesterKey = semesterKey,
                 importHistoricalAttendance = importHistoricalAttendance,
                 rows = previewRowsForSync
             )
+            if (!edgeOk) {
+                provisionStudentsViaSupabaseSignupFallback(createdStudents)
+            }
         }
         createdStudents
+    }
+
+    /**
+     * Authoritative Supabase bulk Excel importer that returns an honest [SupabaseStudentSyncReport].
+     * 1. Requires a live Supabase Admin JWT (automatically attempts refresh if expired).
+     * 2. Tries Edge Function `admin-bulk-import-students` (`action = "bulk_import"`) first.
+     * 3. If the Edge Function is not deployed (HTTP 404), persists each student via
+     *    [SupabaseStudentCrudService.createStudent] (`classes` + `auth.users` + `public.profiles`)
+     *    so data is genuinely stored in Supabase and visible from all other devices.
+     */
+    suspend fun adminBulkImportStudentsToSupabase(
+        newStudents: List<StudentRecord>,
+        classes: List<AcademicClass>,
+        fileName: String,
+        semesterKey: String,
+        importHistoricalAttendance: Boolean,
+        previewRowsForSync: List<ExcelImportPreviewRow>
+    ): SupabaseStudentSyncReport = withContext(Dispatchers.IO) {
+        if (newStudents.isEmpty()) {
+            return@withContext SupabaseStudentSyncReport(totalProcessed = 0)
+        }
+        if (!isSupabaseConfigured()) {
+            adminBulkImportStudents(
+                newStudents = newStudents,
+                fileName = fileName,
+                semesterKey = semesterKey,
+                importHistoricalAttendance = importHistoricalAttendance,
+                previewRowsForSync = previewRowsForSync
+            )
+            return@withContext SupabaseStudentSyncReport(
+                totalProcessed = newStudents.size,
+                localRepairedCount = newStudents.size
+            )
+        }
+
+        var jwt = getActiveSupabaseJwt().orEmpty()
+        if (jwt.isBlank()) {
+            jwt = refreshSupabaseAccessTokenIfNeeded().orEmpty()
+        }
+        if (jwt.isBlank()) {
+            return@withContext SupabaseStudentSyncReport(
+                totalProcessed = newStudents.size,
+                diagnosticMessage = "Sesi Admin belum terhubung ke Supabase Auth. Logout lalu login ulang menggunakan akun Admin Supabase sebelum melakukan Import Excel."
+            )
+        }
+
+        // Primary path: Edge Function atomic batch import
+        val edgeOk = syncBulkImportToSupabaseEdgeFunctionIfConnected(
+            fileName = fileName,
+            semesterKey = semesterKey,
+            importHistoricalAttendance = importHistoricalAttendance,
+            rows = previewRowsForSync
+        )
+        if (edgeOk) {
+            return@withContext SupabaseStudentSyncReport(
+                totalProcessed = newStudents.size,
+                syncedToSupabaseCount = newStudents.size,
+                usedEdgeFunction = true
+            )
+        }
+
+        // Direct Supabase CRUD path (`classes` + `auth.users` + `public.profiles`) when Edge Function is 404
+        val classById = classes.associateBy { it.id }
+        var syncedCount = 0
+        var alreadyCount = 0
+        var rateLimited = false
+        var lastError: String? = null
+
+        for (stu in newStudents) {
+            val cleanNim = SupabaseStudentCrudService.sanitizeNim(stu.nim)
+            if (cleanNim.length < 5 || cleanNim.contains(" ")) continue
+            val targetClass = stu.classId?.let { classById[it] }
+            when (
+                val res = studentCrudService.createStudent(
+                    jwt = jwt,
+                    student = stu.copy(nim = cleanNim, mustChangePassword = true),
+                    initialPassword = cleanNim,
+                    targetClass = targetClass
+                )
+            ) {
+                is RemoteStudentWriteResult.Success -> syncedCount++
+                is RemoteStudentWriteResult.Error -> {
+                    val msg = res.message
+                    val lower = msg.lowercase(Locale.US)
+                    when {
+                        lower.contains("sudah terdaftar") || lower.contains("duplikat") -> alreadyCount++
+                        lower.contains("rate limit") -> {
+                            rateLimited = true
+                            lastError = msg
+                            break
+                        }
+                        lower.contains("401") || lower.contains("403") || lower.contains("42p17") -> {
+                            lastError = msg
+                            break
+                        }
+                        else -> lastError = msg
+                    }
+                }
+            }
+        }
+
+        SupabaseStudentSyncReport(
+            totalProcessed = newStudents.size,
+            syncedToSupabaseCount = syncedCount,
+            alreadyInSupabaseCount = alreadyCount,
+            usedEdgeFunction = false,
+            rateLimited = rateLimited,
+            diagnosticMessage = lastError
+        )
+    }
+
+    /**
+     * Repairs any local missing credentials for students visible in the Admin dashboard
+     * and synchronizes all active student accounts to Supabase Auth so students can log in
+     * from any phone using their NIM and initial password (NIM).
+     */
+    suspend fun syncStudentsToSupabase(
+        students: List<StudentRecord>,
+        semesterKey: String
+    ): SupabaseStudentSyncReport = withContext(Dispatchers.IO) {
+        if (students.isEmpty()) {
+            return@withContext SupabaseStudentSyncReport(
+                diagnosticMessage = "Belum ada data mahasiswa untuk disinkronkan."
+            )
+        }
+
+        val createdIso = nowIso()
+        var repairedCount = 0
+        val existingBefore = accountsMutex.withLock { loadLocalAccounts() }
+        val existingNimSet = existingBefore.map { it.nim.trim().lowercase(Locale.US) }.toMutableSet()
+        val missingLocally = students.mapNotNull { stu ->
+            val cleanNim = stu.nim.trim()
+            val nimKey = cleanNim.lowercase(Locale.US)
+            if (cleanNim.length >= 5 && !cleanNim.contains(" ") && existingNimSet.add(nimKey)) {
+                val safeEmail = stu.email.trim().lowercase(Locale.US)
+                    .ifBlank { "${cleanNim.lowercase(Locale.US)}@mahasiswa.azrilclas.ac.id" }
+                StoredAccountRecord(
+                    id = stu.id,
+                    fullName = stu.fullName.trim(),
+                    nim = cleanNim,
+                    email = safeEmail,
+                    username = cleanNim,
+                    studyProgramId = stu.studyProgramId,
+                    studyProgramCode = stu.studyProgramName,
+                    classId = stu.classId,
+                    className = stu.className,
+                    semester = stu.semester,
+                    cohortYear = stu.cohortYear,
+                    accountStatus = stu.status,
+                    badgeStatus = stu.badgeStatus,
+                    mustChangePassword = stu.mustChangePassword,
+                    role = UserRole.STUDENT,
+                    passwordHash = PasswordHasher.hashPassword(cleanNim, PasswordHasher.BULK_STUDENT_ITERATIONS),
+                    createdAt = createdIso
+                )
+            } else null
+        }
+
+        if (missingLocally.isNotEmpty()) {
+            accountsMutex.withLock {
+                val fresh = loadLocalAccounts()
+                val freshNims = fresh.map { it.nim.trim().lowercase(Locale.US) }.toMutableSet()
+                val uniqueMissing = missingLocally.filter { freshNims.add(it.nim.trim().lowercase(Locale.US)) }
+                if (uniqueMissing.isNotEmpty()) {
+                    saveLocalAccounts(uniqueMissing + fresh)
+                    repairedCount = uniqueMissing.size
+                }
+            }
+        }
+
+        if (!isSupabaseConfigured()) {
+            return@withContext SupabaseStudentSyncReport(
+                totalProcessed = students.size,
+                localRepairedCount = repairedCount,
+                diagnosticMessage = "Akun lokal tersinkron ($repairedCount diperbaiki). Supabase belum dikonfigurasi."
+            )
+        }
+
+        val previewRows = students.mapIndexed { idx, stu ->
+            val resolvedClassName = stu.className ?: "${stu.studyProgramName}-${stu.semester}"
+            ExcelImportPreviewRow(
+                sheetName = resolvedClassName,
+                rowNumber = idx + 1,
+                studentNumber = (idx + 1).toString(),
+                nim = stu.nim,
+                fullName = stu.fullName,
+                studyProgramId = stu.studyProgramId,
+                studyProgramCode = stu.studyProgramName,
+                className = resolvedClassName,
+                classLabel = resolvedClassName.substringAfter('-', stu.semester.toString()),
+                semester = stu.semester,
+                colorFlag = if (stu.badgeStatus == StudentBadgeStatus.AFK) {
+                    com.example.ui.model.ExcelRowColorFlag.RED_AFK
+                } else {
+                    com.example.ui.model.ExcelRowColorFlag.NONE
+                },
+                validationStatus = if (stu.badgeStatus == StudentBadgeStatus.AFK) {
+                    com.example.ui.model.ExcelImportValidationStatus.VALID_AFK
+                } else {
+                    com.example.ui.model.ExcelImportValidationStatus.VALID_NORMAL
+                }
+            )
+        }
+
+        val edgeOk = syncBulkImportToSupabaseEdgeFunctionIfConnected(
+            fileName = "manual_admin_sync.xlsx",
+            semesterKey = semesterKey,
+            importHistoricalAttendance = false,
+            rows = previewRows
+        )
+        if (edgeOk) {
+            return@withContext SupabaseStudentSyncReport(
+                totalProcessed = students.size,
+                localRepairedCount = repairedCount,
+                syncedToSupabaseCount = students.size,
+                usedEdgeFunction = true
+            )
+        }
+
+        val fallbackReport = provisionStudentsViaSupabaseSignupFallback(students)
+        fallbackReport.copy(
+            totalProcessed = students.size,
+            localRepairedCount = repairedCount
+        )
     }
 
     /**
@@ -566,8 +1061,8 @@ class AzrilAuthRepository(
         }
 
         if (isSupabaseConfigured()) {
-            val jwt = store.getString(KEY_SESSION_TOKEN)
-            if (!isLocalSessionToken(jwt)) {
+            val jwt = getActiveSupabaseJwt()
+            if (!jwt.isNullOrBlank()) {
                 val base = supabaseUrl.trimEnd('/')
                 val pwUpdateErr = runCatching {
                     val payload = JSONObject().apply { put("password", cleanPw) }
@@ -627,86 +1122,122 @@ class AzrilAuthRepository(
         semester: Int,
         cohortYear: Int,
         accountStatus: AccountStatus,
-        badgeStatus: StudentBadgeStatus
+        badgeStatus: StudentBadgeStatus,
+        previousNim: String? = null,
+        targetClass: AcademicClass? = null
     ): AuthResult = withContext(Dispatchers.IO) {
         val cleanName = fullName.trim()
-        val cleanNim = nim.trim()
+        val cleanNim = SupabaseStudentCrudService.sanitizeNim(nim)
         val cleanEmail = email.trim().lowercase(Locale.US)
         if (cleanName.length < 3) return@withContext AuthResult.Failure("Nama lengkap minimal 3 karakter.")
         if (cleanNim.length < 5) return@withContext AuthResult.Failure("NIM minimal 5 karakter.")
         if (cleanNim.contains(" ")) return@withContext AuthResult.Failure("NIM tidak boleh mengandung spasi.")
         if (!cleanEmail.contains("@") || !cleanEmail.contains(".")) return@withContext AuthResult.Failure("Format email tidak valid.")
 
-        val (existing, updated) = accountsMutex.withLock {
-            val accounts = loadLocalAccounts()
-            if (accounts.any { it.id != studentId && it.nim.equals(cleanNim, ignoreCase = true) }) {
-                return@withContext AuthResult.Failure("NIM '$cleanNim' sudah digunakan oleh mahasiswa lain.")
+        var canonicalStudent = StudentRecord(
+            id = studentId,
+            fullName = cleanName,
+            nim = cleanNim,
+            email = cleanEmail,
+            studyProgramId = studyProgramId,
+            studyProgramName = studyProgramCode,
+            classId = classId,
+            className = className,
+            semester = semester,
+            cohortYear = cohortYear,
+            status = accountStatus,
+            badgeStatus = badgeStatus
+        )
+
+        // When Supabase is configured, ALWAYS execute authoritative UPDATE in Supabase FIRST.
+        if (isSupabaseConfigured()) {
+            val jwt = getActiveSupabaseJwt().orEmpty()
+            when (
+                val remoteUpdate = studentCrudService.updateStudent(
+                    jwt = jwt,
+                    student = canonicalStudent,
+                    previousNim = previousNim,
+                    targetClass = targetClass
+                )
+            ) {
+                is RemoteStudentWriteResult.Error -> return@withContext AuthResult.Failure(remoteUpdate.message)
+                is RemoteStudentWriteResult.Success -> {
+                    canonicalStudent = remoteUpdate.student
+                }
             }
-            if (accounts.any { it.id != studentId && it.email.equals(cleanEmail, ignoreCase = true) }) {
-                return@withContext AuthResult.Failure("Email '$cleanEmail' sudah digunakan oleh akun lain.")
+        }
+
+        val (_, updated) = accountsMutex.withLock {
+            val accounts = loadLocalAccounts()
+            if (!isSupabaseConfigured()) {
+                if (accounts.any { it.id != studentId && it.nim.equals(cleanNim, ignoreCase = true) }) {
+                    return@withContext AuthResult.Failure("NIM '$cleanNim' sudah digunakan oleh mahasiswa lain.")
+                }
+                if (accounts.any { it.id != studentId && it.email.equals(cleanEmail, ignoreCase = true) }) {
+                    return@withContext AuthResult.Failure("Email '$cleanEmail' sudah digunakan oleh akun lain.")
+                }
             }
 
-            val found = accounts.find { it.id == studentId }
+            val found = accounts.find { it.id == studentId || it.id == canonicalStudent.id }
             val nextRec = if (found != null) {
                 found.copy(
-                    fullName = cleanName,
-                    nim = cleanNim,
-                    email = cleanEmail,
-                    username = cleanNim,
-                    studyProgramId = studyProgramId,
-                    studyProgramCode = studyProgramCode,
-                    classId = classId,
-                    className = className,
-                    semester = semester,
-                    cohortYear = cohortYear,
-                    accountStatus = accountStatus,
-                    badgeStatus = badgeStatus
+                    id = canonicalStudent.id,
+                    fullName = canonicalStudent.fullName,
+                    nim = canonicalStudent.nim,
+                    email = canonicalStudent.email,
+                    username = canonicalStudent.nim,
+                    studyProgramId = canonicalStudent.studyProgramId,
+                    studyProgramCode = canonicalStudent.studyProgramName,
+                    classId = canonicalStudent.classId,
+                    className = canonicalStudent.className,
+                    semester = canonicalStudent.semester,
+                    cohortYear = canonicalStudent.cohortYear,
+                    accountStatus = canonicalStudent.status,
+                    badgeStatus = canonicalStudent.badgeStatus
                 )
             } else {
                 StoredAccountRecord(
-                    id = studentId,
-                    fullName = cleanName,
-                    nim = cleanNim,
-                    email = cleanEmail,
-                    username = cleanNim,
-                    studyProgramId = studyProgramId,
-                    studyProgramCode = studyProgramCode,
-                    classId = classId,
-                    className = className,
-                    semester = semester,
-                    cohortYear = cohortYear,
-                    accountStatus = accountStatus,
-                    badgeStatus = badgeStatus,
+                    id = canonicalStudent.id,
+                    fullName = canonicalStudent.fullName,
+                    nim = canonicalStudent.nim,
+                    email = canonicalStudent.email,
+                    username = canonicalStudent.nim,
+                    studyProgramId = canonicalStudent.studyProgramId,
+                    studyProgramCode = canonicalStudent.studyProgramName,
+                    classId = canonicalStudent.classId,
+                    className = canonicalStudent.className,
+                    semester = canonicalStudent.semester,
+                    cohortYear = canonicalStudent.cohortYear,
+                    accountStatus = canonicalStudent.status,
+                    badgeStatus = canonicalStudent.badgeStatus,
                     role = UserRole.STUDENT,
-                    passwordHash = PasswordHasher.hashPassword(cleanNim),
+                    passwordHash = PasswordHasher.hashPassword(canonicalStudent.nim, PasswordHasher.BULK_STUDENT_ITERATIONS),
                     createdAt = nowIso()
                 )
             }
             val nextList = if (found != null) {
-                accounts.map { if (it.id == studentId) nextRec else it }
+                accounts.map { if (it.id == found.id) nextRec else it }
             } else {
                 listOf(nextRec) + accounts
             }
             saveLocalAccounts(nextList)
             found to nextRec
         }
-        if (existing != null && !existing.nim.equals(cleanNim, ignoreCase = true)) {
-            syncAdminEdgeActionIfConnected(
-                JSONObject().apply {
-                    put("action", "update_nim")
-                    put("studentId", studentId)
-                    put("newNim", cleanNim)
-                }
-            )
-        }
-        syncStudentBadgeToSupabaseIfConnected(studentId, badgeStatus)
         AuthResult.Success(profile = updated.toUserProfile(), usingSupabase = isSupabaseConfigured())
     }
 
-    suspend fun adminUpdateStudentBadgeStatus(
+    suspend fun adminUpdateStudentBadgeStatusResult(
         studentId: String,
+        studentNim: String? = null,
         badgeStatus: StudentBadgeStatus
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): String? = withContext(Dispatchers.IO) {
+        if (isSupabaseConfigured()) {
+            val jwt = getActiveSupabaseJwt().orEmpty()
+            when (val res = studentCrudService.updateStudentBadge(jwt, studentId, studentNim, badgeStatus)) {
+                is RemoteDeleteResult.Error -> return@withContext res.message
+                RemoteDeleteResult.Success -> Unit
+            }
+        }
         accountsMutex.withLock {
             val accounts = loadLocalAccounts()
             val updated = accounts.map { acc ->
@@ -714,9 +1245,13 @@ class AzrilAuthRepository(
             }
             saveLocalAccounts(updated)
         }
-        syncStudentBadgeToSupabaseIfConnected(studentId, badgeStatus)
-        true
+        null
     }
+
+    suspend fun adminUpdateStudentBadgeStatus(
+        studentId: String,
+        badgeStatus: StudentBadgeStatus
+    ): Boolean = adminUpdateStudentBadgeStatusResult(studentId, null, badgeStatus) == null
 
     suspend fun adminResetStudentPassword(
         studentId: String,
@@ -724,32 +1259,48 @@ class AzrilAuthRepository(
         requirePasswordChange: Boolean = true
     ): String? = withContext(Dispatchers.IO) {
         if (newPassword.length < 6) return@withContext "Kata sandi baru minimal 6 karakter."
+        if (isSupabaseConfigured()) {
+            val edgeOk = syncAdminEdgeActionIfConnected(
+                JSONObject().apply {
+                    put("action", "reset_password")
+                    put("studentId", studentId)
+                    put("newPassword", newPassword)
+                    put("mustChangePassword", requirePasswordChange)
+                }
+            )
+            if (!edgeOk) {
+                return@withContext "Reset password di Supabase Auth membutuhkan Edge Function admin-bulk-import-students yang aktif dan sesi Admin Supabase yang valid."
+            }
+        }
         accountsMutex.withLock {
             val accounts = loadLocalAccounts()
             val target = accounts.find { it.id == studentId }
-                ?: return@withContext "Akun mahasiswa tidak ditemukan."
+                ?: return@withContext if (isSupabaseConfigured()) null else "Akun mahasiswa tidak ditemukan."
             val newHash = PasswordHasher.hashPassword(newPassword)
             val updated = accounts.map { acc ->
                 if (acc.id == target.id) acc.copy(passwordHash = newHash, mustChangePassword = requirePasswordChange) else acc
             }
             saveLocalAccounts(updated)
         }
-        syncAdminEdgeActionIfConnected(
-            JSONObject().apply {
-                put("action", "reset_password")
-                put("studentId", studentId)
-                put("newPassword", newPassword)
-                put("mustChangePassword", requirePasswordChange)
-            }
-        )
         null
     }
 
-    suspend fun adminDeleteStudentAccount(studentId: String) = withContext(Dispatchers.IO) {
+    suspend fun adminDeleteStudentAccount(
+        studentId: String,
+        studentNim: String? = null
+    ): String? = withContext(Dispatchers.IO) {
+        if (isSupabaseConfigured()) {
+            val jwt = getActiveSupabaseJwt().orEmpty()
+            when (val res = studentCrudService.deleteStudent(jwt, studentId, studentNim)) {
+                is RemoteDeleteResult.Error -> return@withContext res.message
+                RemoteDeleteResult.Success -> Unit
+            }
+        }
         accountsMutex.withLock {
             val accounts = loadLocalAccounts().filterNot { it.id == studentId }
             saveLocalAccounts(accounts)
         }
+        null
     }
 
     /**
@@ -849,7 +1400,7 @@ class AzrilAuthRepository(
         rememberMe: Boolean,
         nowMillis: Long = System.currentTimeMillis()
     ): AuthResult = withContext(Dispatchers.IO) {
-        val cleanId = identifier.trim()
+        val cleanId = SupabaseStudentCrudService.sanitizeIdentifier(identifier)
         val cleanLower = cleanId.lowercase(Locale.US)
         if (cleanId.isEmpty()) return@withContext AuthResult.Failure("NIM wajib diisi.")
         if (password.isEmpty()) return@withContext AuthResult.Failure("Kata sandi wajib diisi.")
@@ -871,19 +1422,21 @@ class AzrilAuthRepository(
                 return@withContext remoteResult
             }
             val localAccounts = accountsMutex.withLock { loadLocalAccounts() }
+            val compactId = SupabaseStudentCrudService.sanitizeNim(cleanId)
             val localMatch = localAccounts.find {
-                it.nim.equals(cleanId, ignoreCase = true) ||
-                    it.username.equals(cleanLower, ignoreCase = true) ||
-                    it.email.equals(cleanLower, ignoreCase = true)
+                SupabaseStudentCrudService.sanitizeNim(it.nim).equals(compactId, ignoreCase = true) ||
+                    it.username.trim().equals(cleanLower, ignoreCase = true) ||
+                    it.email.trim().equals(cleanLower, ignoreCase = true)
             }
             if (localMatch == null) return@withContext remoteResult
         }
 
         val accounts = accountsMutex.withLock { loadLocalAccounts() }
+        val compactId = SupabaseStudentCrudService.sanitizeNim(cleanId)
         val matched = accounts.find {
-            it.nim.equals(cleanId, ignoreCase = true) ||
-                it.username.equals(cleanLower, ignoreCase = true) ||
-                it.email.equals(cleanLower, ignoreCase = true)
+            SupabaseStudentCrudService.sanitizeNim(it.nim).equals(compactId, ignoreCase = true) ||
+                it.username.trim().equals(cleanLower, ignoreCase = true) ||
+                it.email.trim().equals(cleanLower, ignoreCase = true)
         } ?: return@withContext AuthResult.Failure("NIM tidak terdaftar. Hubungi Admin untuk pembuatan akun mahasiswa.")
 
         if (matched.role == UserRole.ADMIN) {
@@ -915,11 +1468,11 @@ class AzrilAuthRepository(
     }
 
     suspend fun logout() = withContext(Dispatchers.IO) {
-        val token = store.getString(KEY_SESSION_TOKEN)
+        val token = getActiveSupabaseJwt()
         val storedRole = store.getString(KEY_SESSION_ROLE)
-        if (isSupabaseConfigured() && !token.isNullOrBlank() &&
-            !token.startsWith("azr_sess_") && !token.startsWith("azr_admin_sess_")
-        ) {
+        activeAccessToken = null
+        activeRefreshToken = null
+        if (isSupabaseConfigured() && !token.isNullOrBlank()) {
             runCatching {
                 val req = Request.Builder()
                     .url("${supabaseUrl.trimEnd('/')}/auth/v1/logout")
@@ -1066,8 +1619,8 @@ class AzrilAuthRepository(
         semesterKey: String,
         importHistoricalAttendance: Boolean,
         rows: List<ExcelImportPreviewRow>
-    ) {
-        if (!isSupabaseConfigured() || rows.isEmpty()) return
+    ): Boolean {
+        if (!isSupabaseConfigured() || rows.isEmpty()) return false
         val rowsArr = JSONArray()
         rows.forEach { r ->
             rowsArr.put(JSONObject().apply {
@@ -1086,7 +1639,7 @@ class AzrilAuthRepository(
                 }
             })
         }
-        syncAdminEdgeActionIfConnected(
+        return syncAdminEdgeActionIfConnected(
             JSONObject().apply {
                 put("action", "bulk_import")
                 put("fileName", fileName)
@@ -1097,11 +1650,10 @@ class AzrilAuthRepository(
         )
     }
 
-    private suspend fun syncAdminEdgeActionIfConnected(payload: JSONObject) {
-        if (!isSupabaseConfigured()) return
-        val jwt = store.getString(KEY_SESSION_TOKEN) ?: return
-        if (isLocalSessionToken(jwt)) return
-        runCatching {
+    private suspend fun syncAdminEdgeActionIfConnected(payload: JSONObject): Boolean {
+        if (!isSupabaseConfigured()) return false
+        val jwt = getActiveSupabaseJwt() ?: return false
+        return runCatching {
             val base = supabaseUrl.trimEnd('/')
             val req = Request.Builder()
                 .url("$base/functions/v1/admin-bulk-import-students")
@@ -1110,8 +1662,155 @@ class AzrilAuthRepository(
                 .addHeader("Authorization", "Bearer $jwt")
                 .addHeader("Content-Type", "application/json")
                 .build()
-            httpClient.newCall(req).execute().close()
+            httpClient.newCall(req).execute().use { it.isSuccessful }
+        }.getOrDefault(false)
+    }
+
+    private suspend fun provisionSingleStudentToSupabase(
+        student: StudentRecord,
+        initialPassword: String
+    ): Boolean {
+        if (!isSupabaseConfigured()) return false
+        val resolvedClassName = student.className ?: "${student.studyProgramName}-${student.semester}"
+        val row = ExcelImportPreviewRow(
+            sheetName = resolvedClassName,
+            rowNumber = 1,
+            studentNumber = "1",
+            nim = student.nim,
+            fullName = student.fullName,
+            studyProgramId = student.studyProgramId,
+            studyProgramCode = student.studyProgramName,
+            className = resolvedClassName,
+            classLabel = resolvedClassName.substringAfter('-', student.semester.toString()),
+            semester = student.semester,
+            colorFlag = if (student.badgeStatus == StudentBadgeStatus.AFK) {
+                com.example.ui.model.ExcelRowColorFlag.RED_AFK
+            } else {
+                com.example.ui.model.ExcelRowColorFlag.NONE
+            },
+            validationStatus = if (student.badgeStatus == StudentBadgeStatus.AFK) {
+                com.example.ui.model.ExcelImportValidationStatus.VALID_AFK
+            } else {
+                com.example.ui.model.ExcelImportValidationStatus.VALID_NORMAL
+            }
+        )
+        if (initialPassword.trim().equals(student.nim.trim(), ignoreCase = true)) {
+            val edgeOk = syncBulkImportToSupabaseEdgeFunctionIfConnected(
+                fileName = "single_student_create.xlsx",
+                semesterKey = "2026/2027-Ganjil",
+                importHistoricalAttendance = false,
+                rows = listOf(row)
+            )
+            if (edgeOk) return true
         }
+        val report = provisionStudentsViaSupabaseSignupFallback(listOf(student), customPassword = initialPassword)
+        return report.syncedToSupabaseCount > 0 || report.alreadyInSupabaseCount > 0
+    }
+
+    private fun provisionStudentsViaSupabaseSignupFallback(
+        students: List<StudentRecord>,
+        customPassword: String? = null
+    ): SupabaseStudentSyncReport {
+        if (!isSupabaseConfigured() || students.isEmpty()) {
+            return SupabaseStudentSyncReport(totalProcessed = students.size)
+        }
+        val base = supabaseUrl.trimEnd('/')
+        var syncedCount = 0
+        var alreadyRegistered = 0
+        var rateLimited = false
+        var emailConfirmPending = false
+        var lastError: String? = null
+
+        for (stu in students) {
+            val cleanNim = stu.nim.trim()
+            if (cleanNim.length < 5 || cleanNim.contains(" ")) continue
+            val password = (customPassword ?: cleanNim).trim()
+            if (password.length < 6) continue
+            val email = stu.email.trim().lowercase(Locale.US)
+                .takeIf { it.contains("@") && it.contains(".") }
+                ?: "${cleanNim.lowercase(Locale.US)}@mahasiswa.azrilclas.ac.id"
+
+            val meta = JSONObject().apply {
+                put("full_name", stu.fullName.trim())
+                put("nim", cleanNim)
+                put("username", cleanNim)
+                put("study_program_code", stu.studyProgramName)
+                put("study_program_id", stu.studyProgramId)
+                put("class_name", stu.className ?: "")
+                put("semester", stu.semester)
+                put("cohort_year", stu.cohortYear)
+                put("must_change_password", password.equals(cleanNim, ignoreCase = true))
+            }
+            val payload = JSONObject().apply {
+                put("email", email)
+                put("password", password)
+                put("data", meta)
+            }
+            val req = Request.Builder()
+                .url("$base/auth/v1/signup")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Content-Type", "application/json")
+                .build()
+
+            val stopBatch = runCatching {
+                httpClient.newCall(req).execute().use { resp ->
+                    val body = resp.body?.string().orEmpty()
+                    val lowerBody = body.lowercase(Locale.US)
+                    when {
+                        resp.isSuccessful -> {
+                            val parsed = runCatching { JSONObject(body) }.getOrNull()
+                            val hasSession = parsed?.optString("access_token").orEmpty().isNotBlank()
+                            val userObj = parsed?.optJSONObject("user") ?: parsed
+                            val identitiesEmpty = userObj?.optJSONArray("identities")?.length() == 0
+                            if (identitiesEmpty) {
+                                alreadyRegistered++
+                            } else {
+                                syncedCount++
+                                if (!hasSession && userObj?.optString("email_confirmed_at").isNullOrBlank()) {
+                                    emailConfirmPending = true
+                                }
+                            }
+                            false
+                        }
+                        resp.code == 429 || lowerBody.contains("rate limit") -> {
+                            rateLimited = true
+                            lastError = "Batas pembuatan akun Supabase Auth tercapai (rate limit). Deploy Edge Function admin-bulk-import-students untuk impor massal tanpa batas."
+                            true
+                        }
+                        lowerBody.contains("already registered") || lowerBody.contains("user already exists") -> {
+                            alreadyRegistered++
+                            false
+                        }
+                        else -> {
+                            val errMsg = runCatching {
+                                JSONObject(body).let { j ->
+                                    j.optString("msg").ifBlank { j.optString("error_description") }
+                                        .ifBlank { j.optString("message") }
+                                }
+                            }.getOrNull().orEmpty()
+                            lastError = errMsg.ifBlank { "HTTP ${resp.code} saat menyinkronkan akun ke Supabase Auth." }
+                            // Stop early if signup is globally disabled or DB trigger fails on schema mismatch
+                            resp.code == 400 || resp.code == 403 || resp.code == 500
+                        }
+                    }
+                }
+            }.getOrElse { ex ->
+                lastError = SupabaseNetworkClient.formatConnectionError(ex as? Exception ?: Exception(ex), supabaseUrl)
+                true
+            }
+            if (stopBatch) break
+        }
+
+        return SupabaseStudentSyncReport(
+            totalProcessed = students.size,
+            syncedToSupabaseCount = syncedCount,
+            alreadyInSupabaseCount = alreadyRegistered,
+            usedEdgeFunction = false,
+            rateLimited = rateLimited,
+            emailConfirmationPending = emailConfirmPending,
+            diagnosticMessage = lastError
+        )
     }
 
     suspend fun saveStudentStreaks(streaks: Map<String, StudentStreakState>) = withContext(Dispatchers.IO) {
@@ -1148,8 +1847,7 @@ class AzrilAuthRepository(
 
     suspend fun syncLoginStreakToSupabaseIfConnected() = withContext(Dispatchers.IO) {
         if (!isSupabaseConfigured()) return@withContext
-        val jwt = store.getString(KEY_SESSION_TOKEN) ?: return@withContext
-        if (isLocalSessionToken(jwt)) return@withContext
+        val jwt = getActiveSupabaseJwt() ?: return@withContext
         runCatching {
             val base = supabaseUrl.trimEnd('/')
             val req = Request.Builder()
@@ -1170,8 +1868,7 @@ class AzrilAuthRepository(
         semesterKey: String
     ) = withContext(Dispatchers.IO) {
         if (!isSupabaseConfigured()) return@withContext
-        val jwt = store.getString(KEY_SESSION_TOKEN) ?: return@withContext
-        if (isLocalSessionToken(jwt)) return@withContext
+        val jwt = getActiveSupabaseJwt() ?: return@withContext
         runCatching {
             val base = supabaseUrl.trimEnd('/')
             val payload = JSONObject().apply {
@@ -1193,8 +1890,7 @@ class AzrilAuthRepository(
 
     private suspend fun syncStudentBadgeToSupabaseIfConnected(studentId: String, badgeStatus: StudentBadgeStatus) {
         if (!isSupabaseConfigured()) return
-        val jwt = store.getString(KEY_SESSION_TOKEN) ?: return
-        if (isLocalSessionToken(jwt)) return
+        val jwt = getActiveSupabaseJwt() ?: return
         runCatching {
             val base = supabaseUrl.trimEnd('/')
             val body = JSONObject().apply {
@@ -1217,14 +1913,20 @@ class AzrilAuthRepository(
         identifier: String,
         rememberMe: Boolean,
         expiresAtMillis: Long = System.currentTimeMillis() +
-            if (profile.role == UserRole.ADMIN) ADMIN_SESSION_DURATION_MS else REMEMBER_SESSION_DURATION_MS
+            if (profile.role == UserRole.ADMIN) ADMIN_SESSION_DURATION_MS else REMEMBER_SESSION_DURATION_MS,
+        refreshToken: String? = null
     ) {
+        // Always retain the live access token & refresh token in memory for the active session
+        // even when rememberMe == false (so Admin CRUD / Export / Sync have the live JWT).
+        activeAccessToken = token
+        activeRefreshToken = refreshToken?.takeIf { it.isNotBlank() }
         store.putBoolean(KEY_REMEMBER_ME, rememberMe)
         if (rememberMe) {
             if (profile.role == UserRole.STUDENT) {
                 store.putString(KEY_REMEMBERED_IDENTIFIER, identifier)
             }
             store.putString(KEY_SESSION_TOKEN, token)
+            store.putString(KEY_SESSION_REFRESH_TOKEN, refreshToken?.takeIf { it.isNotBlank() })
             store.putString(KEY_SESSION_USER_ID, profile.id)
             store.putString(KEY_SESSION_ROLE, profile.role.name)
             store.putString(KEY_SESSION_PROFILE_JSON, serializeProfile(profile))
@@ -1275,6 +1977,7 @@ class AzrilAuthRepository(
                 if (resp.isSuccessful) {
                     val json = JSONObject(rawBody)
                     val accessToken = json.optString("access_token")
+                    val refreshToken = json.optString("refresh_token").ifBlank { null }
                     val profJson = json.optJSONObject("profile")
                     val roleStr = profJson?.optString("role", "")
                     if (accessToken.isBlank() || profJson == null || !roleStr.equals("admin", ignoreCase = true)) {
@@ -1293,12 +1996,21 @@ class AzrilAuthRepository(
                         createdAt = profJson.optString("created_at").ifBlank { null }
                     )
                     val serverExpiresAtSec = json.optLong("expires_at", 0L)
-                    val expiresAt = if (serverExpiresAtSec > 0L) {
+                    val expiresAt = if (refreshToken != null) {
+                        nowMillis + ADMIN_SESSION_DURATION_MS
+                    } else if (serverExpiresAtSec > 0L) {
                         minOf(serverExpiresAtSec * 1000L, nowMillis + ADMIN_SESSION_DURATION_MS)
                     } else {
                         nowMillis + ADMIN_SESSION_DURATION_MS
                     }
-                    persistSessionState(adminProfile, accessToken, username, rememberMe, expiresAt)
+                    persistSessionState(
+                        profile = adminProfile,
+                        token = accessToken,
+                        identifier = username,
+                        rememberMe = rememberMe,
+                        expiresAtMillis = expiresAt,
+                        refreshToken = refreshToken
+                    )
                     return SupabaseAdminLoginOutcome.Authenticated(
                         AuthResult.Success(profile = adminProfile, usingSupabase = true, sessionExpiresAt = expiresAt)
                     )
@@ -1313,60 +2025,94 @@ class AzrilAuthRepository(
             }
 
             // 2. Fallback path when Edge Function is not yet deployed: secure DB RPC `resolve_admin_login_email`
-            val resolvedEmail = when (val lookup = resolveAdminEmailFromSupabase(base, username)) {
-                is AdminEmailLookupResult.Found -> lookup.email
-                AdminEmailLookupResult.NotProvisionedOrMissing ->
-                    return SupabaseAdminLoginOutcome.BackendNotProvisioned
+            //    or direct Admin email / deterministic internal admin emails, always strictly verified against profiles.role == 'admin'.
+            val candidateAdminEmails = linkedSetOf<String>()
+            var resolvedByAdminRpc = false
+            val isDirectEmailInput = username.contains("@")
+            when (val lookup = resolveAdminEmailFromSupabase(base, username)) {
+                is AdminEmailLookupResult.Found -> {
+                    candidateAdminEmails.add(lookup.email.lowercase(Locale.US))
+                    resolvedByAdminRpc = true
+                }
+                AdminEmailLookupResult.NotProvisionedOrMissing -> {
+                    if (isDirectEmailInput) {
+                        candidateAdminEmails.add(username.trim().lowercase(Locale.US))
+                    } else {
+                        candidateAdminEmails.add(internalAuthEmailForAdmin(username))
+                        if (username.equals(PRIMARY_ADMIN_USERNAME, ignoreCase = true)) {
+                            candidateAdminEmails.add(PRIMARY_ADMIN_EMAIL.lowercase(Locale.US))
+                        }
+                    }
+                }
                 is AdminEmailLookupResult.Error ->
                     return SupabaseAdminLoginOutcome.Rejected(AuthResult.Failure(lookup.message))
             }
 
-            val authPayload = JSONObject().apply {
-                put("email", resolvedEmail)
-                put("password", password)
+            for (candidateEmail in candidateAdminEmails) {
+                val authPayload = JSONObject().apply {
+                    put("email", candidateEmail)
+                    put("password", password)
+                }
+                val authReq = Request.Builder()
+                    .url("$base/auth/v1/token?grant_type=password")
+                    .post(authPayload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .addHeader("apikey", supabaseAnonKey.trim())
+                    .addHeader("Content-Type", "application/json")
+                    .build()
+
+                httpClient.newCall(authReq).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        if (resolvedByAdminRpc || isDirectEmailInput) {
+                            return SupabaseAdminLoginOutcome.Rejected(
+                                AuthResult.Failure("Email/username atau password administrator Supabase tidak valid.")
+                            )
+                        }
+                        return@use
+                    }
+                    val json = JSONObject(body)
+                    val accessToken = json.optString("access_token")
+                    val refreshToken = json.optString("refresh_token").ifBlank { null }
+                    val userId = json.optJSONObject("user")?.optString("id").orEmpty()
+                    if (accessToken.isBlank() || userId.isBlank()) {
+                        return SupabaseAdminLoginOutcome.Rejected(
+                            AuthResult.Failure("Token sesi administrator tidak valid.")
+                        )
+                    }
+
+                    // Mandatory backend verification via verify_admin_session() (when deployed) + profiles.role == 'admin'
+                    val verifyResult = verifyAdminSessionWithSupabaseDetailed(accessToken)
+                    val profile = fetchSupabaseProfile(base, accessToken, userId, candidateEmail)
+                    val backendOk = verifyResult == true || (verifyResult == null && profile?.role == UserRole.ADMIN)
+                    if (!backendOk || profile == null || profile.role != UserRole.ADMIN || profile.status != AccountStatus.ACTIVE) {
+                        return SupabaseAdminLoginOutcome.Rejected(
+                            AuthResult.Failure("Akses ditolak: akun ini tidak terverifikasi sebagai Administrator (pastikan profiles.role = 'admin' di Supabase).")
+                        )
+                    }
+
+                    val expiresInSec = json.optLong("expires_in", 3600L)
+                    val expiresAt = if (refreshToken != null) {
+                        nowMillis + ADMIN_SESSION_DURATION_MS
+                    } else {
+                        minOf(nowMillis + expiresInSec * 1000L, nowMillis + ADMIN_SESSION_DURATION_MS)
+                    }
+                    persistSessionState(
+                        profile = profile,
+                        token = accessToken,
+                        identifier = username,
+                        rememberMe = rememberMe,
+                        expiresAtMillis = expiresAt,
+                        refreshToken = refreshToken
+                    )
+                    return SupabaseAdminLoginOutcome.Authenticated(
+                        AuthResult.Success(profile = profile, usingSupabase = true, sessionExpiresAt = expiresAt)
+                    )
+                }
             }
-            val authReq = Request.Builder()
-                .url("$base/auth/v1/token?grant_type=password")
-                .post(authPayload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                .addHeader("apikey", supabaseAnonKey.trim())
-                .addHeader("Content-Type", "application/json")
-                .build()
-
-            httpClient.newCall(authReq).execute().use { response ->
-                val body = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    return SupabaseAdminLoginOutcome.Rejected(
-                        AuthResult.Failure("Username atau password administrator tidak valid.")
-                    )
-                }
-                val json = JSONObject(body)
-                val accessToken = json.optString("access_token")
-                val userId = json.optJSONObject("user")?.optString("id").orEmpty()
-                if (accessToken.isBlank() || userId.isBlank()) {
-                    return SupabaseAdminLoginOutcome.Rejected(
-                        AuthResult.Failure("Token sesi administrator tidak valid.")
-                    )
-                }
-
-                // Mandatory backend verification via verify_admin_session() + profiles.role == 'admin'
-                val backendVerified = verifyAdminSessionWithSupabase(accessToken)
-                val profile = fetchSupabaseProfile(base, accessToken, userId, resolvedEmail)
-                if (!backendVerified || profile == null || profile.role != UserRole.ADMIN || profile.status != AccountStatus.ACTIVE) {
-                    return SupabaseAdminLoginOutcome.Rejected(
-                        AuthResult.Failure("Akses ditolak: akun ini tidak terverifikasi sebagai Administrator.")
-                    )
-                }
-
-                val expiresInSec = json.optLong("expires_in", 3600L)
-                val expiresAt = minOf(nowMillis + expiresInSec * 1000L, nowMillis + ADMIN_SESSION_DURATION_MS)
-                persistSessionState(profile, accessToken, username, rememberMe, expiresAt)
-                SupabaseAdminLoginOutcome.Authenticated(
-                    AuthResult.Success(profile = profile, usingSupabase = true, sessionExpiresAt = expiresAt)
-                )
-            }
+            SupabaseAdminLoginOutcome.BackendNotProvisioned
         } catch (e: Exception) {
             SupabaseAdminLoginOutcome.Rejected(
-                AuthResult.Failure("Gagal terhubung ke Supabase Auth: ${e.localizedMessage ?: "kesalahan jaringan"}")
+                AuthResult.Failure(SupabaseNetworkClient.formatConnectionError(e, supabaseUrl))
             )
         }
     }
@@ -1396,7 +2142,7 @@ class AzrilAuthRepository(
         }
     }
 
-    suspend fun verifyAdminSessionWithSupabase(jwt: String): Boolean = withContext(Dispatchers.IO) {
+    private suspend fun verifyAdminSessionWithSupabaseDetailed(jwt: String): Boolean? = withContext(Dispatchers.IO) {
         if (!isSupabaseConfigured() || jwt.isBlank()) return@withContext false
         runCatching {
             val base = supabaseUrl.trimEnd('/')
@@ -1408,10 +2154,20 @@ class AzrilAuthRepository(
                 .addHeader("Content-Type", "application/json")
                 .build()
             httpClient.newCall(req).execute().use { resp ->
+                if (resp.code == 404) return@use null // RPC not deployed yet
                 if (!resp.isSuccessful) return@use false
                 resp.body?.string()?.trim().equals("true", ignoreCase = true)
             }
         }.getOrDefault(false)
+    }
+
+    suspend fun verifyAdminSessionWithSupabase(jwt: String): Boolean =
+        verifyAdminSessionWithSupabaseDetailed(jwt) == true
+
+    private sealed interface StudentEmailLookupResult {
+        data class Found(val email: String) : StudentEmailLookupResult
+        data object NotFound : StudentEmailLookupResult
+        data class Rejected(val message: String) : StudentEmailLookupResult
     }
 
     private suspend fun loginViaSupabase(
@@ -1422,53 +2178,109 @@ class AzrilAuthRepository(
     ): AuthResult {
         return try {
             val base = supabaseUrl.trimEnd('/')
-            val resolvedEmail = if (identifier.contains("@")) {
-                identifier.lowercase(Locale.US)
+            val cleanId = identifier.trim()
+            val candidateEmails = linkedSetOf<String>()
+            var resolvedByRpc = false
+
+            if (cleanId.contains("@")) {
+                candidateEmails.add(cleanId.lowercase(Locale.US))
+                resolvedByRpc = true
             } else {
-                resolveEmailFromSupabaseIdentifier(base, identifier)
-                    ?: return AuthResult.Failure("NIM atau akun tidak ditemukan di database.")
+                when (val lookup = resolveEmailFromSupabaseIdentifier(base, cleanId)) {
+                    is StudentEmailLookupResult.Found -> {
+                        candidateEmails.add(lookup.email.lowercase(Locale.US))
+                        resolvedByRpc = true
+                    }
+                    is StudentEmailLookupResult.Rejected -> {
+                        return AuthResult.Failure(lookup.message)
+                    }
+                    StudentEmailLookupResult.NotFound -> Unit
+                }
+                // Deterministic fallback emails so login still succeeds even when
+                // resolve_login_email RPC is not yet deployed or only 001 migration was applied.
+                val safeNim = cleanId.lowercase(Locale.US)
+                    .filter { it.isLetterOrDigit() || it == '.' || it == '-' || it == '_' }
+                if (safeNim.isNotEmpty()) {
+                    candidateEmails.add(internalAuthEmailForNim(cleanId))
+                    candidateEmails.add("${safeNim}@mahasiswa.azrilclas.ac.id")
+                }
             }
 
-            val payload = JSONObject().apply {
-                put("email", resolvedEmail)
-                put("password", password)
+            if (candidateEmails.isEmpty()) {
+                return AuthResult.Failure("NIM atau akun tidak ditemukan di database.")
             }
-            val request = Request.Builder()
-                .url("$base/auth/v1/token?grant_type=password")
-                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                .addHeader("apikey", supabaseAnonKey.trim())
-                .addHeader("Content-Type", "application/json")
-                .build()
 
-            httpClient.newCall(request).execute().use { response ->
-                val body = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    return AuthResult.Failure("NIM atau kata sandi tidak sesuai.")
+            var sawEmailNotConfirmed = false
+            for (candidateEmail in candidateEmails) {
+                val payload = JSONObject().apply {
+                    put("email", candidateEmail)
+                    put("password", password)
                 }
-                val json = JSONObject(body)
-                val accessToken = json.optString("access_token")
-                val userObj = json.optJSONObject("user")
-                val userId = userObj?.optString("id").orEmpty()
-                val profile = fetchSupabaseProfile(base, accessToken, userId, resolvedEmail)
-                    ?: return AuthResult.Failure("Profil akun tidak ditemukan di tabel profiles.")
+                val request = Request.Builder()
+                    .url("$base/auth/v1/token?grant_type=password")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .addHeader("apikey", supabaseAnonKey.trim())
+                    .addHeader("Content-Type", "application/json")
+                    .build()
 
-                if (profile.role == UserRole.ADMIN) {
-                    return AuthResult.Failure("Akun Administrator harus masuk melalui halaman Login Admin.")
-                }
-                if (profile.status == AccountStatus.INACTIVE) {
-                    return AuthResult.Failure("Akun mahasiswa ini sedang dinonaktifkan oleh Admin.")
-                }
+                httpClient.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        val lower = body.lowercase(Locale.US)
+                        if (lower.contains("email not confirmed") || lower.contains("email_not_confirmed")) {
+                            sawEmailNotConfirmed = true
+                        }
+                        return@use
+                    }
+                    val json = JSONObject(body)
+                    val accessToken = json.optString("access_token")
+                    val refreshToken = json.optString("refresh_token").ifBlank { null }
+                    val userObj = json.optJSONObject("user")
+                    val userId = userObj?.optString("id").orEmpty()
+                    if (accessToken.isBlank() || userId.isBlank()) return@use
 
-                val expiresAt = nowMillis + REMEMBER_SESSION_DURATION_MS
-                persistSessionState(profile, accessToken, identifier, rememberMe, expiresAt)
-                AuthResult.Success(profile = profile, usingSupabase = true, sessionExpiresAt = expiresAt)
+                    val profile = fetchSupabaseProfile(
+                        baseUrl = base,
+                        jwt = accessToken,
+                        userId = userId,
+                        fallbackEmail = candidateEmail,
+                        fallbackIdentifier = cleanId,
+                        userMetadata = userObj?.optJSONObject("user_metadata")
+                    ) ?: return AuthResult.Failure("Profil akun tidak ditemukan di tabel profiles.")
+
+                    if (profile.role == UserRole.ADMIN) {
+                        return AuthResult.Failure("Akun Administrator harus masuk melalui halaman Login Admin.")
+                    }
+                    if (profile.status == AccountStatus.INACTIVE) {
+                        return AuthResult.Failure("Akun mahasiswa ini sedang dinonaktifkan oleh Admin.")
+                    }
+
+                    val expiresAt = nowMillis + REMEMBER_SESSION_DURATION_MS
+                    persistSessionState(
+                        profile = profile,
+                        token = accessToken,
+                        identifier = cleanId,
+                        rememberMe = rememberMe,
+                        expiresAtMillis = expiresAt,
+                        refreshToken = refreshToken
+                    )
+                    return AuthResult.Success(profile = profile, usingSupabase = true, sessionExpiresAt = expiresAt)
+                }
+            }
+
+            when {
+                sawEmailNotConfirmed -> AuthResult.Failure(
+                    "Akun sudah terdaftar di Supabase tetapi email belum dikonfirmasi. Nonaktifkan 'Confirm email' di Supabase Auth Settings atau gunakan Edge Function import."
+                )
+                resolvedByRpc -> AuthResult.Failure("NIM atau kata sandi tidak sesuai.")
+                else -> AuthResult.Failure("NIM atau akun tidak ditemukan di database.")
             }
         } catch (e: Exception) {
-            AuthResult.Failure("Gagal terhubung ke Supabase Auth: ${e.localizedMessage ?: "kesalahan jaringan"}")
+            AuthResult.Failure(SupabaseNetworkClient.formatConnectionError(e, supabaseUrl))
         }
     }
 
-    private fun resolveEmailFromSupabaseIdentifier(baseUrl: String, identifier: String): String? {
+    private fun resolveEmailFromSupabaseIdentifier(baseUrl: String, identifier: String): StudentEmailLookupResult {
         val body = JSONObject().apply { put("p_identifier", identifier) }
         val req = Request.Builder()
             .url("$baseUrl/rest/v1/rpc/resolve_login_email")
@@ -1477,51 +2289,113 @@ class AzrilAuthRepository(
             .addHeader("Content-Type", "application/json")
             .build()
         return httpClient.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            resp.body?.string()?.trim()?.removeSurrounding("\"")?.takeIf { it.contains("@") }
+            val raw = resp.body?.string()?.trim().orEmpty()
+            if (!resp.isSuccessful) {
+                val lower = raw.lowercase(Locale.US)
+                if (lower.contains("administrator") || lower.contains("dinonaktifkan")) {
+                    val msg = runCatching { JSONObject(raw).optString("message") }.getOrNull().orEmpty()
+                    if (msg.isNotBlank()) return@use StudentEmailLookupResult.Rejected(msg)
+                }
+                return@use StudentEmailLookupResult.NotFound
+            }
+            val email = raw.removeSurrounding("\"")
+            if (email.contains("@")) StudentEmailLookupResult.Found(email) else StudentEmailLookupResult.NotFound
         }
     }
 
-    private fun fetchSupabaseProfile(baseUrl: String, jwt: String, userId: String, fallbackEmail: String): UserProfile? {
-        val req = Request.Builder()
-            .url("$baseUrl/rest/v1/profiles?id=eq.$userId&select=id,full_name,nim,email,username,study_program_id,class_id,semester,cohort_year,account_status,student_badge_status,must_change_password,role,created_at,study_programs(code,name)")
-            .get()
-            .addHeader("apikey", supabaseAnonKey.trim())
-            .addHeader("Authorization", "Bearer $jwt")
-            .build()
-        return httpClient.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val arr = JSONArray(resp.body?.string().orEmpty())
-            if (arr.length() == 0) return null
-            val row = arr.getJSONObject(0)
-            val prodiObj = row.optJSONObject("study_programs")
-            val roleStr = row.optString("role", "student")
-            val prodiCode = prodiObj?.optString("code")?.ifBlank { null } ?: prodiObj?.optString("name")
-            val statusStr = row.optString("account_status", "active").lowercase(Locale.US)
-            val status = when (statusStr) {
-                "inactive" -> AccountStatus.INACTIVE
-                "pending_activation" -> AccountStatus.PENDING_ACTIVATION
-                else -> AccountStatus.ACTIVE
+    private fun fetchSupabaseProfile(
+        baseUrl: String,
+        jwt: String,
+        userId: String,
+        fallbackEmail: String,
+        fallbackIdentifier: String = "",
+        userMetadata: JSONObject? = null
+    ): UserProfile? {
+        val selectUrls = listOf(
+            "$baseUrl/rest/v1/profiles?id=eq.$userId&select=*,study_programs(id,code,name),classes(id,name)",
+            "$baseUrl/rest/v1/profiles?id=eq.$userId&select=*,study_programs(code,name)",
+            "$baseUrl/rest/v1/profiles?id=eq.$userId&select=*"
+        )
+        for (url in selectUrls) {
+            val req = Request.Builder()
+                .url(url)
+                .get()
+                .addHeader("apikey", supabaseAnonKey.trim())
+                .addHeader("Authorization", "Bearer $jwt")
+                .build()
+            val parsed = runCatching {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val arr = JSONArray(resp.body?.string().orEmpty())
+                    if (arr.length() == 0) return@use null
+                    val row = arr.getJSONObject(0)
+                    val prodiObj = row.optJSONObject("study_programs")
+                    val classObj = row.optJSONObject("classes")
+                    val roleStr = row.optString("role", "student")
+                    val prodiCode = prodiObj?.optString("code")?.ifBlank { null }
+                        ?: prodiObj?.optString("name")?.ifBlank { null }
+                        ?: OfficialStudyPrograms.findById(row.optString("study_program_id"))?.code
+                        ?: userMetadata?.optString("study_program_code")?.ifBlank { null }
+                    val statusStr = row.optString("account_status", "active").lowercase(Locale.US)
+                    val status = when (statusStr) {
+                        "inactive" -> AccountStatus.INACTIVE
+                        "pending_activation" -> AccountStatus.PENDING_ACTIVATION
+                        else -> AccountStatus.ACTIVE
+                    }
+                    val joinedClassName = classObj?.optString("name")?.trim()?.ifBlank { null }
+                    UserProfile(
+                        id = row.optString("id", userId),
+                        fullName = row.optString("full_name", userMetadata?.optString("full_name") ?: "Mahasiswa"),
+                        email = row.optString("email", fallbackEmail),
+                        username = row.optString("username").ifBlank { null },
+                        role = if (roleStr.equals("admin", ignoreCase = true)) UserRole.ADMIN else UserRole.STUDENT,
+                        nim = row.optString("nim").ifBlank { userMetadata?.optString("nim")?.ifBlank { null } },
+                        studyProgramId = row.optString("study_program_id").ifBlank { null },
+                        studyProgramName = prodiCode,
+                        classId = row.optString("class_id").ifBlank { null },
+                        className = joinedClassName
+                            ?: row.optString("class_name").ifBlank {
+                                userMetadata?.optString("class_name")?.ifBlank { null }
+                                    ?: row.optString("class_id").ifBlank { "Terhubung ke Supabase" }
+                            },
+                        semester = row.optInt("semester", userMetadata?.optInt("semester", 1) ?: 1),
+                        cohortYear = row.optInt("cohort_year", userMetadata?.optInt("cohort_year", 2025) ?: 2025),
+                        status = status,
+                        badgeStatus = StudentBadgeStatus.fromDbValue(row.optString("student_badge_status", "neutral")),
+                        mustChangePassword = row.optBoolean("must_change_password", false),
+                        createdAt = row.optString("created_at").ifBlank { null }
+                    )
+                }
+            }.getOrNull()
+            if (parsed != null) return parsed
+        }
+
+        // Graceful fallback strictly as STUDENT from Supabase Auth user_metadata when profiles row is not yet synced
+        if (userMetadata != null) {
+            val nim = userMetadata.optString("nim").ifBlank {
+                fallbackIdentifier.takeIf { it.isNotBlank() && !it.contains("@") }
             }
-            UserProfile(
-                id = row.optString("id", userId),
-                fullName = row.optString("full_name", "Mahasiswa"),
-                email = row.optString("email", fallbackEmail),
-                username = row.optString("username").ifBlank { null },
-                role = if (roleStr.equals("admin", ignoreCase = true)) UserRole.ADMIN else UserRole.STUDENT,
-                nim = row.optString("nim").ifBlank { null },
-                studyProgramId = row.optString("study_program_id").ifBlank { null },
-                studyProgramName = prodiCode,
-                classId = row.optString("class_id").ifBlank { null },
-                className = row.optString("class_id").ifBlank { "Terhubung ke Supabase" },
-                semester = row.optInt("semester", 1),
-                cohortYear = row.optInt("cohort_year", 2026),
-                status = status,
-                badgeStatus = StudentBadgeStatus.fromDbValue(row.optString("student_badge_status", "neutral")),
-                mustChangePassword = row.optBoolean("must_change_password", false),
-                createdAt = row.optString("created_at").ifBlank { null }
+            val prodiCode = userMetadata.optString("study_program_code").ifBlank { null }
+            val matchedProdi = prodiCode?.let { OfficialStudyPrograms.findByCode(it) }
+            return UserProfile(
+                id = userId,
+                fullName = userMetadata.optString("full_name").ifBlank { nim ?: "Mahasiswa" },
+                email = fallbackEmail,
+                username = userMetadata.optString("username").ifBlank { nim },
+                role = UserRole.STUDENT,
+                nim = nim,
+                studyProgramId = matchedProdi?.id ?: userMetadata.optString("study_program_id").ifBlank { null },
+                studyProgramName = matchedProdi?.code ?: prodiCode,
+                classId = userMetadata.optString("class_id").ifBlank { null },
+                className = userMetadata.optString("class_name").ifBlank { "Terhubung ke Supabase" },
+                semester = userMetadata.optInt("semester", 1),
+                cohortYear = userMetadata.optInt("cohort_year", 2025),
+                status = AccountStatus.ACTIVE,
+                badgeStatus = StudentBadgeStatus.NEUTRAL,
+                mustChangePassword = userMetadata.optBoolean("must_change_password", false)
             )
         }
+        return null
     }
 
     private suspend fun loadLocalAccounts(): List<StoredAccountRecord> {

@@ -4,6 +4,7 @@ import com.example.BuildConfig
 import com.example.data.assignments.AssignmentSyncService
 import com.example.data.auth.AuthKeyValueStore
 import com.example.data.gamification.XpAndStreakEngine
+import com.example.data.network.SupabaseNetworkClient
 import com.example.ui.model.AcademicClass
 import com.example.ui.model.AccountStatus
 import com.example.ui.model.Assignment
@@ -138,10 +139,12 @@ sealed interface ExportBuildResult {
  */
 class AzrilDataExportService(
     private val store: AuthKeyValueStore,
-    private val supabaseUrl: String = BuildConfig.SUPABASE_URL,
+    supabaseUrl: String = BuildConfig.SUPABASE_URL,
     private val supabaseAnonKey: String = BuildConfig.SUPABASE_ANON_KEY,
-    private val httpClient: OkHttpClient = OkHttpClient()
+    private val httpClient: OkHttpClient = SupabaseNetworkClient.defaultHttpClient,
+    private val activeTokenProvider: (suspend () -> String?)? = null
 ) {
+    private val supabaseUrl: String = SupabaseNetworkClient.normalizeBaseUrl(supabaseUrl)
     companion object {
         private const val KEY_SESSION_TOKEN = "session_token"
         private const val PAGE_SIZE = 1000
@@ -240,16 +243,14 @@ class AzrilDataExportService(
             SimpleDateFormat("HH:mm 'WIB'", ID_LOCALE).apply { timeZone = WIB_TZ }.format(Date(millis))
     }
 
-    fun isSupabaseConfigured(): Boolean {
-        val cleanUrl = supabaseUrl.trim()
-        val cleanKey = supabaseAnonKey.trim()
-        return cleanUrl.startsWith("https://") &&
-            !cleanUrl.contains("YOUR_PROJECT_REF") &&
-            cleanKey.length > 20 &&
-            !cleanKey.contains("YOUR_SUPABASE_ANON_KEY")
-    }
+    fun isSupabaseConfigured(): Boolean =
+        SupabaseNetworkClient.isConfigured(supabaseUrl, supabaseAnonKey)
 
     private suspend fun activeSupabaseJwt(): String? {
+        val provided = activeTokenProvider?.invoke()
+        if (!provided.isNullOrBlank() && !provided.startsWith("azr_sess_") && !provided.startsWith("azr_admin_sess_")) {
+            return provided
+        }
         val jwt = store.getString(KEY_SESSION_TOKEN) ?: return null
         if (jwt.isBlank() || jwt.startsWith("azr_sess_") || jwt.startsWith("azr_admin_sess_")) return null
         return jwt
