@@ -1,8 +1,10 @@
 package com.example.ui.screens.admin
 
+import android.content.ActivityNotFoundException
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -58,8 +61,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -67,6 +74,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.importer.ExcelStudentImportParser
 import com.example.ui.components.AzrilCard
@@ -604,6 +612,7 @@ fun AdminStudentsScreen(
     isExpanded: Boolean
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var query by rememberSaveable { mutableStateOf("") }
     var selectedProdiFilter by rememberSaveable { mutableStateOf("ALL") }
     var selectedClassFilter by rememberSaveable { mutableStateOf("ALL") }
@@ -611,8 +620,8 @@ fun AdminStudentsScreen(
     var selectedBadgeFilter by rememberSaveable { mutableStateOf("ALL") }
     var currentPage by rememberSaveable { mutableIntStateOf(1) }
     var showAddDialog by rememberSaveable { mutableStateOf(false) }
-    var showExcelDialog by rememberSaveable { mutableStateOf(false) }
     var showCsvDialog by rememberSaveable { mutableStateOf(false) }
+    var showConnectSupabaseDialog by rememberSaveable { mutableStateOf(false) }
     var editingStudent by remember { mutableStateOf<StudentRecord?>(null) }
     var resettingPasswordStudent by remember { mutableStateOf<StudentRecord?>(null) }
     var deletingStudent by remember { mutableStateOf<StudentRecord?>(null) }
@@ -632,6 +641,73 @@ fun AdminStudentsScreen(
         }
         val matchesBadge = selectedBadgeFilter == "ALL" || stu.badgeStatus.name == selectedBadgeFilter
         matchesQuery && matchesProdi && matchesClass && matchesAccount && matchesBadge
+    }
+
+    // Hoisted SAF launchers registered unconditionally at screen level (never inside conditional AlertDialog)
+    val openXlsxDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.startExcelFileParseFromUri(context, uri)
+        }
+    }
+
+    val fallbackGetContentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.startExcelFileParseFromUri(context, uri)
+        }
+    }
+
+    val saveExcelTemplateLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                runCatching {
+                    val templateBytes = ExcelStudentImportParser.buildBlankTemplateXlsx()
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(templateBytes)
+                        out.flush()
+                    } ?: error("Gagal membuka lokasi penyimpanan.")
+                }
+            }
+            saved.onSuccess {
+                viewModel.showToast("Template Excel (.xlsx) berhasil disimpan (sheet PJKR-3B, FARMASI-3, HES-3B).", ToastType.SUCCESS)
+            }.onFailure {
+                viewModel.showToast("Gagal menyimpan template Excel: ${it.message ?: "kesalahan penyimpanan"}.", ToastType.ERROR)
+            }
+        }
+    }
+
+    fun launchSafeExcelFilePicker() {
+        try {
+            openXlsxDocumentLauncher.launch(
+                arrayOf(
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "application/octet-stream",
+                    "*/*"
+                )
+            )
+        } catch (_: ActivityNotFoundException) {
+            try {
+                fallbackGetContentLauncher.launch("*/*")
+            } catch (_: Throwable) {
+                viewModel.reportExcelPickerError(
+                    "Tidak ditemukan aplikasi pemilih file (File Manager) di perangkat Android ini."
+                )
+            }
+        } catch (_: Throwable) {
+            try {
+                fallbackGetContentLauncher.launch("*/*")
+            } catch (t2: Throwable) {
+                viewModel.reportExcelPickerError(
+                    "Gagal membuka pemilih file Android: ${t2.message ?: "kesalahan sistem"}."
+                )
+            }
+        }
     }
 
     val exportCsvLauncher = rememberLauncherForActivityResult(
@@ -677,68 +753,167 @@ fun AdminStudentsScreen(
     ) {
         AzrilPageHeader(
             title = "Data Mahasiswa",
-            subtitle = "Import Excel (.xlsx) multi-sheet, pembuatan akun massal berbasis NIM, filter warna AFK/Blok Hitam, reset password, dan ekspor data.",
+            subtitle = "Kelola akun mahasiswa berbasis NIM, impor Excel (.xlsx) multi-sheet, filter AFK, reset password, dan ekspor data.",
             action = {
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = { showExcelDialog = true },
-                        shape = RoundedCornerShape(999.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = LimePrimary, contentColor = InkText),
-                        modifier = Modifier.testTag("open_excel_import_button")
-                    ) {
-                        Icon(Icons.Rounded.TableChart, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Import Excel", fontWeight = FontWeight.Bold)
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            if (filtered.isEmpty()) {
-                                viewModel.showToast("Belum ada data mahasiswa untuk diekspor.", ToastType.INFO)
-                            } else {
-                                exportCsvLauncher.launch("Data_Mahasiswa_AzrilClas.csv")
-                            }
-                        },
-                        shape = RoundedCornerShape(999.dp),
-                        modifier = Modifier.testTag("export_students_csv_button")
-                    ) {
-                        Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Ekspor")
-                    }
-                    if (uiState.isSupabaseConfigured) {
+                if (isExpanded) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { viewModel.openExcelImportDialog() },
+                            shape = RoundedCornerShape(999.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = LimePrimary, contentColor = InkText),
+                            modifier = Modifier.testTag("open_excel_import_button")
+                        ) {
+                            Icon(Icons.Rounded.TableChart, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Import Excel", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
                         OutlinedButton(
-                            onClick = { viewModel.refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true) },
+                            onClick = {
+                                if (filtered.isEmpty()) {
+                                    viewModel.showToast("Belum ada data mahasiswa untuk diekspor.", ToastType.INFO)
+                                } else {
+                                    exportCsvLauncher.launch("Data_Mahasiswa_AzrilClas.csv")
+                                }
+                            },
+                            shape = RoundedCornerShape(999.dp),
+                            modifier = Modifier.testTag("export_students_csv_button")
+                        ) {
+                            Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Ekspor", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        if (uiState.isSupabaseConfigured) {
+                            OutlinedButton(
+                                onClick = { viewModel.refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true) },
+                                enabled = !uiState.isSyncingStudents,
+                                shape = RoundedCornerShape(999.dp),
+                                modifier = Modifier.testTag("refresh_students_supabase_button")
+                            ) {
+                                Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(if (uiState.isSyncingStudents) "Memuat..." else "Muat Ulang", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (uiState.students.isNotEmpty()) {
+                                OutlinedButton(
+                                    onClick = { viewModel.syncAllStudentsToSupabase() },
+                                    enabled = !uiState.isSyncingStudents,
+                                    shape = RoundedCornerShape(999.dp),
+                                    modifier = Modifier.testTag("sync_students_supabase_button")
+                                ) {
+                                    Icon(Icons.Rounded.CloudSync, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(if (uiState.isSyncingStudents) "Menyinkronkan..." else "Sinkron Supabase", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        }
+                        Button(
+                            onClick = { showAddDialog = true },
                             enabled = !uiState.isSyncingStudents,
                             shape = RoundedCornerShape(999.dp),
-                            modifier = Modifier.testTag("refresh_students_supabase_button")
+                            colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
+                            modifier = Modifier.testTag("add_student_button")
                         ) {
-                            Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text(if (uiState.isSyncingStudents) "Memuat..." else "Muat Ulang")
+                            Text("Tambah", maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
-                        if (uiState.students.isNotEmpty()) {
+                    }
+                } else {
+                    // Compact mobile layout: balanced 2-column pill button grid with zero horizontal overflow
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = { viewModel.openExcelImportDialog() },
+                                shape = RoundedCornerShape(999.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = LimePrimary, contentColor = InkText),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("open_excel_import_button")
+                            ) {
+                                Icon(Icons.Rounded.TableChart, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Import Excel", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            Button(
+                                onClick = { showAddDialog = true },
+                                enabled = !uiState.isSyncingStudents,
+                                shape = RoundedCornerShape(999.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("add_student_button")
+                            ) {
+                                Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Tambah", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    if (filtered.isEmpty()) {
+                                        viewModel.showToast("Belum ada data mahasiswa untuk diekspor.", ToastType.INFO)
+                                    } else {
+                                        exportCsvLauncher.launch("Data_Mahasiswa_AzrilClas.csv")
+                                    }
+                                },
+                                shape = RoundedCornerShape(999.dp),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("export_students_csv_button")
+                            ) {
+                                Icon(Icons.Rounded.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Ekspor", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (uiState.isSupabaseConfigured) {
+                                OutlinedButton(
+                                    onClick = { viewModel.refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true) },
+                                    enabled = !uiState.isSyncingStudents,
+                                    shape = RoundedCornerShape(999.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("refresh_students_supabase_button")
+                                ) {
+                                    Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(if (uiState.isSyncingStudents) "Memuat..." else "Muat Ulang", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        }
+                        if (uiState.isSupabaseConfigured && uiState.students.isNotEmpty()) {
                             OutlinedButton(
                                 onClick = { viewModel.syncAllStudentsToSupabase() },
                                 enabled = !uiState.isSyncingStudents,
                                 shape = RoundedCornerShape(999.dp),
-                                modifier = Modifier.testTag("sync_students_supabase_button")
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 46.dp)
+                                    .testTag("sync_students_supabase_button")
                             ) {
                                 Icon(Icons.Rounded.CloudSync, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text(if (uiState.isSyncingStudents) "Menyinkronkan..." else "Sinkron Supabase")
+                                Text(if (uiState.isSyncingStudents) "Menyinkronkan..." else "Sinkron Supabase", maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                         }
-                    }
-                    Button(
-                        onClick = { showAddDialog = true },
-                        enabled = !uiState.isSyncingStudents,
-                        shape = RoundedCornerShape(999.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
-                        modifier = Modifier.testTag("add_student_button")
-                    ) {
-                        Icon(Icons.Rounded.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Tambah")
                     }
                 }
             }
@@ -752,39 +927,20 @@ fun AdminStudentsScreen(
             )
         }
 
-        if (uiState.isSupabaseConfigured && !uiState.studentsSyncError.isNullOrBlank()) {
-            Surface(
-                modifier = Modifier.fillMaxWidth().testTag("students_sync_error_banner"),
-                shape = RoundedCornerShape(20.dp),
-                color = Rose50,
-                border = BorderStroke(1.dp, Rose600.copy(alpha = 0.35f))
-            ) {
-                Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Icon(Icons.Rounded.Warning, contentDescription = "Kendala sinkronisasi Supabase", tint = Rose700)
-                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(
-                            text = "Sinkronisasi Database Supabase",
-                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                            color = Rose700
-                        )
-                        Text(
-                            text = uiState.studentsSyncError,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Rose700
-                        )
-                    }
-                    TextButton(
-                        onClick = { viewModel.refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true) },
-                        enabled = !uiState.isSyncingStudents
-                    ) {
-                        Text("Coba Lagi", color = Rose700, fontWeight = FontWeight.Bold)
-                    }
+        val shouldShowSupabaseBanner = uiState.isSupabaseConfigured &&
+            (!uiState.hasLiveSupabaseSession || !uiState.studentsSyncError.isNullOrBlank())
+        if (shouldShowSupabaseBanner) {
+            AdminSupabaseSyncStatusBanner(
+                errorMessage = uiState.studentsSyncError
+                    ?: "Sesi Admin belum terhubung ke Supabase Auth. Hubungkan akun Admin Supabase sekarang agar seluruh data mahasiswa langsung tersinkronisasi.",
+                hasLiveSession = uiState.hasLiveSupabaseSession,
+                isSyncing = uiState.isSyncingStudents,
+                onRetrySync = { viewModel.refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true) },
+                onOpenConnectDialog = {
+                    viewModel.clearAdminSupabaseConnectError()
+                    showConnectSupabaseDialog = true
                 }
-            }
+            )
         }
 
         // 6 Required Statistics Cards
@@ -825,16 +981,16 @@ fun AdminStudentsScreen(
             }
         }
 
-        // Student Count per Class Summary (clickable filter)
+        // Student Count per Class Summary (clickable filter, horizontal scroll on mobile)
         if (uiState.classes.isNotEmpty()) {
             AzrilCard {
                 Text("Jumlah Mahasiswa per Kelas", style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold), color = InkText)
                 Spacer(modifier = Modifier.height(8.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val classChipsContent: @Composable () -> Unit = {
                     FilterChip(
                         selected = selectedClassFilter == "ALL",
                         onClick = { selectedClassFilter = "ALL"; currentPage = 1 },
-                        label = { Text("Semua Kelas ($totalStudents)") },
+                        label = { Text("Semua Kelas ($totalStudents)", maxLines = 1) },
                         shape = RoundedCornerShape(999.dp)
                     )
                     uiState.classes.forEach { cls ->
@@ -848,71 +1004,102 @@ fun AdminStudentsScreen(
                             },
                             label = {
                                 Text(
-                                    if (afkInClass > 0) "${cls.name}: $countInClass ($afkInClass AFK)"
-                                    else "${cls.name}: $countInClass"
+                                    text = if (afkInClass > 0) "${cls.name}: $countInClass ($afkInClass AFK)"
+                                    else "${cls.name}: $countInClass",
+                                    maxLines = 1
                                 )
                             },
                             shape = RoundedCornerShape(999.dp)
                         )
                     }
                 }
+                if (isExpanded) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        classChipsContent()
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        classChipsContent()
+                    }
+                }
             }
         }
 
-        // Search & Filters
+        // Search & Filters (horizontal scroll strips on compact mobile to avoid vertical bloat)
         AzrilCard {
             AzrilSearchField(
                 value = query,
                 onValueChange = { query = it; currentPage = 1 },
-                placeholder = "Cari berdasarkan nama lengkap, NIM, atau email...",
+                placeholder = "Cari nama lengkap, NIM, atau email...",
                 modifier = Modifier.fillMaxWidth()
             )
             if (uiState.studyPrograms.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(10.dp))
                 Text("Program Studi", style = MaterialTheme.typography.labelMedium, color = InkMuted)
                 Spacer(modifier = Modifier.height(4.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val prodiChipsContent: @Composable () -> Unit = {
                     FilterChip(
                         selected = selectedProdiFilter == "ALL",
                         onClick = { selectedProdiFilter = "ALL"; currentPage = 1 },
-                        label = { Text("Semua Prodi") },
+                        label = { Text("Semua Prodi", maxLines = 1) },
                         shape = RoundedCornerShape(999.dp)
                     )
                     uiState.studyPrograms.forEach { prodi ->
                         FilterChip(
                             selected = selectedProdiFilter == prodi.id,
                             onClick = { selectedProdiFilter = prodi.id; currentPage = 1 },
-                            label = { Text(prodi.code) },
+                            label = { Text(prodi.code, maxLines = 1) },
                             shape = RoundedCornerShape(999.dp)
                         )
                     }
+                }
+                if (isExpanded) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) { prodiChipsContent() }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) { prodiChipsContent() }
                 }
             }
             Spacer(modifier = Modifier.height(10.dp))
             Text("Status Akun", style = MaterialTheme.typography.labelMedium, color = InkMuted)
             Spacer(modifier = Modifier.height(4.dp))
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                FilterChip(selected = selectedAccountFilter == "ALL", onClick = { selectedAccountFilter = "ALL"; currentPage = 1 }, label = { Text("Semua Akun") }, shape = RoundedCornerShape(999.dp))
-                FilterChip(selected = selectedAccountFilter == "ACTIVE", onClick = { selectedAccountFilter = "ACTIVE"; currentPage = 1 }, label = { Text("Aktif ($activeAccountCount)") }, shape = RoundedCornerShape(999.dp))
-                FilterChip(selected = selectedAccountFilter == "INACTIVE", onClick = { selectedAccountFilter = "INACTIVE"; currentPage = 1 }, label = { Text("Nonaktif ($inactiveAccountCount)") }, shape = RoundedCornerShape(999.dp))
-                FilterChip(selected = selectedAccountFilter == "MUST_CHANGE_PW", onClick = { selectedAccountFilter = "MUST_CHANGE_PW"; currentPage = 1 }, label = { Text("Belum Ganti Password ($mustChangePwCount)") }, shape = RoundedCornerShape(999.dp))
+            val accountChipsContent: @Composable () -> Unit = {
+                FilterChip(selected = selectedAccountFilter == "ALL", onClick = { selectedAccountFilter = "ALL"; currentPage = 1 }, label = { Text("Semua Akun", maxLines = 1) }, shape = RoundedCornerShape(999.dp))
+                FilterChip(selected = selectedAccountFilter == "ACTIVE", onClick = { selectedAccountFilter = "ACTIVE"; currentPage = 1 }, label = { Text("Aktif ($activeAccountCount)", maxLines = 1) }, shape = RoundedCornerShape(999.dp))
+                FilterChip(selected = selectedAccountFilter == "INACTIVE", onClick = { selectedAccountFilter = "INACTIVE"; currentPage = 1 }, label = { Text("Nonaktif ($inactiveAccountCount)", maxLines = 1) }, shape = RoundedCornerShape(999.dp))
+                FilterChip(selected = selectedAccountFilter == "MUST_CHANGE_PW", onClick = { selectedAccountFilter = "MUST_CHANGE_PW"; currentPage = 1 }, label = { Text("Belum Ganti Password ($mustChangePwCount)", maxLines = 1) }, shape = RoundedCornerShape(999.dp))
+            }
+            if (isExpanded) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { accountChipsContent() }
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) { accountChipsContent() }
             }
 
             Spacer(modifier = Modifier.height(10.dp))
             Text("Filter Status / Cap Mahasiswa", style = MaterialTheme.typography.labelMedium, color = InkMuted)
             Spacer(modifier = Modifier.height(4.dp))
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            val badgeChipsContent: @Composable () -> Unit = {
                 FilterChip(
                     selected = selectedBadgeFilter == "ALL",
                     onClick = { selectedBadgeFilter = "ALL"; currentPage = 1 },
-                    label = { Text("Semua (${uiState.students.size})") },
+                    label = { Text("Semua (${uiState.students.size})", maxLines = 1) },
                     shape = RoundedCornerShape(999.dp),
                     modifier = Modifier.testTag("filter_badge_all")
                 )
                 FilterChip(
                     selected = selectedBadgeFilter == StudentBadgeStatus.AFK.name,
                     onClick = { selectedBadgeFilter = StudentBadgeStatus.AFK.name; currentPage = 1 },
-                    label = { Text("AFK ($afkCount)") },
+                    label = { Text("AFK ($afkCount)", maxLines = 1) },
                     shape = RoundedCornerShape(999.dp),
                     colors = FilterChipDefaults.filterChipColors(
                         selectedContainerColor = Rose600,
@@ -925,14 +1112,14 @@ fun AdminStudentsScreen(
                 FilterChip(
                     selected = selectedBadgeFilter == StudentBadgeStatus.NEUTRAL.name,
                     onClick = { selectedBadgeFilter = StudentBadgeStatus.NEUTRAL.name; currentPage = 1 },
-                    label = { Text("Netral ($neutralCount)") },
+                    label = { Text("Netral ($neutralCount)", maxLines = 1) },
                     shape = RoundedCornerShape(999.dp),
                     modifier = Modifier.testTag("filter_badge_neutral")
                 )
                 FilterChip(
                     selected = selectedBadgeFilter == StudentBadgeStatus.LULUS.name,
                     onClick = { selectedBadgeFilter = StudentBadgeStatus.LULUS.name; currentPage = 1 },
-                    label = { Text("Lulus ($lulusCount)") },
+                    label = { Text("Lulus ($lulusCount)", maxLines = 1) },
                     shape = RoundedCornerShape(999.dp),
                     colors = FilterChipDefaults.filterChipColors(
                         selectedContainerColor = Emerald600,
@@ -943,6 +1130,14 @@ fun AdminStudentsScreen(
                     modifier = Modifier.testTag("filter_badge_lulus")
                 )
             }
+            if (isExpanded) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { badgeChipsContent() }
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) { badgeChipsContent() }
+            }
         }
 
         if (filtered.isEmpty()) {
@@ -952,7 +1147,7 @@ fun AdminStudentsScreen(
                 icon = Icons.Rounded.Groups,
                 showIllustration = true,
                 actionLabel = "Import Excel (.xlsx)",
-                onAction = { showExcelDialog = true }
+                onAction = { viewModel.openExcelImportDialog() }
             )
         } else {
             pageItems.forEach { stu ->
@@ -1008,13 +1203,23 @@ fun AdminStudentsScreen(
                                 Text(
                                     text = "${stu.fullName} — ${stu.studyProgramName}",
                                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                    color = if (isAfk) Rose700 else InkText
+                                    color = if (isAfk) Rose700 else InkText,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
                                 )
-                                Text(stu.email, style = MaterialTheme.typography.bodySmall, color = Slate500)
                                 Text(
-                                    "${stu.className ?: "Belum ada kelas"} • Sem ${stu.semester} (${stu.cohortYear})",
+                                    text = stu.email,
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Slate600
+                                    color = Slate500,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "${stu.className ?: "Belum ada kelas"} • Sem ${stu.semester} (${stu.cohortYear})",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Slate600,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                             Row {
@@ -1102,10 +1307,39 @@ fun AdminStudentsScreen(
         }
     }
 
-    if (showExcelDialog) {
+    if (showConnectSupabaseDialog) {
+        ConnectSupabaseAdminDialog(
+            isConnecting = uiState.isConnectingAdminSupabase,
+            errorMessage = uiState.adminSupabaseConnectError,
+            onConnect = { identifier, password ->
+                viewModel.connectAdminSupabaseSession(identifier, password) {
+                    showConnectSupabaseDialog = false
+                }
+            },
+            onClearError = { viewModel.clearAdminSupabaseConnectError() },
+            onDismiss = {
+                viewModel.clearAdminSupabaseConnectError()
+                showConnectSupabaseDialog = false
+            }
+        )
+    }
+
+    if (uiState.excelImportState.isDialogOpen) {
         AdminExcelImportDialog(
-            viewModel = viewModel,
-            onDismiss = { showExcelDialog = false }
+            importState = uiState.excelImportState,
+            onPickExcelFile = { launchSafeExcelFilePicker() },
+            onDownloadTemplate = {
+                try {
+                    saveExcelTemplateLauncher.launch("Template_Absensi_AzrilClas.xlsx")
+                } catch (_: Throwable) {
+                    viewModel.reportExcelPickerError("Gagal membuka dialog penyimpanan template di perangkat ini.")
+                }
+            },
+            onCancelActiveOperation = { viewModel.cancelActiveExcelImport() },
+            onCommitImport = { summary, importHist ->
+                viewModel.commitExcelStudentImport(summary, importHist)
+            },
+            onDismiss = { viewModel.dismissExcelImportDialog() }
         )
     }
 

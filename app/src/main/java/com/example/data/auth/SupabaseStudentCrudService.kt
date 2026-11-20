@@ -3,9 +3,13 @@ package com.example.data.auth
 import com.example.data.network.SupabaseNetworkClient
 import com.example.ui.model.AcademicClass
 import com.example.ui.model.AccountStatus
+import com.example.ui.model.PointSourceType
+import com.example.ui.model.RankingPointTransaction
 import com.example.ui.model.StudentBadgeStatus
 import com.example.ui.model.StudentRecord
+import com.example.ui.model.StudentStreakState
 import com.example.ui.model.StudyProgram
+import com.example.ui.model.XpCategory
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -21,7 +25,9 @@ import java.util.TimeZone
 data class RemoteAcademicDirectory(
     val studyPrograms: List<StudyProgram>,
     val classes: List<AcademicClass>,
-    val students: List<StudentRecord>
+    val students: List<StudentRecord>,
+    val xpTransactions: List<RankingPointTransaction> = emptyList(),
+    val studentStreaks: Map<String, StudentStreakState> = emptyMap()
 )
 
 sealed interface RemoteDirectoryResult {
@@ -164,11 +170,97 @@ class SupabaseStudentCrudService(
                 cls.copy(memberIds = students.filter { it.classId == cls.id }.map { it.id })
             }
 
+            // Also fetch authoritative XP transactions & student streaks from Supabase
+            // so Admin Ranking and Student Ranking share identical XP & leaderboard totals.
+            val remoteXp = fetchXpAndRankingTransactions(base = base, jwt = jwt, studentIdFilter = null)
+            val remoteStreaks = fetchStudentStreaks(base = base, jwt = jwt, studentIdFilter = null)
+
             RemoteDirectoryResult.Success(
                 RemoteAcademicDirectory(
                     studyPrograms = effectiveProdis,
                     classes = syncedClasses,
-                    students = students
+                    students = students,
+                    xpTransactions = remoteXp,
+                    studentStreaks = remoteStreaks
+                )
+            )
+        } catch (e: Exception) {
+            RemoteDirectoryResult.Error(SupabaseNetworkClient.formatConnectionError(e, base))
+        }
+    }
+
+    /**
+     * Fetches the authoritative leaderboard roster, classes, study programs, XP history,
+     * and login streaks for an authenticated Student using RLS-safe RPC + own-row queries.
+     * Ensures Student Dashboard/Ranking uses the exact same Supabase source as Admin Dashboard.
+     */
+    fun fetchDirectoryForStudent(jwt: String, currentStudentId: String): RemoteDirectoryResult {
+        val base = baseUrl()
+        if (!SupabaseNetworkClient.isConfigured(base, supabaseAnonKey)) {
+            return RemoteDirectoryResult.Error("Konfigurasi Supabase belum aktif.")
+        }
+        if (jwt.isBlank()) {
+            return RemoteDirectoryResult.Error(
+                message = "Sesi mahasiswa belum terhubung ke Supabase Auth.",
+                isUnauthorized = true
+            )
+        }
+        return try {
+            val prodis = fetchStudyPrograms(base, jwt).orEmpty().ifEmpty { OfficialStudyPrograms.list }
+            val prodiById = prodis.associateBy { it.id }
+            val prodiByCode = prodis.associateBy { it.code.uppercase(Locale.US) }
+
+            val classesOutcome = fetchClassesWithStatus(base, jwt, prodiById, prodiByCode)
+            val rawClasses = when (classesOutcome) {
+                is FetchOutcome.Success -> classesOutcome.data
+                is FetchOutcome.Failure -> {
+                    if (classesOutcome.code == 401) {
+                        return RemoteDirectoryResult.Error(
+                            message = parsePostgrestError(401, classesOutcome.rawBody, "Sesi berakhir"),
+                            isUnauthorized = true
+                        )
+                    }
+                    emptyList()
+                }
+            }
+            val classById = rawClasses.associateBy { it.id }
+
+            // 1. Try unified RLS-safe leaderboard RPC (migration 010)
+            val rpcResult = fetchStudentLeaderboardViaRpc(base, jwt, prodiById, prodiByCode, classById)
+            if (rpcResult is FetchOutcome.Failure && rpcResult.code == 401) {
+                return RemoteDirectoryResult.Error(
+                    message = parsePostgrestError(401, rpcResult.rawBody, "Sesi mahasiswa berakhir"),
+                    isUnauthorized = true
+                )
+            }
+
+            val ownXpTransactions = fetchXpAndRankingTransactions(base, jwt, studentIdFilter = currentStudentId)
+            val ownStreaks = fetchStudentStreaks(base, jwt, studentIdFilter = currentStudentId)
+
+            val (students, combinedXp) = if (rpcResult is FetchOutcome.Success && rpcResult.data.first.isNotEmpty()) {
+                val (leaderboardStudents, leaderboardSummaryTxs) = rpcResult.data
+                // Keep detailed own XP transactions for the logged-in student, and use server-derived
+                // leaderboard XP summaries for peers so Top 3 Podium & Rankings are 100% accurate.
+                val ownIds = ownXpTransactions.map { it.studentId }.toSet()
+                val peerSummaryTxs = leaderboardSummaryTxs.filter { it.studentId !in ownIds }
+                leaderboardStudents to (ownXpTransactions + peerSummaryTxs)
+            } else {
+                // Fallback when migration 010 RPC isn't deployed yet: fetch own profile from public.profiles
+                val ownProfile = fetchOwnStudentProfile(base, jwt, currentStudentId, prodiById, prodiByCode, classById)
+                listOfNotNull(ownProfile) to ownXpTransactions
+            }
+
+            val syncedClasses = rawClasses.map { cls ->
+                cls.copy(memberIds = students.filter { it.classId == cls.id }.map { it.id })
+            }
+
+            RemoteDirectoryResult.Success(
+                RemoteAcademicDirectory(
+                    studyPrograms = prodis,
+                    classes = syncedClasses,
+                    students = students,
+                    xpTransactions = combinedXp,
+                    studentStreaks = ownStreaks
                 )
             )
         } catch (e: Exception) {
@@ -941,51 +1033,292 @@ class SupabaseStudentCrudService(
             }
         }
 
+        // 3. Resilient RPC fallback (`get_admin_directory_students` from migration 010)
+        if (selectedArray == null || selectedArray.length() == 0) {
+            val rpcAttempt = postRpcJsonArrayWithStatus(
+                base = base,
+                rpcPath = "/rest/v1/rpc/get_admin_directory_students",
+                jwt = jwt
+            )
+            if (rpcAttempt is FetchOutcome.Success && rpcAttempt.data.length() > 0) {
+                selectedArray = rpcAttempt.data
+            } else if (rpcAttempt is FetchOutcome.Failure && rpcAttempt.code == 401) {
+                return rpcAttempt
+            }
+        }
+
         val arr = selectedArray
             ?: return lastFailure ?: FetchOutcome.Failure(500, "")
 
-        val parsed = (0 until arr.length()).mapNotNull { i ->
+        val parsed = parseStudentRecordsFromJsonArray(arr, prodiById, prodiByCode, classById)
+        return FetchOutcome.Success(parsed)
+    }
+
+    private fun parseStudentRecordsFromJsonArray(
+        arr: JSONArray,
+        prodiById: Map<String, StudyProgram>,
+        prodiByCode: Map<String, StudyProgram>,
+        classById: Map<String, AcademicClass>
+    ): List<StudentRecord> = (0 until arr.length()).mapNotNull { i ->
+        val o = arr.optJSONObject(i) ?: return@mapNotNull null
+        val id = o.optString("id").trim()
+        if (id.isBlank()) return@mapNotNull null
+        val roleValue = o.optString("role", "student").trim()
+        if (roleValue.equals("admin", ignoreCase = true)) return@mapNotNull null
+        val prodiObj = o.optJSONObject("study_programs")
+        val classObj = o.optJSONObject("classes")
+        val rawProdiId = o.optString("study_program_id").trim()
+        val joinedProdiCode = prodiObj?.optString("code")?.trim()?.uppercase(Locale.US).orEmpty()
+            .ifBlank { o.optString("study_program_code").trim().uppercase(Locale.US) }
+        val resolvedProdi = prodiById[rawProdiId]
+            ?: prodiByCode[joinedProdiCode]
+            ?: OfficialStudyPrograms.findByCode(joinedProdiCode)
+        val classId = o.optString("class_id").trim().ifBlank { null }
+        val className = classObj?.optString("name")?.trim()?.ifBlank { null }
+            ?: o.optString("class_name").trim().ifBlank { null }
+            ?: classId?.let { classById[it]?.name }
+        val statusStr = o.optString("account_status", "active").lowercase(Locale.US)
+        val accountStatus = when (statusStr) {
+            "inactive" -> AccountStatus.INACTIVE
+            "pending_activation" -> AccountStatus.PENDING_ACTIVATION
+            else -> AccountStatus.ACTIVE
+        }
+        val nim = sanitizeNim(o.optString("nim", o.optString("username", "")))
+        StudentRecord(
+            id = id,
+            fullName = o.optString("full_name", "Mahasiswa").trim().ifBlank { nim.ifBlank { "Mahasiswa" } },
+            nim = nim.ifBlank { "-" },
+            email = o.optString("email", "").trim().lowercase(Locale.US),
+            studyProgramId = resolvedProdi?.id ?: rawProdiId.ifBlank { OfficialStudyPrograms.list.first().id },
+            studyProgramName = resolvedProdi?.code ?: joinedProdiCode.ifBlank { "HES" },
+            classId = classId,
+            className = className,
+            semester = o.optInt("semester", 1),
+            cohortYear = o.optInt("cohort_year", 2026),
+            status = accountStatus,
+            badgeStatus = StudentBadgeStatus.fromDbValue(o.optString("student_badge_status", "neutral")),
+            mustChangePassword = o.optBoolean("must_change_password", false)
+        )
+    }
+
+    private fun fetchOwnStudentProfile(
+        base: String,
+        jwt: String,
+        studentId: String,
+        prodiById: Map<String, StudyProgram>,
+        prodiByCode: Map<String, StudyProgram>,
+        classById: Map<String, AcademicClass>
+    ): StudentRecord? {
+        if (studentId.isBlank()) return null
+        val urls = listOf(
+            "/rest/v1/profiles?id=eq.$studentId&select=*,study_programs(id,code,name),classes(id,name)",
+            "/rest/v1/profiles?id=eq.$studentId&select=*"
+        )
+        for (url in urls) {
+            val res = fetchPaginatedJsonArrayWithStatus(base, url, jwt)
+            if (res is FetchOutcome.Success && res.data.length() > 0) {
+                return parseStudentRecordsFromJsonArray(res.data, prodiById, prodiByCode, classById).firstOrNull()
+            }
+        }
+        return null
+    }
+
+    private fun fetchStudentLeaderboardViaRpc(
+        base: String,
+        jwt: String,
+        prodiById: Map<String, StudyProgram>,
+        prodiByCode: Map<String, StudyProgram>,
+        classById: Map<String, AcademicClass>
+    ): FetchOutcome<Pair<List<StudentRecord>, List<RankingPointTransaction>>> {
+        val rpc = postRpcJsonArrayWithStatus(
+            base = base,
+            rpcPath = "/rest/v1/rpc/get_student_leaderboard_directory",
+            jwt = jwt
+        )
+        if (rpc is FetchOutcome.Failure) return rpc
+        val arr = (rpc as FetchOutcome.Success).data
+        val students = parseStudentRecordsFromJsonArray(arr, prodiById, prodiByCode, classById)
+        val nowMs = System.currentTimeMillis()
+        val summaryTxs = (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
             val id = o.optString("id").trim()
-            if (id.isBlank()) return@mapNotNull null
-            val roleValue = o.optString("role", "student").trim()
-            if (roleValue.equals("admin", ignoreCase = true)) return@mapNotNull null
-            val prodiObj = o.optJSONObject("study_programs")
-            val classObj = o.optJSONObject("classes")
-            val rawProdiId = o.optString("study_program_id").trim()
-            val joinedProdiCode = prodiObj?.optString("code")?.trim()?.uppercase(Locale.US).orEmpty()
-                .ifBlank { o.optString("study_program_code").trim().uppercase(Locale.US) }
-            val resolvedProdi = prodiById[rawProdiId]
-                ?: prodiByCode[joinedProdiCode]
-                ?: OfficialStudyPrograms.findByCode(joinedProdiCode)
-            val classId = o.optString("class_id").trim().ifBlank { null }
-            val className = classObj?.optString("name")?.trim()?.ifBlank { null }
-                ?: o.optString("class_name").trim().ifBlank { null }
-                ?: classId?.let { classById[it]?.name }
-            val statusStr = o.optString("account_status", "active").lowercase(Locale.US)
-            val accountStatus = when (statusStr) {
-                "inactive" -> AccountStatus.INACTIVE
-                "pending_activation" -> AccountStatus.PENDING_ACTIVATION
-                else -> AccountStatus.ACTIVE
-            }
-            val nim = sanitizeNim(o.optString("nim", o.optString("username", "")))
-            StudentRecord(
-                id = id,
-                fullName = o.optString("full_name", "Mahasiswa").trim().ifBlank { nim.ifBlank { "Mahasiswa" } },
-                nim = nim.ifBlank { "-" },
-                email = o.optString("email", "").trim().lowercase(Locale.US),
-                studyProgramId = resolvedProdi?.id ?: rawProdiId.ifBlank { OfficialStudyPrograms.list.first().id },
-                studyProgramName = resolvedProdi?.code ?: joinedProdiCode.ifBlank { "HES" },
-                classId = classId,
-                className = className,
-                semester = o.optInt("semester", 1),
-                cohortYear = o.optInt("cohort_year", 2026),
-                status = accountStatus,
-                badgeStatus = StudentBadgeStatus.fromDbValue(o.optString("student_badge_status", "neutral")),
-                mustChangePassword = o.optBoolean("must_change_password", false)
+            val totalXp = o.optInt("total_xp", 0)
+            if (id.isBlank() || totalXp <= 0) return@mapNotNull null
+            RankingPointTransaction(
+                id = "sb-lb-$id",
+                studentId = id,
+                sourceType = PointSourceType.MANUAL_ADJUSTMENT,
+                sourceId = "supabase-leaderboard-total-$id",
+                points = totalXp,
+                description = "Akumulasi XP terverifikasi dari Supabase",
+                createdAt = "Sinkron Supabase",
+                updatedAt = "Sinkron Supabase",
+                timestampMillis = nowMs,
+                xpCategory = XpCategory.MANUAL_ADJUSTMENT,
+                activityTitle = "Total XP Terverifikasi"
             )
         }
-        return FetchOutcome.Success(parsed)
+        return FetchOutcome.Success(students to summaryTxs)
+    }
+
+    private fun fetchXpAndRankingTransactions(
+        base: String,
+        jwt: String,
+        studentIdFilter: String?
+    ): List<RankingPointTransaction> {
+        val filterClause = if (!studentIdFilter.isNullOrBlank()) "&student_id=eq.$studentIdFilter" else ""
+        // Primary ledger: public.xp_transactions (migration 004)
+        val xpRes = fetchPaginatedJsonArrayWithStatus(
+            base = base,
+            pathAndQuery = "/rest/v1/xp_transactions?select=*${filterClause}&order=created_at.desc",
+            jwt = jwt
+        )
+        if (xpRes is FetchOutcome.Success && xpRes.data.length() > 0) {
+            return (0 until xpRes.data.length()).mapNotNull { i ->
+                val o = xpRes.data.optJSONObject(i) ?: return@mapNotNull null
+                val id = o.optString("id").trim()
+                val sid = o.optString("student_id").trim()
+                if (id.isBlank() || sid.isBlank()) return@mapNotNull null
+                val catStr = o.optString("category", "MANUAL_ADJUSTMENT").trim().uppercase(Locale.US)
+                val xpCategory = runCatching { XpCategory.valueOf(catStr) }.getOrDefault(XpCategory.MANUAL_ADJUSTMENT)
+                val refType = o.optString("reference_type", "MANUAL_ADJUSTMENT").trim().uppercase(Locale.US)
+                val sourceType = when (refType) {
+                    "ATTENDANCE" -> PointSourceType.ATTENDANCE
+                    "ASSIGNMENT" -> PointSourceType.ASSIGNMENT
+                    "PARTICIPATION" -> PointSourceType.PARTICIPATION
+                    "STREAK_MILESTONE" -> PointSourceType.STREAK_BONUS
+                    else -> PointSourceType.MANUAL_ADJUSTMENT
+                }
+                val createdIso = o.optString("created_at", "")
+                val ts = parseIsoMillis(createdIso) ?: System.currentTimeMillis()
+                RankingPointTransaction(
+                    id = id,
+                    studentId = sid,
+                    sourceType = sourceType,
+                    sourceId = o.optString("reference_id", id).ifBlank { id },
+                    points = o.optInt("xp_amount", 0),
+                    description = o.optString("description", "").ifBlank { xpCategory.defaultTitle },
+                    createdAt = createdIso.take(16).replace('T', ' ').ifBlank { "-" },
+                    updatedAt = o.optString("updated_at", createdIso).take(16).replace('T', ' ').ifBlank { "-" },
+                    timestampMillis = ts,
+                    xpCategory = xpCategory,
+                    activityTitle = o.optString("activity_title", "").ifBlank { xpCategory.defaultTitle },
+                    semesterKey = o.optString("semester_key", "2026/2027-Ganjil").ifBlank { "2026/2027-Ganjil" },
+                    adminId = o.optString("admin_id").ifBlank { null }
+                )
+            }
+        }
+
+        // Secondary legacy ledger: public.ranking_points (migration 002)
+        val rpRes = fetchPaginatedJsonArrayWithStatus(
+            base = base,
+            pathAndQuery = "/rest/v1/ranking_points?select=*${filterClause}&order=created_at.desc",
+            jwt = jwt
+        )
+        if (rpRes is FetchOutcome.Success && rpRes.data.length() > 0) {
+            return (0 until rpRes.data.length()).mapNotNull { i ->
+                val o = rpRes.data.optJSONObject(i) ?: return@mapNotNull null
+                val id = o.optString("id").trim()
+                val sid = o.optString("student_id").trim()
+                if (id.isBlank() || sid.isBlank()) return@mapNotNull null
+                val srcStr = o.optString("source_type", "MANUAL_ADJUSTMENT").trim().uppercase(Locale.US)
+                val sourceType = when (srcStr) {
+                    "ATTENDANCE" -> PointSourceType.ATTENDANCE
+                    "ASSIGNMENT" -> PointSourceType.ASSIGNMENT
+                    else -> PointSourceType.MANUAL_ADJUSTMENT
+                }
+                val xpCat = when (sourceType) {
+                    PointSourceType.ATTENDANCE -> XpCategory.ATTENDANCE_HADIR
+                    PointSourceType.ASSIGNMENT -> XpCategory.ASSIGNMENT_ON_TIME
+                    else -> XpCategory.MANUAL_ADJUSTMENT
+                }
+                val createdIso = o.optString("created_at", "")
+                val ts = parseIsoMillis(createdIso) ?: System.currentTimeMillis()
+                RankingPointTransaction(
+                    id = id,
+                    studentId = sid,
+                    sourceType = sourceType,
+                    sourceId = o.optString("source_id", id).ifBlank { id },
+                    points = o.optInt("points", 0),
+                    description = o.optString("description", "").ifBlank { xpCat.defaultTitle },
+                    createdAt = createdIso.take(16).replace('T', ' ').ifBlank { "-" },
+                    updatedAt = o.optString("updated_at", createdIso).take(16).replace('T', ' ').ifBlank { "-" },
+                    timestampMillis = ts,
+                    xpCategory = xpCat,
+                    activityTitle = o.optString("description", "").ifBlank { xpCat.defaultTitle }
+                )
+            }
+        }
+        return emptyList()
+    }
+
+    private fun fetchStudentStreaks(
+        base: String,
+        jwt: String,
+        studentIdFilter: String?
+    ): Map<String, StudentStreakState> {
+        val filterClause = if (!studentIdFilter.isNullOrBlank()) "&student_id=eq.$studentIdFilter" else ""
+        val res = fetchPaginatedJsonArrayWithStatus(
+            base = base,
+            pathAndQuery = "/rest/v1/student_streaks?select=*${filterClause}",
+            jwt = jwt
+        )
+        if (res !is FetchOutcome.Success) return emptyMap()
+        val map = linkedMapOf<String, StudentStreakState>()
+        for (i in 0 until res.data.length()) {
+            val o = res.data.optJSONObject(i) ?: continue
+            val sid = o.optString("student_id").trim()
+            if (sid.isBlank()) continue
+            map[sid] = StudentStreakState(
+                studentId = sid,
+                currentStreak = o.optInt("current_streak", 0),
+                longestStreak = o.optInt("longest_streak", 0),
+                lastLoginDateWib = o.optString("last_login_date_wib").ifBlank { null },
+                streakCycleId = o.optString("streak_cycle_id", "cycle-1").ifBlank { "cycle-1" }
+            )
+        }
+        return map
+    }
+
+    private fun postRpcJsonArrayWithStatus(
+        base: String,
+        rpcPath: String,
+        jwt: String,
+        payload: String = "{}"
+    ): FetchOutcome<JSONArray> {
+        val req = Request.Builder()
+            .url("$base$rpcPath")
+            .post(payload.toRequestBody(JSON_MEDIA_TYPE))
+            .addHeader("apikey", supabaseAnonKey.trim())
+            .addHeader("Authorization", "Bearer $jwt")
+            .addHeader("Content-Type", "application/json")
+            .build()
+        return httpClient.newCall(req).execute().use { resp ->
+            val raw = resp.body?.string().orEmpty().trim()
+            if (!resp.isSuccessful) {
+                FetchOutcome.Failure(resp.code, raw)
+            } else if (raw.isEmpty() || raw == "null") {
+                FetchOutcome.Success(JSONArray())
+            } else {
+                val parsed = runCatching { JSONArray(raw) }.getOrNull()
+                if (parsed != null) FetchOutcome.Success(parsed) else FetchOutcome.Failure(500, raw)
+            }
+        }
+    }
+
+    private fun parseIsoMillis(iso: String): Long? {
+        if (iso.isBlank()) return null
+        val cleaned = iso.trim().replace(Regex("\\.\\d+"), "").replace("+00:00", "Z")
+        val patterns = listOf("yyyy-MM-dd'T'HH:mm:ss'Z'", "yyyy-MM-dd'T'HH:mm:ssX", "yyyy-MM-dd HH:mm:ss")
+        for (p in patterns) {
+            val parsed = runCatching {
+                SimpleDateFormat(p, Locale.US).apply {
+                    timeZone = TimeZone.getTimeZone("UTC")
+                }.parse(cleaned)?.time
+            }.getOrNull()
+            if (parsed != null) return parsed
+        }
+        return null
     }
 
     private fun fetchPaginatedJsonArrayWithStatus(

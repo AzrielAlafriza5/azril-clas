@@ -41,6 +41,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -87,8 +91,13 @@ import com.example.ui.theme.SoftMintBg
 fun AdminDashboardScreen(
     uiState: AzrilUiState,
     isExpanded: Boolean,
+    onRetrySupabaseSync: () -> Unit = {},
+    onConnectSupabaseAdmin: (identifier: String, password: String, onConnected: () -> Unit) -> Unit = { _, _, _ -> },
+    onClearSupabaseConnectError: () -> Unit = {},
     onNavigate: (AdminDestination) -> Unit
 ) {
+    var showConnectSupabaseDialog by rememberSaveable { mutableStateOf(false) }
+
     if (uiState.loadState is ScreenLoadState.Loading) {
         Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
             AzrilSkeletonList(count = 4)
@@ -114,6 +123,22 @@ fun AdminDashboardScreen(
             title = "Dashboard Akademik",
             subtitle = "Pantau mahasiswa, program studi, absensi, tugas, AI review, dan ranking dalam satu tampilan minimalis."
         )
+
+        val shouldShowSupabaseBanner = uiState.isSupabaseConfigured &&
+            (!uiState.hasLiveSupabaseSession || !uiState.studentsSyncError.isNullOrBlank())
+        if (shouldShowSupabaseBanner) {
+            AdminSupabaseSyncStatusBanner(
+                errorMessage = uiState.studentsSyncError
+                    ?: "Sesi Admin saat ini berjalan pada mode cadangan lokal sehingga data mahasiswa dari Supabase belum tampil. Hubungkan akun Admin Supabase untuk memuat seluruh data.",
+                hasLiveSession = uiState.hasLiveSupabaseSession,
+                isSyncing = uiState.isSyncingStudents,
+                onRetrySync = onRetrySupabaseSync,
+                onOpenConnectDialog = {
+                    onClearSupabaseConnectError()
+                    showConnectSupabaseDialog = true
+                }
+            )
+        }
 
         // Editorial Dark Overview Card (#171A17 + Lime Green #B5D45D) with Quick Actions
         AzrilDarkCard {
@@ -301,6 +326,23 @@ fun AdminDashboardScreen(
         }
 
         Spacer(modifier = Modifier.height(12.dp))
+    }
+
+    if (showConnectSupabaseDialog) {
+        ConnectSupabaseAdminDialog(
+            isConnecting = uiState.isConnectingAdminSupabase,
+            errorMessage = uiState.adminSupabaseConnectError,
+            onConnect = { identifier, password ->
+                onConnectSupabaseAdmin(identifier, password) {
+                    showConnectSupabaseDialog = false
+                }
+            },
+            onClearError = onClearSupabaseConnectError,
+            onDismiss = {
+                onClearSupabaseConnectError()
+                showConnectSupabaseDialog = false
+            }
+        )
     }
 }
 

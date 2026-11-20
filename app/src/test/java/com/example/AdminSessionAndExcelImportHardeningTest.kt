@@ -12,6 +12,7 @@ import com.example.ui.model.StudentBadgeStatus
 import com.example.ui.model.StudentRecord
 import com.example.ui.model.UserRole
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.net.URLDecoder
 import java.util.UUID
 import java.util.zip.ZipEntry
@@ -138,6 +139,34 @@ class AdminSessionAndExcelImportHardeningTest {
                         }
                     }
 
+                    path == "/rest/v1/rpc/get_student_leaderboard_directory" -> {
+                        if (auth != validAdminJwt && !auth.contains("student-")) {
+                            jsonResp(req, 401, """{"message":"JWT expired"}""")
+                        } else {
+                            val arr = JSONArray()
+                            profiles.values.filter { !it.optString("role").equals("admin", ignoreCase = true) }.forEach { row ->
+                                val prodi = studyPrograms.find { it.optString("id") == row.optString("study_program_id") }
+                                val cls = classes[row.optString("class_id")]
+                                arr.put(
+                                    JSONObject()
+                                        .put("id", row.optString("id"))
+                                        .put("full_name", row.optString("full_name"))
+                                        .put("nim", row.optString("nim"))
+                                        .put("study_program_id", row.optString("study_program_id"))
+                                        .put("study_program_code", prodi?.optString("code") ?: "HES")
+                                        .put("class_id", row.optString("class_id"))
+                                        .put("class_name", cls?.optString("name") ?: "")
+                                        .put("semester", row.optInt("semester", 3))
+                                        .put("cohort_year", row.optInt("cohort_year", 2025))
+                                        .put("account_status", row.optString("account_status", "active"))
+                                        .put("student_badge_status", row.optString("student_badge_status", "neutral"))
+                                        .put("total_xp", 250)
+                                )
+                            }
+                            jsonResp(req, 200, arr.toString())
+                        }
+                    }
+
                     path == "/rest/v1/rpc/resolve_login_email" -> {
                         val ident = JSONObject(readBody(req)).optString("p_identifier").trim()
                         val match = profiles.values.find {
@@ -208,7 +237,7 @@ class AdminSessionAndExcelImportHardeningTest {
                     }
 
                     path == "/rest/v1/classes" && method == "GET" -> {
-                        if (auth != validAdminJwt) {
+                        if (auth != validAdminJwt && !auth.contains("student-")) {
                             jsonResp(req, 401, """{"message":"JWT expired"}""")
                         } else {
                             val arr = JSONArray()
@@ -478,5 +507,156 @@ class AdminSessionAndExcelImportHardeningTest {
         assertTrue(phone2Students.any { it.nim == "250701101" && it.badgeStatus == StudentBadgeStatus.NEUTRAL })
         assertTrue(phone2Students.any { it.nim == "250701102" && it.badgeStatus == StudentBadgeStatus.AFK })
         assertFalse(phone2Students.any { it.nim == "250701103" })
+    }
+
+    @Test
+    fun diskStreamingExcelImport_multiSheetLargeRoster_tracksProgress_deduplicatesNim_preservesAfkAndBlackSkip_andSyncsToSupabase() = runTest {
+        // Build 3 sheets (PJKR-3B, FARMASI-3, HES-3B) with 156 total rows:
+        // Per sheet: 45 Normal + 4 RED AFK + 2 BLACK skip + 1 cross-sheet duplicate = 52 rows/sheet
+        fun buildSheetRows(prefix: String, sheetIdx: Int): List<ExcelStudentImportParser.XlsxRowBuildSpec> {
+            val rows = mutableListOf<ExcelStudentImportParser.XlsxRowBuildSpec>()
+            rows.add(ExcelStudentImportParser.XlsxRowBuildSpec(listOf("No.", "NIM", "Nama", "Minggu ke-1", "Minggu ke-2", "Minggu ke-3")))
+            var no = 1
+            for (i in 1..45) {
+                val nim = "${prefix}${String.format("%03d", i)}"
+                rows.add(
+                    ExcelStudentImportParser.XlsxRowBuildSpec(
+                        values = listOf(no++.toString(), nim, "Mahasiswa Normal $prefix $i", "HADIR", "HADIR", "IZIN")
+                    )
+                )
+            }
+            for (i in 1..4) {
+                val nim = "${prefix}90$i"
+                rows.add(
+                    ExcelStudentImportParser.XlsxRowBuildSpec(
+                        values = listOf(no++.toString(), nim, "Mahasiswa AFK $prefix $i", "ALPHA", "ALPHA", "ALPHA"),
+                        fillArgb = "FFFF0000"
+                    )
+                )
+            }
+            for (i in 1..2) {
+                val nim = "${prefix}80$i"
+                rows.add(
+                    ExcelStudentImportParser.XlsxRowBuildSpec(
+                        values = listOf(no++.toString(), nim, "Dihapus Hitam $prefix $i", "ALPHA", "ALPHA", "ALPHA"),
+                        fillArgb = "FF000000"
+                    )
+                )
+            }
+            // Cross-sheet duplicate NIM on sheet 0 and sheet 1 (must be flagged as INVALID_OR_DUPLICATE)
+            if (sheetIdx == 0 || sheetIdx == 1) {
+                rows.add(
+                    ExcelStudentImportParser.XlsxRowBuildSpec(
+                        values = listOf(no.toString(), "259999999", "Duplikat Lintas Sheet $sheetIdx", "HADIR", "HADIR", "HADIR")
+                    )
+                )
+            }
+            return rows
+        }
+
+        val multiSheetBytes = ExcelStudentImportParser.buildStyledXlsx(
+            sheets = listOf(
+                ExcelStudentImportParser.XlsxSheetBuildSpec("PJKR-3B", buildSheetRows("2510", 0)),
+                ExcelStudentImportParser.XlsxSheetBuildSpec("FARMASI-3", buildSheetRows("2520", 1)),
+                ExcelStudentImportParser.XlsxSheetBuildSpec("HES-3B", buildSheetRows("2530", 2))
+            )
+        )
+
+        val tempFile = File.createTempFile("azril_multisheet_150_", ".xlsx")
+        try {
+            tempFile.writeBytes(multiSheetBytes)
+            val progressSteps = mutableListOf<Float>()
+            val parseRes = ExcelStudentImportParser.parseXlsxFile(
+                fileName = "rekap_3_prodi_150_baris.xlsx",
+                file = tempFile,
+                existingStudents = emptyList(),
+                onProgress = { progress, _ -> progressSteps.add(progress) }
+            )
+            assertTrue("Disk-streaming parseXlsxFile must succeed: ${parseRes.exceptionOrNull()}", parseRes.isSuccess)
+            val summary = parseRes.getOrThrow()
+
+            // Verify progress reporting moved monotonically to 1.0f
+            assertTrue("Progress callbacks must be emitted", progressSteps.size >= 5)
+            assertEquals(1.0f, progressSteps.last(), 0.001f)
+
+            // Verify sheet mappings & counts across all 3 prodis
+            assertEquals(3, summary.sheetMappings.size)
+            assertEquals(135, summary.validNormalCount) // 45 * 3
+            assertEquals(12, summary.validAfkCount)     // 4 * 3
+            assertEquals(6, summary.skippedBlackCount)  // 2 * 3
+            assertEquals(2, summary.invalidOrDuplicateCount) // cross-sheet duplicate blocked on both rows
+            assertEquals(147, summary.totalImportableCount)
+            assertTrue(summary.hasWeeklyAttendance)
+
+            // Persist a representative multi-prodi subset to Supabase with progress callback & verify Student leaderboard sync
+            val server = HardeningFakeSupabase()
+            val client = server.buildClient()
+            val adminRepo = AzrilAuthRepository(TestKeyValueStore(), testSupabaseUrl, testAnonKey, client)
+            val connectRes = adminRepo.connectSupabaseAdminSession("azril.admin@kampus.ac.id", "AdminSecret#2026")
+            assertTrue("In-place Admin Supabase connect must succeed", connectRes is AuthResult.Success)
+
+            val sampleRows = listOf(
+                summary.rows.first { it.sheetName == "PJKR-3B" && it.validationStatus == ExcelImportValidationStatus.VALID_NORMAL },
+                summary.rows.first { it.sheetName == "FARMASI-3" && it.validationStatus == ExcelImportValidationStatus.VALID_AFK },
+                summary.rows.first { it.sheetName == "HES-3B" && it.validationStatus == ExcelImportValidationStatus.VALID_NORMAL }
+            )
+            val prodiIds = mapOf("PJKR" to server.prodiPjkrUuid, "FARMASI" to server.prodiFarmasiUuid, "HES" to server.prodiHesUuid)
+            val studentsToSync = sampleRows.map { row ->
+                StudentRecord(
+                    id = UUID.randomUUID().toString(),
+                    fullName = row.fullName,
+                    nim = row.nim,
+                    email = "${row.nim}@mahasiswa.azrilclas.ac.id",
+                    studyProgramId = prodiIds[row.studyProgramCode] ?: server.prodiHesUuid,
+                    studyProgramName = row.studyProgramCode,
+                    classId = "cls-${row.className.lowercase()}",
+                    className = row.className,
+                    semester = 3,
+                    cohortYear = 2025,
+                    status = AccountStatus.ACTIVE,
+                    badgeStatus = if (row.validationStatus == ExcelImportValidationStatus.VALID_AFK) StudentBadgeStatus.AFK else StudentBadgeStatus.NEUTRAL,
+                    mustChangePassword = true
+                )
+            }
+            val commitProgressUpdates = mutableListOf<Int>()
+            val report1 = adminRepo.adminBulkImportStudentsToSupabase(
+                newStudents = studentsToSync,
+                classes = emptyList(),
+                fileName = "rekap_3_prodi_150_baris.xlsx",
+                semesterKey = "2026/2027-Ganjil",
+                importHistoricalAttendance = true,
+                previewRowsForSync = sampleRows,
+                onProgress = { processed, _, _ -> commitProgressUpdates.add(processed) }
+            )
+            assertEquals(3, report1.syncedToSupabaseCount)
+            assertTrue("Commit progress callback must report progress", commitProgressUpdates.isNotEmpty())
+
+            // Re-importing same students MUST NOT create duplicates
+            val report2 = adminRepo.adminBulkImportStudentsToSupabase(
+                newStudents = studentsToSync,
+                classes = emptyList(),
+                fileName = "rekap_3_prodi_150_baris.xlsx",
+                semesterKey = "2026/2027-Ganjil",
+                importHistoricalAttendance = false,
+                previewRowsForSync = sampleRows
+            )
+            assertEquals(0, report2.syncedToSupabaseCount)
+            assertEquals(3, report2.alreadyInSupabaseCount)
+
+            // Student logs in and fetches unified leaderboard -> MUST see the exact same 3 students + XP from Supabase!
+            val studentRepo = AzrilAuthRepository(TestKeyValueStore(), testSupabaseUrl, testAnonKey, client)
+            val firstStudentNim = studentsToSync.first().nim
+            val stuLogin = studentRepo.login(firstStudentNim, firstStudentNim, rememberMe = true)
+            assertTrue("Imported student must log in cleanly via NIM", stuLogin is AuthResult.Success)
+            val stuProfile = (stuLogin as AuthResult.Success).profile
+            val leaderboardDir = studentRepo.fetchStudentLeaderboardAndXpFromSupabase(stuProfile.id)
+            assertTrue("Student leaderboard sync must succeed", leaderboardDir is RemoteDirectoryResult.Success)
+            val syncedLeaderboard = (leaderboardDir as RemoteDirectoryResult.Success).directory
+            assertEquals("Student Ranking & Admin must see the exact same 3 students", 3, syncedLeaderboard.students.size)
+            assertEquals("Unified RPC must preserve XP balances", 3, syncedLeaderboard.xpTransactions.size)
+            assertTrue(syncedLeaderboard.xpTransactions.all { it.points == 250 })
+        } finally {
+            tempFile.delete()
+        }
     }
 }

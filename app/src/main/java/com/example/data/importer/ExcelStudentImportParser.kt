@@ -10,10 +10,15 @@ import com.example.ui.model.StudentRecord
 import com.example.ui.model.StudyProgram
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FilterInputStream
+import java.io.InputStream
 import java.math.BigDecimal
 import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipException
+import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import javax.xml.parsers.DocumentBuilderFactory
@@ -92,11 +97,175 @@ object ExcelStudentImportParser {
         "954F72"  // 11: folHlink
     )
 
+    /**
+     * Memory-safe disk-streaming `.xlsx` parser designed for Android devices.
+     * Uses `ZipFile` to read ONE XML entry stream at a time directly from disk into SAX parsers,
+     * never holding the entire `.xlsx` byte array or all decompressed XML sheets in heap memory.
+     */
+    fun parseXlsxFile(
+        fileName: String,
+        file: File,
+        existingStudents: List<StudentRecord>,
+        studyPrograms: List<StudyProgram> = OfficialStudyPrograms.list,
+        onProgress: ((progress: Float, statusText: String) -> Unit)? = null
+    ): Result<ExcelImportPreviewSummary> {
+        return try {
+            if (!file.exists() || !file.isFile) {
+                return Result.failure(IllegalArgumentException("File sementara Excel tidak ditemukan di penyimpanan perangkat."))
+            }
+            val fileLength = file.length()
+            if (fileLength <= 0L) {
+                return Result.failure(IllegalArgumentException("File Excel kosong."))
+            }
+            if (fileLength > MAX_XLSX_FILE_BYTES) {
+                return Result.failure(
+                    IllegalArgumentException(
+                        "Ukuran file terlalu besar (${(fileLength / (1024L * 1024L)).coerceAtLeast(1L)} MB). Maksimal ukuran file Excel yang didukung adalah 15 MB."
+                    )
+                )
+            }
+            val magic = ByteArray(4)
+            val magicRead = FileInputStream(file).use { it.read(magic) }
+            validateXlsxMagicBytes(if (magicRead >= 4) magic else ByteArray(0))?.let { validationError ->
+                return Result.failure(IllegalArgumentException(validationError))
+            }
+
+            onProgress?.invoke(0.10f, "Membuka struktur file Excel (.xlsx)...")
+
+            ZipFile(file).use { zipFile ->
+                val entryMap = linkedMapOf<String, ZipEntry>()
+                var entryCount = 0
+                val entriesEnum = zipFile.entries()
+                while (entriesEnum.hasMoreElements()) {
+                    val entry = entriesEnum.nextElement()
+                    entryCount++
+                    if (entryCount > MAX_ZIP_ENTRIES) {
+                        return Result.failure(
+                            IllegalArgumentException("File Excel memiliki terlalu banyak komponen internal (>$MAX_ZIP_ENTRIES).")
+                        )
+                    }
+                    if (!entry.isDirectory) {
+                        val normalizedKey = normalizeZipPath(entry.name)
+                        if (isRequiredXmlEntry(normalizedKey)) {
+                            entryMap[normalizedKey] = entry
+                        }
+                    }
+                }
+
+                val totalReadCounter = longArrayOf(0L)
+                fun openBoundedStream(entry: ZipEntry): InputStream {
+                    return BoundedZipEntryInputStream(
+                        delegate = zipFile.getInputStream(entry),
+                        maxEntryBytes = MAX_SINGLE_XML_ENTRY_BYTES.toLong(),
+                        totalCounter = totalReadCounter,
+                        maxTotalBytes = MAX_TOTAL_UNCOMPRESSED_BYTES
+                    )
+                }
+
+                fun readSmallEntryBytes(key: String): ByteArray? {
+                    val entry = entryMap[key] ?: return null
+                    return openBoundedStream(entry).use { it.readBytes() }
+                }
+
+                val workbookBytes = readSmallEntryBytes("xl/workbook.xml")
+                    ?: return Result.failure(
+                        IllegalArgumentException("File bukan format Excel (.xlsx) yang valid: struktur xl/workbook.xml tidak ditemukan.")
+                    )
+                val relsBytes = readSmallEntryBytes("xl/_rels/workbook.xml.rels")
+                    ?: return Result.failure(
+                        IllegalArgumentException("File Excel (.xlsx) tidak lengkap: xl/_rels/workbook.xml.rels tidak ditemukan.")
+                    )
+
+                val sheets = parseWorkbookSheets(workbookBytes, relsBytes)
+                require(sheets.isNotEmpty()) { "Tidak ada sheet ditemukan di dalam file Excel." }
+
+                onProgress?.invoke(0.22f, "Membaca tabel teks (sharedStrings)...")
+                val sharedStrings = entryMap["xl/sharedstrings.xml"]?.let { entry ->
+                    openBoundedStream(entry).use(::parseSharedStringsStreaming)
+                }.orEmpty()
+
+                val themeColors = readSmallEntryBytes("xl/theme/theme1.xml")?.let(::parseThemeColors)
+                    ?: DEFAULT_THEME_COLORS
+
+                onProgress?.invoke(0.32f, "Menganalisis warna sel & gaya (AFK / Blok Hitam)...")
+                val styleColorMap = entryMap["xl/styles.xml"]?.let { entry ->
+                    openBoundedStream(entry).use { stream ->
+                        parseCellStyleFillColorsStreaming(stream, themeColors)
+                    }
+                }.orEmpty()
+
+                val sheetMappings = mutableListOf<ExcelSheetMapping>()
+                val rawRows = mutableListOf<ParsedRawRow>()
+                val totalSheets = sheets.size.coerceAtLeast(1)
+
+                sheets.forEachIndexed { idx, sheet ->
+                    val sheetProgress = 0.35f + (0.53f * (idx.toFloat() / totalSheets.toFloat()))
+                    onProgress?.invoke(
+                        sheetProgress,
+                        "Membaca sheet ${sheet.name} (${idx + 1}/${sheets.size})..."
+                    )
+                    val mapping = mapSheetNameToClassAndProdi(sheet.name, studyPrograms)
+                    sheetMappings.add(mapping)
+                    val normalizedTarget = normalizeZipPath(sheet.targetPath)
+                    val sheetEntry = entryMap[normalizedTarget]
+                        ?: entryMap["xl/${normalizedTarget.removePrefix("xl/")}"]
+                    if (sheetEntry != null) {
+                        openBoundedStream(sheetEntry).use { sheetStream ->
+                            rawRows.addAll(
+                                parseWorksheetRowsStreaming(
+                                    sheetName = sheet.name,
+                                    mapping = mapping,
+                                    sheetXmlStream = sheetStream,
+                                    sharedStrings = sharedStrings,
+                                    styleColorMap = styleColorMap
+                                )
+                            )
+                        }
+                    }
+                }
+
+                onProgress?.invoke(0.94f, "Memvalidasi NIM, prodi, warna AFK, dan duplikat...")
+                val validatedRows = validateParsedRows(rawRows, existingStudents)
+                onProgress?.invoke(1.0f, "Validasi selesai (${validatedRows.size} baris diperiksa).")
+                Result.success(
+                    ExcelImportPreviewSummary(
+                        fileName = fileName,
+                        sheetMappings = sheetMappings,
+                        rows = validatedRows
+                    )
+                )
+            }
+        } catch (_: OutOfMemoryError) {
+            Result.failure(
+                IllegalStateException(
+                    "File Excel terlalu besar atau kompleks untuk memori perangkat. Pisahkan file per kelas atau hapus gambar/format kosong lalu coba lagi."
+                )
+            )
+        } catch (_: ZipException) {
+            Result.failure(
+                IllegalArgumentException(
+                    "File Excel (.xlsx) rusak atau terenkripsi password. Buka di Excel/Google Sheets lalu simpan ulang sebagai .xlsx standar tanpa password."
+                )
+            )
+        } catch (e: IllegalArgumentException) {
+            Result.failure(e)
+        } catch (e: IllegalStateException) {
+            Result.failure(e)
+        } catch (t: Throwable) {
+            Result.failure(
+                IllegalStateException(
+                    "Gagal memproses file Excel (.xlsx): ${t.message?.take(140) ?: "format XML tidak dikenali"}."
+                )
+            )
+        }
+    }
+
     fun parseXlsx(
         fileName: String,
         bytes: ByteArray,
         existingStudents: List<StudentRecord>,
-        studyPrograms: List<StudyProgram> = OfficialStudyPrograms.list
+        studyPrograms: List<StudyProgram> = OfficialStudyPrograms.list,
+        onProgress: ((progress: Float, statusText: String) -> Unit)? = null
     ): Result<ExcelImportPreviewSummary> {
         return try {
             require(bytes.isNotEmpty()) { "File Excel kosong." }
@@ -111,6 +280,7 @@ object ExcelStudentImportParser {
                 return Result.failure(IllegalArgumentException(validationError))
             }
 
+            onProgress?.invoke(0.12f, "Membuka struktur file Excel (.xlsx)...")
             val entries = unzipRequiredXmlEntries(bytes)
             val workbookBytes = entries["xl/workbook.xml"]
                 ?: return Result.failure(
@@ -124,33 +294,46 @@ object ExcelStudentImportParser {
             val sheets = parseWorkbookSheets(workbookBytes, relsBytes)
             require(sheets.isNotEmpty()) { "Tidak ada sheet ditemukan di dalam file Excel." }
 
-            val sharedStrings = entries["xl/sharedstrings.xml"]?.let(::parseSharedStringsStreaming).orEmpty()
+            onProgress?.invoke(0.25f, "Membaca tabel teks (sharedStrings)...")
+            val sharedStrings = entries["xl/sharedstrings.xml"]?.let {
+                ByteArrayInputStream(it).use(::parseSharedStringsStreaming)
+            }.orEmpty()
             val themeColors = entries["xl/theme/theme1.xml"]?.let(::parseThemeColors) ?: DEFAULT_THEME_COLORS
-            val styleColorMap = entries["xl/styles.xml"]?.let { parseCellStyleFillColors(it, themeColors) }.orEmpty()
+            onProgress?.invoke(0.35f, "Menganalisis warna sel & gaya (AFK / Blok Hitam)...")
+            val styleColorMap = entries["xl/styles.xml"]?.let {
+                ByteArrayInputStream(it).use { stream -> parseCellStyleFillColorsStreaming(stream, themeColors) }
+            }.orEmpty()
 
             val sheetMappings = mutableListOf<ExcelSheetMapping>()
             val rawRows = mutableListOf<ParsedRawRow>()
+            val totalSheets = sheets.size.coerceAtLeast(1)
 
-            sheets.forEach { sheet ->
+            sheets.forEachIndexed { idx, sheet ->
+                val sheetProgress = 0.38f + (0.50f * (idx.toFloat() / totalSheets.toFloat()))
+                onProgress?.invoke(sheetProgress, "Membaca sheet ${sheet.name} (${idx + 1}/${sheets.size})...")
                 val mapping = mapSheetNameToClassAndProdi(sheet.name, studyPrograms)
                 sheetMappings.add(mapping)
                 val normalizedTarget = normalizeZipPath(sheet.targetPath)
                 val sheetBytes = entries[normalizedTarget]
                     ?: entries["xl/${normalizedTarget.removePrefix("xl/")}"]
                 if (sheetBytes != null) {
-                    rawRows.addAll(
-                        parseWorksheetRowsStreaming(
-                            sheetName = sheet.name,
-                            mapping = mapping,
-                            sheetXmlBytes = sheetBytes,
-                            sharedStrings = sharedStrings,
-                            styleColorMap = styleColorMap
+                    ByteArrayInputStream(sheetBytes).use { stream ->
+                        rawRows.addAll(
+                            parseWorksheetRowsStreaming(
+                                sheetName = sheet.name,
+                                mapping = mapping,
+                                sheetXmlStream = stream,
+                                sharedStrings = sharedStrings,
+                                styleColorMap = styleColorMap
+                            )
                         )
-                    )
+                    }
                 }
             }
 
+            onProgress?.invoke(0.94f, "Memvalidasi NIM, prodi, dan deteksi duplikat...")
             val validatedRows = validateParsedRows(rawRows, existingStudents)
+            onProgress?.invoke(1.0f, "Validasi selesai (${validatedRows.size} baris diperiksa).")
             Result.success(
                 ExcelImportPreviewSummary(
                     fileName = fileName,
@@ -180,6 +363,37 @@ object ExcelStudentImportParser {
                     "Gagal memproses file Excel (.xlsx): ${t.message?.take(140) ?: "format XML tidak dikenali"}."
                 )
             )
+        }
+    }
+
+    private class BoundedZipEntryInputStream(
+        delegate: InputStream,
+        private val maxEntryBytes: Long,
+        private val totalCounter: LongArray,
+        private val maxTotalBytes: Long
+    ) : FilterInputStream(delegate) {
+        private var entryRead = 0L
+
+        override fun read(): Int {
+            val b = super.read()
+            if (b >= 0) account(1)
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val n = super.read(b, off, len)
+            if (n > 0) account(n.toLong())
+            return n
+        }
+
+        private fun account(delta: Long) {
+            entryRead += delta
+            totalCounter[0] += delta
+            if (entryRead > maxEntryBytes || totalCounter[0] > maxTotalBytes) {
+                throw IllegalArgumentException(
+                    "Isi file Excel melebihi batas memori aman perangkat. Hapus baris kosong atau gambar di dalam Excel lalu coba lagi."
+                )
+            }
         }
     }
 
@@ -501,7 +715,7 @@ object ExcelStudentImportParser {
      * Constant-memory SAX streaming parser for `xl/sharedStrings.xml`.
      * Avoids building a full DOM tree on Android devices.
      */
-    private fun parseSharedStringsStreaming(bytes: ByteArray): List<String> {
+    private fun parseSharedStringsStreaming(stream: InputStream): List<String> {
         val result = ArrayList<String>(256)
         val saxParser = createSecureSaxParserFactory().newSAXParser()
         val handler = object : DefaultHandler() {
@@ -545,7 +759,7 @@ object ExcelStudentImportParser {
                 }
             }
         }
-        saxParser.parse(ByteArrayInputStream(bytes), handler)
+        saxParser.parse(stream, handler)
         return result
     }
 
@@ -579,105 +793,171 @@ object ExcelStudentImportParser {
         return null
     }
 
-    private fun parseCellStyleFillColors(
-        stylesBytes: ByteArray,
+    private data class RawColorSpec(
+        val auto: String?,
+        val rgb: String?,
+        val theme: Int?,
+        val indexed: Int?,
+        val tint: Double?
+    )
+
+    private data class RawFillSpec(
+        val patternType: String,
+        val fgColor: RawColorSpec?,
+        val bgColor: RawColorSpec?
+    )
+
+    /**
+     * Constant-memory SAX streaming parser for `xl/styles.xml`.
+     * Real MS Excel & WPS Office workbooks can have multi-megabyte `styles.xml` files with
+     * thousands of styles; using SAX instead of DOM prevents 8–12x heap expansion & OOM kills on Android.
+     */
+    private fun parseCellStyleFillColorsStreaming(
+        stylesStream: InputStream,
         themeColors: List<String>
     ): Map<Int, ExcelRowColorFlag> {
-        val root = parseXml(stylesBytes)
-
-        // Optional custom indexed colors palette
         val indexedPalette = DEFAULT_INDEXED_COLORS.toMutableList()
-        val indexedColorsContainer = findFirstChildByLocalName(
-            findFirstChildByLocalName(root, "colors"),
-            "indexedColors"
-        )
-        if (indexedColorsContainer != null) {
-            val rgbColorEls = getDirectChildrenByLocalName(indexedColorsContainer, "rgbColor")
-            rgbColorEls.forEachIndexed { idx, el ->
-                val rgb = el.getAttribute("rgb").trim()
-                val hex6 = if (rgb.length == 8) rgb.substring(2) else rgb
-                if (hex6.length == 6) {
-                    if (idx < indexedPalette.size) indexedPalette[idx] = hex6 else indexedPalette.add(hex6)
-                }
-            }
-        }
+        val rawFills = ArrayList<RawFillSpec>(64)
+        val cellXfFillIds = ArrayList<Int>(128)
 
-        // Parse <fills>
-        val fillsContainer = findFirstChildByLocalName(root, "fills")
-        val fillFlags = mutableListOf<ExcelRowColorFlag>()
-        if (fillsContainer != null) {
-            val fillEls = getDirectChildrenByLocalName(fillsContainer, "fill")
-            fillEls.forEach { fillEl ->
-                val patternFill = findFirstChildByLocalName(fillEl, "patternFill")
-                if (patternFill == null) {
-                    fillFlags.add(ExcelRowColorFlag.NONE)
-                } else {
-                    val patternType = patternFill.getAttribute("patternType").lowercase(Locale.US)
-                    if (patternType.isBlank() || patternType == "none" || patternType == "gray125") {
-                        fillFlags.add(ExcelRowColorFlag.NONE)
-                    } else {
-                        val fgColorEl = findFirstChildByLocalName(patternFill, "fgColor")
-                        val bgColorEl = findFirstChildByLocalName(patternFill, "bgColor")
-                        val rgb = resolveExcelColorElement(fgColorEl, themeColors, indexedPalette)
-                            ?: resolveExcelColorElement(bgColorEl, themeColors, indexedPalette)
-                        val flag = if (rgb != null) {
-                            classifyFillColor(rgb.r, rgb.g, rgb.b)
-                        } else {
-                            ExcelRowColorFlag.NONE
+        val saxParser = createSecureSaxParserFactory().newSAXParser()
+        val handler = object : DefaultHandler() {
+            private var inColors = false
+            private var inIndexedColors = false
+            private var indexedColorIdx = 0
+
+            private var inFills = false
+            private var inFill = false
+            private var inPatternFill = false
+            private var currentPatternType = ""
+            private var currentFg: RawColorSpec? = null
+            private var currentBg: RawColorSpec? = null
+
+            private var inCellXfs = false
+
+            private fun extractColorSpec(attrs: Attributes?): RawColorSpec {
+                return RawColorSpec(
+                    auto = attrs?.getValue("auto")?.trim(),
+                    rgb = attrs?.getValue("rgb")?.trim(),
+                    theme = attrs?.getValue("theme")?.trim()?.toIntOrNull(),
+                    indexed = attrs?.getValue("indexed")?.trim()?.toIntOrNull(),
+                    tint = attrs?.getValue("tint")?.trim()?.toDoubleOrNull()
+                )
+            }
+
+            override fun startElement(uri: String?, localName: String?, qName: String?, attributes: Attributes?) {
+                val tag = (qName ?: localName).orEmpty().substringAfter(':')
+                when (tag) {
+                    "colors" -> inColors = true
+                    "indexedColors" -> if (inColors) {
+                        inIndexedColors = true
+                        indexedColorIdx = 0
+                    }
+                    "rgbColor" -> if (inIndexedColors) {
+                        val rgb = attributes?.getValue("rgb")?.trim().orEmpty()
+                        val hex6 = if (rgb.length == 8) rgb.substring(2) else rgb
+                        if (hex6.length == 6) {
+                            if (indexedColorIdx < indexedPalette.size) {
+                                indexedPalette[indexedColorIdx] = hex6
+                            } else {
+                                indexedPalette.add(hex6)
+                            }
                         }
-                        fillFlags.add(flag)
+                        indexedColorIdx++
+                    }
+                    "fills" -> inFills = true
+                    "fill" -> if (inFills) {
+                        inFill = true
+                        inPatternFill = false
+                        currentPatternType = ""
+                        currentFg = null
+                        currentBg = null
+                    }
+                    "patternFill" -> if (inFill) {
+                        inPatternFill = true
+                        currentPatternType = attributes?.getValue("patternType")?.trim()?.lowercase(Locale.US).orEmpty()
+                    }
+                    "fgColor" -> if (inPatternFill) {
+                        currentFg = extractColorSpec(attributes)
+                    }
+                    "bgColor" -> if (inPatternFill) {
+                        currentBg = extractColorSpec(attributes)
+                    }
+                    "cellXfs" -> inCellXfs = true
+                    "xf" -> if (inCellXfs) {
+                        val fillId = attributes?.getValue("fillId")?.trim()?.toIntOrNull() ?: 0
+                        cellXfFillIds.add(fillId)
                     }
                 }
             }
+
+            override fun endElement(uri: String?, localName: String?, qName: String?) {
+                val tag = (qName ?: localName).orEmpty().substringAfter(':')
+                when (tag) {
+                    "indexedColors" -> inIndexedColors = false
+                    "colors" -> inColors = false
+                    "patternFill" -> inPatternFill = false
+                    "fill" -> if (inFill) {
+                        rawFills.add(RawFillSpec(currentPatternType, currentFg, currentBg))
+                        inFill = false
+                    }
+                    "fills" -> inFills = false
+                    "cellXfs" -> inCellXfs = false
+                }
+            }
+        }
+        saxParser.parse(stylesStream, handler)
+
+        val fillFlags = rawFills.map { spec ->
+            if (spec.patternType.isBlank() || spec.patternType == "none" || spec.patternType == "gray125") {
+                ExcelRowColorFlag.NONE
+            } else {
+                val rgb = resolveExcelColorSpec(spec.fgColor, themeColors, indexedPalette)
+                    ?: resolveExcelColorSpec(spec.bgColor, themeColors, indexedPalette)
+                if (rgb != null) classifyFillColor(rgb.r, rgb.g, rgb.b) else ExcelRowColorFlag.NONE
+            }
         }
 
-        // Parse <cellXfs>
-        val cellXfs = findFirstChildByLocalName(root, "cellXfs") ?: return emptyMap()
-        val xfEls = getDirectChildrenByLocalName(cellXfs, "xf")
-        val styleMap = HashMap<Int, ExcelRowColorFlag>(xfEls.size)
-        xfEls.forEachIndexed { styleIdx, xf ->
-            val fillId = xf.getAttribute("fillId").toIntOrNull() ?: 0
-            val flag = fillFlags.getOrElse(fillId) { ExcelRowColorFlag.NONE }
-            styleMap[styleIdx] = flag
+        val styleMap = HashMap<Int, ExcelRowColorFlag>(cellXfFillIds.size)
+        cellXfFillIds.forEachIndexed { styleIdx, fillId ->
+            styleMap[styleIdx] = fillFlags.getOrElse(fillId) { ExcelRowColorFlag.NONE }
         }
         return styleMap
     }
 
-    private fun resolveExcelColorElement(
-        colorEl: Element?,
+    private fun resolveExcelColorSpec(
+        spec: RawColorSpec?,
         themeColors: List<String>,
         indexedPalette: List<String>
     ): RgbColor? {
-        if (colorEl == null) return null
-        if (colorEl.getAttribute("auto") == "1" || colorEl.getAttribute("auto").equals("true", ignoreCase = true)) {
+        if (spec == null) return null
+        if (spec.auto == "1" || spec.auto.equals("true", ignoreCase = true)) {
             return null
         }
 
-        val rgbAttr = colorEl.getAttribute("rgb").trim()
+        val rgbAttr = spec.rgb.orEmpty()
         if (rgbAttr.length == 6 || rgbAttr.length == 8) {
             val alpha = if (rgbAttr.length == 8) rgbAttr.substring(0, 2).toIntOrNull(16) ?: 255 else 255
             if (alpha == 0 && rgbAttr == "00000000") return null
             val hex6 = if (rgbAttr.length == 8) rgbAttr.substring(2) else rgbAttr
             val base = parseHexRgb(hex6) ?: return null
-            val tint = colorEl.getAttribute("tint").toDoubleOrNull()
+            val tint = spec.tint
             return if (tint != null && tint != 0.0) applyTint(base, tint) else base
         }
 
-        val themeAttr = colorEl.getAttribute("theme").toIntOrNull()
+        val themeAttr = spec.theme
         if (themeAttr != null && themeAttr in themeColors.indices) {
             val base = parseHexRgb(themeColors[themeAttr]) ?: return null
-            val tint = colorEl.getAttribute("tint").toDoubleOrNull()
+            val tint = spec.tint
             return if (tint != null && tint != 0.0) applyTint(base, tint) else base
         }
 
-        val indexedAttr = colorEl.getAttribute("indexed").toIntOrNull()
+        val indexedAttr = spec.indexed
         if (indexedAttr != null) {
             if (indexedAttr == 64) {
-                // System foreground in a solid pattern fill is black
                 return RgbColor(0, 0, 0)
             }
             if (indexedAttr == 65) {
-                // System background is white / none
                 return null
             }
             if (indexedAttr in indexedPalette.indices) {
@@ -746,7 +1026,7 @@ object ExcelStudentImportParser {
     private fun parseWorksheetRowsStreaming(
         sheetName: String,
         mapping: ExcelSheetMapping,
-        sheetXmlBytes: ByteArray,
+        sheetXmlStream: InputStream,
         sharedStrings: List<String>,
         styleColorMap: Map<Int, ExcelRowColorFlag>
     ): List<ParsedRawRow> {
@@ -862,7 +1142,7 @@ object ExcelStudentImportParser {
                 }
             }
         }
-        saxParser.parse(ByteArrayInputStream(sheetXmlBytes), handler)
+        saxParser.parse(sheetXmlStream, handler)
 
         // Locate header row (first row containing both NIM and Nama, or fallback defaults)
         var headerRowIndex = -1

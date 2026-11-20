@@ -1,6 +1,9 @@
 package com.example.ui.state
 
 import android.app.Application
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.assignments.AssignmentSyncService
@@ -65,18 +68,24 @@ import com.example.ui.model.XpHistoryTimeRange
 import com.example.ui.model.resolveTaskCompletionStatus
 import com.example.ui.navigation.AdminDestination
 import com.example.ui.navigation.StudentDestination
+import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class AuthPortalMode {
     STUDENT_LOGIN,
@@ -91,6 +100,20 @@ sealed interface RouteAccessResult {
     data class SessionExpired(val redirectPortal: AuthPortalMode) : RouteAccessResult
 }
 
+data class ExcelImportUiState(
+    val isDialogOpen: Boolean = false,
+    val isParsingFile: Boolean = false,
+    val parsingFileName: String? = null,
+    val parseProgress: Float = 0f,
+    val parseStatusText: String = "",
+    val parseError: String? = null,
+    val previewSummary: ExcelImportPreviewSummary? = null,
+    val isCommitting: Boolean = false,
+    val commitProgress: Float = 0f,
+    val commitStatusText: String = "",
+    val commitError: String? = null
+)
+
 data class AzrilUiState(
     val currentUser: UserProfile? = null,
     val authPortalMode: AuthPortalMode = AuthPortalMode.STUDENT_LOGIN,
@@ -104,6 +127,8 @@ data class AzrilUiState(
     val adminDestination: AdminDestination = AdminDestination.DASHBOARD,
     val studentDestination: StudentDestination = StudentDestination.DASHBOARD,
     val loadState: ScreenLoadState = ScreenLoadState.Ready,
+    val activeRouteLoading: Boolean = false,
+    val activeLoadingRouteKey: String? = null,
     val toastMessage: ToastMessage? = null,
     // Official study programs seeded strictly with HES, PJKR, FARMASI
     val studyPrograms: List<StudyProgram> = OfficialStudyPrograms.list,
@@ -121,6 +146,9 @@ data class AzrilUiState(
     val isSyncingStudents: Boolean = false,
     val studentsSyncError: String? = null,
     val hasLiveSupabaseSession: Boolean = false,
+    val isConnectingAdminSupabase: Boolean = false,
+    val adminSupabaseConnectError: String? = null,
+    val excelImportState: ExcelImportUiState = ExcelImportUiState(),
     val rankingPoints: List<RankingPointTransaction> = emptyList(),
     val rankingAuditLogs: List<RankingPointAuditLog> = emptyList(),
     val studentStreaks: Map<String, StudentStreakState> = emptyMap(),
@@ -148,6 +176,9 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         activeTokenProvider = { authRepository.getActiveSupabaseJwt() }
     )
     private var pendingStudentPersistenceJob: Job? = null
+    private var activeRouteRefreshJob: Job? = null
+    private var activeExcelParseJob: Job? = null
+    private var activeExcelCommitJob: Job? = null
 
     private val _uiState = MutableStateFlow(
         AzrilUiState(isSupabaseConfigured = authRepository.isSupabaseConfigured())
@@ -212,6 +243,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(hasLiveSupabaseSession = liveSession) }
             if (current?.role == UserRole.STUDENT && !current.mustChangePassword) {
                 recordStudentDailyLogin(current.id)
+                refreshStudentDirectoryAndXpFromSupabase(showToastOnComplete = false)
                 syncAssignmentsAndChecklists(showToastOnComplete = false)
             } else if (current == null || current.role == UserRole.ADMIN) {
                 evaluateStreakRemindersForInactiveStudents()
@@ -313,8 +345,11 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                     val active = _uiState.value.currentUser
+                    val liveSession = authRepository.hasLiveSupabaseSession()
+                    _uiState.update { it.copy(hasLiveSupabaseSession = liveSession) }
                     if (active?.role == UserRole.STUDENT && !active.mustChangePassword) {
                         recordStudentDailyLogin(active.id)
+                        refreshStudentDirectoryAndXpFromSupabase(showToastOnComplete = false)
                         syncAssignmentsAndChecklists(showToastOnComplete = false)
                     }
                 }
@@ -570,14 +605,57 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 return RouteAccessResult.AccessDenied(msg)
             }
             val matchedDest = resolveAdminDestinationFromRoute(normalized)
-            _uiState.update { it.copy(adminDestination = matchedDest, loadState = ScreenLoadState.Ready) }
-            if (authRepository.isSupabaseConfigured() &&
-                (matchedDest == AdminDestination.STUDENTS ||
-                    matchedDest == AdminDestination.CLASSES ||
-                    matchedDest == AdminDestination.DASHBOARD) &&
-                !_uiState.value.isSyncingStudents
-            ) {
-                refreshStudentsAndClassesFromSupabase(showToastOnComplete = false, force = false)
+            val routeKey = matchedDest.route
+            _uiState.update {
+                it.copy(
+                    adminDestination = matchedDest,
+                    loadState = ScreenLoadState.Ready,
+                    activeRouteLoading = true,
+                    activeLoadingRouteKey = routeKey
+                )
+            }
+            activeRouteRefreshJob?.cancel()
+            activeRouteRefreshJob = viewModelScope.launch {
+                try {
+                    if (authRepository.isSupabaseConfigured()) {
+                        when (matchedDest) {
+                            AdminDestination.DASHBOARD,
+                            AdminDestination.STUDENTS,
+                            AdminDestination.CLASSES,
+                            AdminDestination.RANKING -> {
+                                if (!_uiState.value.isSyncingStudents) {
+                                    when (val res = authRepository.fetchStudentsAndClassesFromSupabase()) {
+                                        is RemoteDirectoryResult.Success -> applyRemoteDirectoryResult(res, overrideSuccessToast = null)
+                                        is RemoteDirectoryResult.Error -> _uiState.update { state ->
+                                            state.copy(
+                                                isSyncingStudents = false,
+                                                hasLiveSupabaseSession = authRepository.hasLiveSupabaseSession(),
+                                                studentsSyncError = res.message
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            AdminDestination.ASSIGNMENTS,
+                            AdminDestination.SUBMISSIONS,
+                            AdminDestination.GRADING -> {
+                                syncAssignmentsAndChecklists(showToastOnComplete = false)
+                                delay(220)
+                            }
+                            else -> delay(160)
+                        }
+                    } else {
+                        delay(160)
+                    }
+                } finally {
+                    _uiState.update { state ->
+                        if (state.activeLoadingRouteKey == routeKey) {
+                            state.copy(activeRouteLoading = false, activeLoadingRouteKey = null)
+                        } else {
+                            state
+                        }
+                    }
+                }
             }
             return RouteAccessResult.Allowed
         }
@@ -599,7 +677,54 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 return RouteAccessResult.AccessDenied(msg)
             }
             val matchedDest = resolveStudentDestinationFromRoute(normalized)
-            _uiState.update { it.copy(studentDestination = matchedDest, loadState = ScreenLoadState.Ready) }
+            val routeKey = matchedDest.route
+            _uiState.update {
+                it.copy(
+                    studentDestination = matchedDest,
+                    loadState = ScreenLoadState.Ready,
+                    activeRouteLoading = true,
+                    activeLoadingRouteKey = routeKey
+                )
+            }
+            activeRouteRefreshJob?.cancel()
+            activeRouteRefreshJob = viewModelScope.launch {
+                try {
+                    val hasLiveJwt = authRepository.isSupabaseConfigured() && authRepository.hasLiveSupabaseSession()
+                    when (matchedDest) {
+                        StudentDestination.DASHBOARD,
+                        StudentDestination.RANKING,
+                        StudentDestination.XP_HISTORY,
+                        StudentDestination.PROFILE -> {
+                            if (hasLiveJwt) {
+                                when (val res = authRepository.fetchStudentLeaderboardAndXpFromSupabase(current.id)) {
+                                    is RemoteDirectoryResult.Success -> applyRemoteDirectoryResult(res, overrideSuccessToast = null)
+                                    else -> Unit
+                                }
+                            } else {
+                                delay(220)
+                            }
+                            if (matchedDest == StudentDestination.DASHBOARD && hasLiveJwt) {
+                                syncAssignmentsAndChecklists(showToastOnComplete = false)
+                            }
+                        }
+                        StudentDestination.ASSIGNMENTS,
+                        StudentDestination.MY_SUBMISSIONS,
+                        StudentDestination.GRADES_FEEDBACK -> {
+                            syncAssignmentsAndChecklists(showToastOnComplete = false)
+                            delay(if (hasLiveJwt) 320 else 200)
+                        }
+                        else -> delay(180)
+                    }
+                } finally {
+                    _uiState.update { state ->
+                        if (state.activeLoadingRouteKey == routeKey) {
+                            state.copy(activeRouteLoading = false, activeLoadingRouteKey = null)
+                        } else {
+                            state
+                        }
+                    }
+                }
+            }
             return RouteAccessResult.Allowed
         }
 
@@ -687,16 +812,67 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun triggerRefresh() {
-        if (_uiState.value.currentUser?.role == UserRole.ADMIN && authRepository.isSupabaseConfigured()) {
-            refreshStudentsAndClassesFromSupabase(showToastOnComplete = false, force = true)
+        val role = _uiState.value.currentUser?.role
+        if (role == UserRole.ADMIN && authRepository.isSupabaseConfigured()) {
+            refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true)
+        } else if (role == UserRole.STUDENT && authRepository.isSupabaseConfigured()) {
+            refreshStudentDirectoryAndXpFromSupabase(showToastOnComplete = true)
         }
-        syncAssignmentsAndChecklists(showToastOnComplete = true)
+        syncAssignmentsAndChecklists(showToastOnComplete = role == null || !authRepository.isSupabaseConfigured())
+    }
+
+    fun clearAdminSupabaseConnectError() {
+        _uiState.update { it.copy(adminSupabaseConnectError = null) }
     }
 
     /**
-     * Fetches the authoritative study programs, classes, and student roster directly from Supabase
-     * (`study_programs`, `classes`, `profiles?role=eq.student`) so all Admin devices always reflect
-     * real database state rather than device-local cache.
+     * Connects an already logged-in Admin directly to Supabase Auth in-place without
+     * logging out, then immediately fetches authoritative students, classes, and XP data.
+     */
+    fun connectAdminSupabaseSession(
+        identifier: String,
+        password: String,
+        onConnected: () -> Unit = {}
+    ) {
+        if (_uiState.value.currentUser?.role != UserRole.ADMIN) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isConnectingAdminSupabase = true, adminSupabaseConnectError = null) }
+            when (val res = authRepository.connectSupabaseAdminSession(identifier, password, rememberMe = true)) {
+                is AuthResult.Success -> {
+                    _uiState.update { state ->
+                        state.copy(
+                            isConnectingAdminSupabase = false,
+                            adminSupabaseConnectError = null,
+                            currentUser = res.profile,
+                            hasLiveSupabaseSession = true,
+                            studentsSyncError = null,
+                            sessionExpiresAtMillis = res.sessionExpiresAt.takeIf { it > 0L }
+                                ?: state.sessionExpiresAtMillis,
+                            toastMessage = ToastMessage(
+                                "Sesi Admin berhasil terhubung ke Supabase Auth. Memuat data mahasiswa...",
+                                ToastType.SUCCESS
+                            )
+                        )
+                    }
+                    onConnected()
+                    refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true)
+                    syncAssignmentsAndChecklists(showToastOnComplete = false)
+                }
+                is AuthResult.Failure -> {
+                    _uiState.update {
+                        it.copy(
+                            isConnectingAdminSupabase = false,
+                            adminSupabaseConnectError = res.message
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Fetches the authoritative study programs, classes, student roster, and XP ledger directly
+     * from Supabase so all Admin devices always reflect real database state.
      */
     fun refreshStudentsAndClassesFromSupabase(
         showToastOnComplete: Boolean = false,
@@ -713,6 +889,112 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Fetches the authoritative leaderboard roster, classes, study programs, XP history,
+     * and login streak from Supabase for the currently logged-in Student so Student Ranking,
+     * Podium Top 3, Profile, and XP History use the exact same Supabase source as Admin.
+     */
+    fun refreshStudentDirectoryAndXpFromSupabase(
+        showToastOnComplete: Boolean = false
+    ) {
+        val student = _uiState.value.currentUser ?: return
+        if (student.role != UserRole.STUDENT || !authRepository.isSupabaseConfigured()) return
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isSyncingStudents = true) }
+            val result = authRepository.fetchStudentLeaderboardAndXpFromSupabase(student.id)
+            when (result) {
+                is RemoteDirectoryResult.Success -> {
+                    val dir = result.directory
+                    _uiState.update { state ->
+                        val mergedStudents = if (dir.students.isNotEmpty()) {
+                            mergeRegisteredStudents(state.students, dir.students)
+                        } else state.students
+                        val refreshedMe = mergedStudents.find { it.id == student.id }
+                        val updatedUser = if (refreshedMe != null) {
+                            state.currentUser?.copy(
+                                fullName = refreshedMe.fullName,
+                                nim = refreshedMe.nim,
+                                studyProgramId = refreshedMe.studyProgramId,
+                                studyProgramName = refreshedMe.studyProgramName,
+                                classId = refreshedMe.classId,
+                                className = refreshedMe.className ?: state.currentUser.className,
+                                semester = refreshedMe.semester,
+                                cohortYear = refreshedMe.cohortYear,
+                                status = refreshedMe.status,
+                                badgeStatus = refreshedMe.badgeStatus
+                            )
+                        } else state.currentUser
+                        val mergedXp = mergeXpTransactionsWithoutDuplicates(state.rankingPoints, dir.xpTransactions)
+                        val mergedStreaks = mergeStudentStreaks(state.studentStreaks, dir.studentStreaks)
+                        state.copy(
+                            currentUser = updatedUser,
+                            studyPrograms = dir.studyPrograms.ifEmpty { state.studyPrograms },
+                            classes = dir.classes.ifEmpty { state.classes },
+                            students = mergedStudents,
+                            rankingPoints = mergedXp,
+                            studentStreaks = mergedStreaks,
+                            isSyncingStudents = false,
+                            hasLiveSupabaseSession = true,
+                            toastMessage = if (showToastOnComplete) {
+                                ToastMessage("Data akademik & ranking diperbarui dari Supabase.", ToastType.SUCCESS)
+                            } else state.toastMessage
+                        )
+                    }
+                }
+                is RemoteDirectoryResult.Error -> {
+                    _uiState.update { state ->
+                        state.copy(
+                            isSyncingStudents = false,
+                            toastMessage = if (showToastOnComplete) {
+                                ToastMessage(result.message, ToastType.WARNING)
+                            } else state.toastMessage
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun mergeXpTransactionsWithoutDuplicates(
+        local: List<RankingPointTransaction>,
+        remote: List<RankingPointTransaction>
+    ): List<RankingPointTransaction> {
+        if (remote.isEmpty()) return local
+        val byKey = linkedMapOf<String, RankingPointTransaction>()
+        remote.forEach { tx -> byKey["${tx.studentId}|${tx.sourceId}"] = tx }
+        val remoteDetailedStudentIds = remote.filterNot { it.id.startsWith("sb-lb-") }.map { it.studentId }.toSet()
+        val remoteSummaryStudentIds = remote.filter { it.id.startsWith("sb-lb-") }.map { it.studentId }.toSet()
+        local.forEach { tx ->
+            val key = "${tx.studentId}|${tx.sourceId}"
+            val skipBecauseServerSummaryCoversPeer = tx.studentId in remoteSummaryStudentIds && tx.studentId !in remoteDetailedStudentIds
+            if (!skipBecauseServerSummaryCoversPeer && !byKey.containsKey(key)) {
+                byKey[key] = tx
+            }
+        }
+        return byKey.values.sortedByDescending { it.timestampMillis }
+    }
+
+    private fun mergeStudentStreaks(
+        local: Map<String, StudentStreakState>,
+        remote: Map<String, StudentStreakState>
+    ): Map<String, StudentStreakState> {
+        if (remote.isEmpty()) return local
+        val merged = local.toMutableMap()
+        remote.forEach { (sid, r) ->
+            val l = merged[sid]
+            merged[sid] = if (l != null) {
+                r.copy(
+                    currentStreak = maxOf(r.currentStreak, l.currentStreak),
+                    longestStreak = maxOf(r.longestStreak, l.longestStreak),
+                    loginDatesWib = (l.loginDatesWib + listOfNotNull(r.lastLoginDateWib)).distinct(),
+                    claimedMilestonesInCycle = l.claimedMilestonesInCycle
+                )
+            } else r
+        }
+        return merged
+    }
+
     private suspend fun applyRemoteDirectoryResult(
         result: RemoteDirectoryResult,
         showToastOnComplete: Boolean = false,
@@ -722,10 +1004,14 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
             is RemoteDirectoryResult.Success -> {
                 val dir = result.directory
                 _uiState.update { state ->
+                    val mergedXp = mergeXpTransactionsWithoutDuplicates(state.rankingPoints, dir.xpTransactions)
+                    val mergedStreaks = mergeStudentStreaks(state.studentStreaks, dir.studentStreaks)
                     state.copy(
                         studyPrograms = dir.studyPrograms.ifEmpty { state.studyPrograms },
                         classes = dir.classes,
                         students = dir.students,
+                        rankingPoints = mergedXp,
+                        studentStreaks = mergedStreaks,
                         isSyncingStudents = false,
                         studentsSyncError = null,
                         hasLiveSupabaseSession = true,
@@ -1877,6 +2163,293 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // --- BULK EXCEL (.XLSX) STUDENT IMPORT, COLOR FILTERING (RED=AFK, BLACK=SKIP), & HISTORICAL ATTENDANCE ---
+    fun openExcelImportDialog() {
+        _uiState.update { state ->
+            state.copy(
+                excelImportState = state.excelImportState.copy(
+                    isDialogOpen = true,
+                    parseError = null,
+                    commitError = null
+                )
+            )
+        }
+    }
+
+    fun dismissExcelImportDialog() {
+        val current = _uiState.value.excelImportState
+        if (current.isParsingFile) {
+            activeExcelParseJob?.cancel()
+        }
+        if (current.isCommitting) {
+            // Keep dialog open or allow explicit cancel button; closing dismisses safely after cancelling parse only
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                excelImportState = ExcelImportUiState(isDialogOpen = false)
+            )
+        }
+    }
+
+    fun cancelActiveExcelImport() {
+        activeExcelParseJob?.cancel()
+        activeExcelParseJob = null
+        val wasCommitting = _uiState.value.excelImportState.isCommitting
+        if (wasCommitting) {
+            activeExcelCommitJob?.cancel()
+            activeExcelCommitJob = null
+        }
+        _uiState.update { state ->
+            state.copy(
+                isSyncingStudents = false,
+                excelImportState = state.excelImportState.copy(
+                    isParsingFile = false,
+                    parseProgress = 0f,
+                    parseStatusText = "",
+                    parseError = if (!wasCommitting) "Pembacaan file Excel dibatalkan." else state.excelImportState.parseError,
+                    isCommitting = false,
+                    commitProgress = 0f,
+                    commitStatusText = "",
+                    commitError = if (wasCommitting) "Proses penyimpanan ke Supabase dibatalkan. Data yang sudah tersimpan tetap aman." else state.excelImportState.commitError
+                )
+            )
+        }
+    }
+
+    fun reportExcelPickerError(message: String) {
+        _uiState.update { state ->
+            state.copy(
+                excelImportState = state.excelImportState.copy(
+                    isDialogOpen = true,
+                    isParsingFile = false,
+                    parseError = message
+                )
+            )
+        }
+    }
+
+    /**
+     * Streams a user-picked Android SAF `Uri` into a temporary file inside `context.cacheDir`
+     * (bounded at 15 MB, 16 KB chunks) and parses it directly from disk via `ZipFile` + SAX so
+     * Android devices never hit OutOfMemoryError or lose state when the external file picker returns.
+     */
+    fun startExcelFileParseFromUri(context: Context, uri: Uri) {
+        activeExcelParseJob?.cancel()
+        val appContext = context.applicationContext
+        _uiState.update { state ->
+            state.copy(
+                excelImportState = ExcelImportUiState(
+                    isDialogOpen = true,
+                    isParsingFile = true,
+                    parsingFileName = "Memeriksa file...",
+                    parseProgress = 0.04f,
+                    parseStatusText = "Mengambil metadata file dari penyimpanan Android...",
+                    parseError = null,
+                    previewSummary = null
+                )
+            )
+        }
+
+        activeExcelParseJob = viewModelScope.launch {
+            var tempFile: File? = null
+            try {
+                val (displayName, reportedSizeBytes) = withContext(Dispatchers.IO) {
+                    var name: String? = null
+                    var size = -1L
+                    runCatching {
+                        appContext.contentResolver.query(
+                            uri,
+                            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                            null,
+                            null,
+                            null
+                        )?.use { c ->
+                            if (c.moveToFirst()) {
+                                val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                                if (nameIdx >= 0) name = c.getString(nameIdx)
+                                if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
+                            }
+                        }
+                    }
+                    (name?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "import_mahasiswa.xlsx") to size
+                }
+
+                _uiState.update { state ->
+                    state.copy(
+                        excelImportState = state.excelImportState.copy(
+                            parsingFileName = displayName,
+                            parseProgress = 0.08f,
+                            parseStatusText = "Menyiapkan file $displayName..."
+                        )
+                    )
+                }
+
+                if (reportedSizeBytes > ExcelStudentImportParser.MAX_XLSX_FILE_BYTES) {
+                    val mb = (reportedSizeBytes / (1024L * 1024L)).coerceAtLeast(1L)
+                    _uiState.update { state ->
+                        state.copy(
+                            excelImportState = state.excelImportState.copy(
+                                isParsingFile = false,
+                                parseError = "Ukuran file '$displayName' terlalu besar ($mb MB). Batas maksimal file Excel adalah 15 MB."
+                            )
+                        )
+                    }
+                    return@launch
+                }
+
+                if (displayName.endsWith(".xls", ignoreCase = true) && !displayName.endsWith(".xlsx", ignoreCase = true)) {
+                    _uiState.update { state ->
+                        state.copy(
+                            excelImportState = state.excelImportState.copy(
+                                isParsingFile = false,
+                                parseError = "File '$displayName' menggunakan format .xls lama. Simpan ulang sebagai Excel Workbook (.xlsx) lalu pilih kembali."
+                            )
+                        )
+                    }
+                    return@launch
+                }
+
+                val existingStudentsSnapshot = _uiState.value.students
+                val studyProgramsSnapshot = _uiState.value.studyPrograms
+
+                val parseResult = withContext(Dispatchers.IO) {
+                    ensureActive()
+                    val cacheTarget = File(
+                        appContext.cacheDir,
+                        "azril_xlsx_import_${System.currentTimeMillis()}.xlsx"
+                    )
+                    tempFile = cacheTarget
+
+                    val inputStream = appContext.contentResolver.openInputStream(uri)
+                        ?: return@withContext Result.failure<ExcelImportPreviewSummary>(
+                            IllegalStateException("Gagal membuka file '$displayName'. Pastikan file tersimpan secara lokal di perangkat dan tidak sedang terkunci.")
+                        )
+
+                    var copiedBytes = 0L
+                    inputStream.use { input ->
+                        FileOutputStream(cacheTarget).use { output ->
+                            val buffer = ByteArray(16 * 1024)
+                            while (true) {
+                                ensureActive()
+                                val read = input.read(buffer)
+                                if (read <= 0) break
+                                copiedBytes += read
+                                if (copiedBytes > ExcelStudentImportParser.MAX_XLSX_FILE_BYTES) {
+                                    throw IllegalArgumentException(
+                                        "Ukuran file '$displayName' melebihi batas maksimal 15 MB. Perkecil file Excel lalu coba lagi."
+                                    )
+                                }
+                                output.write(buffer, 0, read)
+                            }
+                            output.flush()
+                        }
+                    }
+
+                    if (copiedBytes <= 0L) {
+                        return@withContext Result.failure<ExcelImportPreviewSummary>(
+                            IllegalArgumentException("File '$displayName' kosong (0 byte).")
+                        )
+                    }
+
+                    ensureActive()
+                    ExcelStudentImportParser.parseXlsxFile(
+                        fileName = displayName,
+                        file = cacheTarget,
+                        existingStudents = existingStudentsSnapshot,
+                        studyPrograms = studyProgramsSnapshot,
+                        onProgress = { progress, status ->
+                            val scaled = (0.15f + progress * 0.85f).coerceIn(0.15f, 1.0f)
+                            _uiState.update { state ->
+                                state.copy(
+                                    excelImportState = state.excelImportState.copy(
+                                        parseProgress = scaled,
+                                        parseStatusText = status
+                                    )
+                                )
+                            }
+                        }
+                    )
+                }
+
+                parseResult.onSuccess { summary ->
+                    _uiState.update { state ->
+                        state.copy(
+                            excelImportState = state.excelImportState.copy(
+                                isParsingFile = false,
+                                parseProgress = 1f,
+                                parseStatusText = "Pratinjau siap (${summary.rows.size} baris terdeteksi).",
+                                parseError = null,
+                                previewSummary = summary,
+                                commitError = null
+                            )
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update { state ->
+                        state.copy(
+                            excelImportState = state.excelImportState.copy(
+                                isParsingFile = false,
+                                parseProgress = 0f,
+                                parseStatusText = "",
+                                previewSummary = null,
+                                parseError = err.message?.takeIf { it.isNotBlank() }
+                                    ?: "File Excel (.xlsx) tidak dapat dibaca."
+                            )
+                        )
+                    }
+                }
+            } catch (_: CancellationException) {
+                _uiState.update { state ->
+                    state.copy(
+                        excelImportState = state.excelImportState.copy(
+                            isParsingFile = false,
+                            parseProgress = 0f,
+                            parseStatusText = "",
+                            parseError = "Pembacaan file Excel dibatalkan."
+                        )
+                    )
+                }
+            } catch (_: SecurityException) {
+                _uiState.update { state ->
+                    state.copy(
+                        excelImportState = state.excelImportState.copy(
+                            isParsingFile = false,
+                            parseProgress = 0f,
+                            parseStatusText = "",
+                            parseError = "Izin akses ke file ditolak oleh Android. Salin file ke folder Download lalu pilih kembali."
+                        )
+                    )
+                }
+            } catch (_: OutOfMemoryError) {
+                _uiState.update { state ->
+                    state.copy(
+                        excelImportState = state.excelImportState.copy(
+                            isParsingFile = false,
+                            parseProgress = 0f,
+                            parseStatusText = "",
+                            parseError = "Memori perangkat tidak mencukupi untuk file ini. Hapus gambar/baris kosong di Excel atau bagi per kelas."
+                        )
+                    )
+                }
+            } catch (t: Throwable) {
+                _uiState.update { state ->
+                    state.copy(
+                        excelImportState = state.excelImportState.copy(
+                            isParsingFile = false,
+                            parseProgress = 0f,
+                            parseStatusText = "",
+                            parseError = t.message?.takeIf { it.isNotBlank() }
+                                ?: "Terjadi kesalahan saat membaca file Excel (.xlsx). Pastikan file valid dan tidak terproteksi password."
+                        )
+                    )
+                }
+            } finally {
+                runCatching { tempFile?.delete() }
+            }
+        }
+    }
+
     fun parseExcelStudentImport(
         fileName: String,
         bytes: ByteArray
@@ -1896,6 +2469,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
      * - Never overwrites existing student accounts.
      * - Username = NIM, Initial Password = NIM, mustChangePassword = true.
      * - Optional historical attendance import preserves exact Excel statuses with ZERO automatic XP.
+     * - Streams live Supabase commit progress to `excelImportState` and keeps dialog open on failure.
      */
     fun commitExcelStudentImport(
         preview: ExcelImportPreviewSummary,
@@ -1913,7 +2487,12 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
 
         if (importableRows.isEmpty()) {
             val msg = "Tidak ada mahasiswa baru yang siap diimpor (seluruh data sudah memiliki akun, blok hitam, atau tidak valid)."
-            showToast(msg, ToastType.WARNING)
+            _uiState.update {
+                it.copy(
+                    excelImportState = it.excelImportState.copy(commitError = msg),
+                    toastMessage = ToastMessage(msg, ToastType.WARNING)
+                )
+            }
             return msg
         }
 
@@ -2019,75 +2598,174 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (authRepository.isSupabaseConfigured()) {
-            _uiState.update { it.copy(isSyncingStudents = true, studentsSyncError = null) }
-            pendingStudentPersistenceJob = viewModelScope.launch {
-                val createdClasses = syncedClasses.filter { cls ->
-                    stateSnapshot.classes.none { it.id == cls.id }
-                }
-                createdClasses.forEach { cls ->
-                    authRepository.adminSaveClassToSupabase(cls, cls.studyProgramName)
-                }
-                val report = authRepository.adminBulkImportStudentsToSupabase(
-                    newStudents = newStudents,
-                    classes = syncedClasses,
-                    fileName = preview.fileName,
-                    semesterKey = semesterKey,
-                    importHistoricalAttendance = importHistoricalAttendance,
-                    previewRowsForSync = importableRows
+            activeExcelCommitJob?.cancel()
+            _uiState.update {
+                it.copy(
+                    isSyncingStudents = true,
+                    studentsSyncError = null,
+                    excelImportState = it.excelImportState.copy(
+                        isCommitting = true,
+                        commitProgress = 0.05f,
+                        commitStatusText = "Menyiapkan kelas & akun untuk disimpan ke Supabase...",
+                        commitError = null
+                    )
                 )
-                val persistedAny = report.usedEdgeFunction || report.syncedToSupabaseCount > 0
-                if (persistedAny) {
-                    authRepository.saveClasses(syncedClasses)
-                    if (newHistoricalRecords.isNotEmpty()) {
-                        authRepository.saveHistoricalAttendanceRecords(mergedHistorical)
-                        _uiState.update { it.copy(historicalAttendanceRecords = mergedHistorical) }
+            }
+            activeExcelCommitJob = viewModelScope.launch {
+                try {
+                    val createdClasses = syncedClasses.filter { cls ->
+                        stateSnapshot.classes.none { it.id == cls.id }
                     }
-                }
-                val importToast = when {
-                    report.usedEdgeFunction -> ToastMessage(summaryText, ToastType.SUCCESS)
-                    report.syncedToSupabaseCount > 0 && report.diagnosticMessage.isNullOrBlank() -> ToastMessage(
-                        buildString {
-                            append("Import Excel ke Supabase selesai: ${report.syncedToSupabaseCount} mahasiswa baru disimpan")
-                            if (report.alreadyInSupabaseCount > 0) append(", ${report.alreadyInSupabaseCount} sudah terdaftar")
-                            if (preview.skippedBlackCount > 0) append(", ${preview.skippedBlackCount} blok hitam dilewati")
-                            append(".")
-                        },
-                        ToastType.SUCCESS
-                    )
-                    report.syncedToSupabaseCount > 0 -> ToastMessage(
-                        "Import sebagian berhasil: ${report.syncedToSupabaseCount}/${report.totalProcessed} tersimpan di Supabase (${report.diagnosticMessage.orEmpty()}).",
-                        ToastType.WARNING
-                    )
-                    report.alreadyInSupabaseCount > 0 && report.diagnosticMessage.isNullOrBlank() -> ToastMessage(
-                        "Seluruh ${report.alreadyInSupabaseCount} mahasiswa pada file sudah terdaftar di Supabase (tidak diduplikasi).",
-                        ToastType.INFO
-                    )
-                    else -> ToastMessage(
-                        report.diagnosticMessage ?: "Gagal menyimpan hasil Import Excel ke database Supabase.",
-                        ToastType.ERROR
-                    )
-                }
+                    createdClasses.forEachIndexed { idx, cls ->
+                        ensureActive()
+                        _uiState.update {
+                            it.copy(
+                                excelImportState = it.excelImportState.copy(
+                                    commitProgress = 0.05f + (0.10f * ((idx + 1).toFloat() / createdClasses.size.coerceAtLeast(1))),
+                                    commitStatusText = "Menyimpan kelas ${cls.name} ke Supabase..."
+                                )
+                            )
+                        }
+                        authRepository.adminSaveClassToSupabase(cls, cls.studyProgramName)
+                    }
 
-                val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
-                if (refreshed is RemoteDirectoryResult.Success) {
-                    applyRemoteDirectoryResult(
-                        result = refreshed,
-                        overrideSuccessToast = importToast
+                    val report = authRepository.adminBulkImportStudentsToSupabase(
+                        newStudents = newStudents,
+                        classes = syncedClasses,
+                        fileName = preview.fileName,
+                        semesterKey = semesterKey,
+                        importHistoricalAttendance = importHistoricalAttendance,
+                        previewRowsForSync = importableRows,
+                        onProgress = { processed, total, statusText ->
+                            val frac = if (total > 0) processed.toFloat() / total.toFloat() else 0.5f
+                            val scaled = (0.15f + frac * 0.75f).coerceIn(0.15f, 0.90f)
+                            _uiState.update {
+                                it.copy(
+                                    excelImportState = it.excelImportState.copy(
+                                        commitProgress = scaled,
+                                        commitStatusText = statusText
+                                    )
+                                )
+                            }
+                        }
                     )
-                    if (importToast.type == ToastType.ERROR && !report.diagnosticMessage.isNullOrBlank()) {
-                        _uiState.update { it.copy(studentsSyncError = report.diagnosticMessage) }
+
+                    val persistedAny = report.usedEdgeFunction || report.syncedToSupabaseCount > 0 ||
+                        (report.alreadyInSupabaseCount > 0 && report.diagnosticMessage.isNullOrBlank())
+                    if (persistedAny) {
+                        authRepository.saveClasses(syncedClasses)
+                        if (newHistoricalRecords.isNotEmpty()) {
+                            authRepository.saveHistoricalAttendanceRecords(mergedHistorical)
+                            _uiState.update { it.copy(historicalAttendanceRecords = mergedHistorical) }
+                        }
                     }
-                } else {
-                    val errMsg = report.diagnosticMessage ?: (refreshed as? RemoteDirectoryResult.Error)?.message
+
+                    val importToast = when {
+                        report.usedEdgeFunction -> ToastMessage(summaryText, ToastType.SUCCESS)
+                        report.syncedToSupabaseCount > 0 && report.diagnosticMessage.isNullOrBlank() -> ToastMessage(
+                            buildString {
+                                append("Import Excel ke Supabase selesai: ${report.syncedToSupabaseCount} mahasiswa baru disimpan")
+                                if (report.alreadyInSupabaseCount > 0) append(", ${report.alreadyInSupabaseCount} sudah terdaftar")
+                                if (preview.skippedBlackCount > 0) append(", ${preview.skippedBlackCount} blok hitam dilewati")
+                                append(".")
+                            },
+                            ToastType.SUCCESS
+                        )
+                        report.syncedToSupabaseCount > 0 -> ToastMessage(
+                            "Import sebagian berhasil: ${report.syncedToSupabaseCount}/${report.totalProcessed} tersimpan di Supabase (${report.diagnosticMessage.orEmpty()}).",
+                            ToastType.WARNING
+                        )
+                        report.alreadyInSupabaseCount > 0 && report.diagnosticMessage.isNullOrBlank() -> ToastMessage(
+                            "Seluruh ${report.alreadyInSupabaseCount} mahasiswa pada file sudah terdaftar di Supabase (tidak diduplikasi).",
+                            ToastType.INFO
+                        )
+                        else -> ToastMessage(
+                            report.diagnosticMessage ?: "Gagal menyimpan hasil Import Excel ke database Supabase.",
+                            ToastType.ERROR
+                        )
+                    }
+
+                    _uiState.update {
+                        it.copy(
+                            excelImportState = it.excelImportState.copy(
+                                commitProgress = 0.95f,
+                                commitStatusText = "Menyegarkan data mahasiswa dari Supabase..."
+                            )
+                        )
+                    }
+
+                    val refreshed = authRepository.fetchStudentsAndClassesFromSupabase()
+                    val isHardFailure = importToast.type == ToastType.ERROR
+                    if (refreshed is RemoteDirectoryResult.Success) {
+                        applyRemoteDirectoryResult(
+                            result = refreshed,
+                            overrideSuccessToast = importToast
+                        )
+                        _uiState.update {
+                            it.copy(
+                                studentsSyncError = if (isHardFailure) report.diagnosticMessage else null,
+                                excelImportState = if (isHardFailure) {
+                                    it.excelImportState.copy(
+                                        isCommitting = false,
+                                        commitProgress = 0f,
+                                        commitStatusText = "",
+                                        commitError = report.diagnosticMessage ?: importToast.message
+                                    )
+                                } else {
+                                    ExcelImportUiState(isDialogOpen = false)
+                                }
+                            )
+                        }
+                    } else {
+                        val errMsg = report.diagnosticMessage ?: (refreshed as? RemoteDirectoryResult.Error)?.message
+                        _uiState.update {
+                            it.copy(
+                                isSyncingStudents = false,
+                                studentsSyncError = errMsg,
+                                toastMessage = importToast,
+                                excelImportState = if (isHardFailure) {
+                                    it.excelImportState.copy(
+                                        isCommitting = false,
+                                        commitProgress = 0f,
+                                        commitStatusText = "",
+                                        commitError = errMsg ?: importToast.message
+                                    )
+                                } else {
+                                    ExcelImportUiState(isDialogOpen = false)
+                                }
+                            )
+                        }
+                    }
+                } catch (_: CancellationException) {
                     _uiState.update {
                         it.copy(
                             isSyncingStudents = false,
-                            studentsSyncError = errMsg,
-                            toastMessage = importToast
+                            excelImportState = it.excelImportState.copy(
+                                isCommitting = false,
+                                commitProgress = 0f,
+                                commitStatusText = "",
+                                commitError = "Proses penyimpanan ke Supabase dibatalkan."
+                            )
+                        )
+                    }
+                } catch (t: Throwable) {
+                    val err = t.message?.takeIf { it.isNotBlank() } ?: "Kesalahan tidak terduga saat menyimpan data ke Supabase."
+                    _uiState.update {
+                        it.copy(
+                            isSyncingStudents = false,
+                            studentsSyncError = err,
+                            toastMessage = ToastMessage(err, ToastType.ERROR),
+                            excelImportState = it.excelImportState.copy(
+                                isCommitting = false,
+                                commitProgress = 0f,
+                                commitStatusText = "",
+                                commitError = err
+                            )
                         )
                     }
                 }
             }
+            pendingStudentPersistenceJob = activeExcelCommitJob
             return null
         }
 
@@ -2096,6 +2774,7 @@ class AzrilViewModel(application: Application) : AndroidViewModel(application) {
                 students = mergedStudents,
                 classes = syncedClasses,
                 historicalAttendanceRecords = mergedHistorical,
+                excelImportState = ExcelImportUiState(isDialogOpen = false),
                 toastMessage = ToastMessage(summaryText, ToastType.SUCCESS)
             )
         }

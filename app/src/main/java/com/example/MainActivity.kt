@@ -32,7 +32,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.components.AzrilAdaptiveShell
+import com.example.ui.components.AzrilRouteTransitionHost
 import com.example.ui.components.AzrilToastBanner
+import com.example.ui.components.GenericAzrilScreenSkeleton
+import com.example.ui.components.StudentDestinationSkeleton
 import com.example.ui.model.UserRole
 import com.example.ui.navigation.AdminDestination
 import com.example.ui.navigation.StudentDestination
@@ -192,23 +195,47 @@ fun AzrilClasApp(
                     onRefresh = { viewModel.triggerRefresh() },
                     onLogout = { viewModel.logout() }
                 ) { isExpanded ->
-                    when (uiState.adminDestination) {
-                        AdminDestination.DASHBOARD -> AdminDashboardScreen(uiState, isExpanded) { viewModel.navigateAdmin(it) }
-                        AdminDestination.STUDY_PROGRAMS -> AdminStudyProgramsScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.CLASSES -> AdminClassesScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.STUDENTS -> AdminStudentsScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.SCHEDULES -> AdminSchedulesScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.ATTENDANCE -> AdminAttendanceScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.ASSIGNMENTS -> AdminAssignmentsScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.SUBMISSIONS -> AdminSubmissionsScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.AI_ASSISTANT -> AdminAiAssistantScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.GRADING -> AdminGradingScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.XP_KEAKTIFAN -> AdminXpParticipationScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.RANKING -> AdminRankingScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.REPORTS -> AdminReportsScreen(uiState, viewModel, isExpanded) { viewModel.navigateAdmin(it) }
-                        AdminDestination.EXPORT_CENTER -> AdminExportCenterScreen(uiState, viewModel, isExpanded)
-                        AdminDestination.NOTIFICATIONS -> RoleNotificationsScreen(uiState, UserRole.ADMIN, viewModel, isExpanded)
-                        AdminDestination.SETTINGS -> AdminSettingsScreen(uiState, viewModel, isExpanded)
+                    val adminLoading = uiState.activeRouteLoading || uiState.isSyncingStudents
+                    val adminShowSkeleton = when (uiState.adminDestination) {
+                        AdminDestination.STUDENTS -> uiState.students.isEmpty() && uiState.studentsSyncError.isNullOrBlank() && uiState.hasLiveSupabaseSession
+                        AdminDestination.CLASSES -> uiState.classes.isEmpty() && uiState.studentsSyncError.isNullOrBlank() && uiState.hasLiveSupabaseSession
+                        else -> false
+                    }
+                    AzrilRouteTransitionHost(
+                        targetRoute = uiState.adminDestination,
+                        isRouteLoading = adminLoading,
+                        showSkeletonWhenLoading = adminShowSkeleton,
+                        skeletonContent = { GenericAzrilScreenSkeleton(isExpanded) }
+                    ) { dest ->
+                        when (dest) {
+                            AdminDestination.DASHBOARD -> AdminDashboardScreen(
+                                uiState = uiState,
+                                isExpanded = isExpanded,
+                                onRetrySupabaseSync = {
+                                    viewModel.refreshStudentsAndClassesFromSupabase(showToastOnComplete = true, force = true)
+                                },
+                                onConnectSupabaseAdmin = { identifier, password, onConnected ->
+                                    viewModel.connectAdminSupabaseSession(identifier, password, onConnected)
+                                },
+                                onClearSupabaseConnectError = { viewModel.clearAdminSupabaseConnectError() },
+                                onNavigate = { viewModel.navigateAdmin(it) }
+                            )
+                            AdminDestination.STUDY_PROGRAMS -> AdminStudyProgramsScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.CLASSES -> AdminClassesScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.STUDENTS -> AdminStudentsScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.SCHEDULES -> AdminSchedulesScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.ATTENDANCE -> AdminAttendanceScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.ASSIGNMENTS -> AdminAssignmentsScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.SUBMISSIONS -> AdminSubmissionsScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.AI_ASSISTANT -> AdminAiAssistantScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.GRADING -> AdminGradingScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.XP_KEAKTIFAN -> AdminXpParticipationScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.RANKING -> AdminRankingScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.REPORTS -> AdminReportsScreen(uiState, viewModel, isExpanded) { viewModel.navigateAdmin(it) }
+                            AdminDestination.EXPORT_CENTER -> AdminExportCenterScreen(uiState, viewModel, isExpanded)
+                            AdminDestination.NOTIFICATIONS -> RoleNotificationsScreen(uiState, UserRole.ADMIN, viewModel, isExpanded)
+                            AdminDestination.SETTINGS -> AdminSettingsScreen(uiState, viewModel, isExpanded)
+                        }
                     }
                 }
             }
@@ -239,17 +266,35 @@ fun AzrilClasApp(
                         onRefresh = { viewModel.triggerRefresh() },
                         onLogout = { viewModel.logout() }
                     ) { isExpanded ->
-                        when (uiState.studentDestination) {
-                            StudentDestination.DASHBOARD -> StudentDashboardScreen(uiState, isExpanded) { viewModel.navigateStudent(it) }
-                            StudentDestination.XP_HISTORY -> StudentXpHistoryScreen(uiState, isExpanded)
-                            StudentDestination.MY_SCHEDULE -> StudentScheduleScreen(uiState, viewModel, isExpanded) { viewModel.navigateStudent(it) }
-                            StudentDestination.ATTENDANCE -> StudentAttendanceScreen(uiState, viewModel, isExpanded)
-                            StudentDestination.ASSIGNMENTS -> StudentAssignmentsScreen(uiState, viewModel, isExpanded)
-                            StudentDestination.MY_SUBMISSIONS -> StudentSubmissionsScreen(uiState, isExpanded)
-                            StudentDestination.GRADES_FEEDBACK -> StudentGradesScreen(uiState, isExpanded)
-                            StudentDestination.RANKING -> StudentRankingScreen(uiState, isExpanded)
-                            StudentDestination.NOTIFICATIONS -> RoleNotificationsScreen(uiState, UserRole.STUDENT, viewModel, isExpanded)
-                            StudentDestination.PROFILE -> StudentProfileScreen(uiState, viewModel, isExpanded) { viewModel.logout() }
+                        val studentLoading = uiState.activeRouteLoading || uiState.isSyncingStudents || uiState.isSyncingAssignments
+                        // Stale-while-revalidate: if data is already cached, render it immediately with top-to-bottom indicator;
+                        // if initial data is not yet loaded, display the screen-structured skeleton!
+                        val studentShowSkeleton = when (uiState.studentDestination) {
+                            StudentDestination.RANKING -> uiState.students.size <= 1 && uiState.rankingPoints.isEmpty()
+                            StudentDestination.XP_HISTORY -> uiState.rankingPoints.isEmpty() && uiState.activeRouteLoading
+                            StudentDestination.ASSIGNMENTS -> uiState.assignments.isEmpty() && uiState.isSyncingAssignments
+                            StudentDestination.DASHBOARD -> uiState.students.isEmpty() && uiState.assignments.isEmpty() && uiState.activeRouteLoading
+                            StudentDestination.PROFILE -> uiState.currentUser == null && uiState.activeRouteLoading
+                            else -> false
+                        }
+                        AzrilRouteTransitionHost(
+                            targetRoute = uiState.studentDestination,
+                            isRouteLoading = studentLoading,
+                            showSkeletonWhenLoading = studentShowSkeleton,
+                            skeletonContent = { dest -> StudentDestinationSkeleton(dest, isExpanded) }
+                        ) { dest ->
+                            when (dest) {
+                                StudentDestination.DASHBOARD -> StudentDashboardScreen(uiState, isExpanded) { viewModel.navigateStudent(it) }
+                                StudentDestination.XP_HISTORY -> StudentXpHistoryScreen(uiState, isExpanded)
+                                StudentDestination.MY_SCHEDULE -> StudentScheduleScreen(uiState, viewModel, isExpanded) { viewModel.navigateStudent(it) }
+                                StudentDestination.ATTENDANCE -> StudentAttendanceScreen(uiState, viewModel, isExpanded)
+                                StudentDestination.ASSIGNMENTS -> StudentAssignmentsScreen(uiState, viewModel, isExpanded)
+                                StudentDestination.MY_SUBMISSIONS -> StudentSubmissionsScreen(uiState, isExpanded)
+                                StudentDestination.GRADES_FEEDBACK -> StudentGradesScreen(uiState, isExpanded)
+                                StudentDestination.RANKING -> StudentRankingScreen(uiState, isExpanded)
+                                StudentDestination.NOTIFICATIONS -> RoleNotificationsScreen(uiState, UserRole.STUDENT, viewModel, isExpanded)
+                                StudentDestination.PROFILE -> StudentProfileScreen(uiState, viewModel, isExpanded) { viewModel.logout() }
+                            }
                         }
                     }
                 }

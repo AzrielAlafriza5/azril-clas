@@ -1,9 +1,5 @@
 package com.example.ui.screens.admin
 
-import android.content.ActivityNotFoundException
-import android.provider.OpenableColumns
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -11,11 +7,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -26,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Block
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.CloudUpload
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Info
@@ -47,36 +42,23 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
-import com.example.data.importer.ExcelStudentImportParser
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import com.example.ui.components.AzrilStatusBadge
 import com.example.ui.model.ExcelImportPreviewRow
 import com.example.ui.model.ExcelImportPreviewSummary
 import com.example.ui.model.ExcelImportValidationStatus
-import com.example.ui.model.ToastType
-import com.example.ui.state.AzrilViewModel
+import com.example.ui.state.ExcelImportUiState
 import com.example.ui.theme.Amber50
 import com.example.ui.theme.Amber700
 import com.example.ui.theme.BorderLight
@@ -99,145 +81,47 @@ import com.example.ui.theme.Slate500
 import com.example.ui.theme.Slate600
 import com.example.ui.theme.SoftMintBg
 import com.example.ui.theme.SurfaceMuted
+import kotlin.math.roundToInt
 
+/**
+ * Stateless, lifecycle-safe Excel (.xlsx) Import Dialog.
+ *
+ * All Android SAF file pickers (`OpenDocument` / `GetContent` / `CreateDocument`) are hoisted
+ * to `AdminStudentsScreen` (always mounted) and all file I/O + SAX parsing + Supabase persistence
+ * runs inside `AzrilViewModel` (`viewModelScope` + `Dispatchers.IO`). This eliminates Activity/Dialog
+ * teardown crashes and OOM kills on Android phones.
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun AdminExcelImportDialog(
-    viewModel: AzrilViewModel,
+    importState: ExcelImportUiState,
+    onPickExcelFile: () -> Unit,
+    onDownloadTemplate: () -> Unit,
+    onCancelActiveOperation: () -> Unit,
+    onCommitImport: (ExcelImportPreviewSummary, Boolean) -> Unit,
     onDismiss: () -> Unit
 ) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var previewSummary by remember { mutableStateOf<ExcelImportPreviewSummary?>(null) }
-    var parseError by rememberSaveable { mutableStateOf<String?>(null) }
-    var isParsingFile by remember { mutableStateOf(false) }
-    var parsingFileName by remember { mutableStateOf<String?>(null) }
-    var activeParseJob by remember { mutableStateOf<Job?>(null) }
     var filterTab by rememberSaveable { mutableStateOf("ALL") }
     var selectedSheetFilter by rememberSaveable { mutableStateOf("ALL") }
     var importHistoricalAttendance by rememberSaveable { mutableStateOf(true) }
     var showConfirmDialog by rememberSaveable { mutableStateOf(false) }
 
-    DisposableEffect(Unit) {
-        onDispose {
-            activeParseJob?.cancel()
-        }
-    }
+    val summary = importState.previewSummary
+    val isBusy = importState.isParsingFile || importState.isCommitting
 
-    val openXlsxLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        activeParseJob?.cancel()
-        parseError = null
-        previewSummary = null
-        isParsingFile = true
-
-        activeParseJob = scope.launch {
-            try {
-                val (displayName, reportedSizeBytes) = withContext(Dispatchers.IO) {
-                    var name: String? = null
-                    var size: Long = -1L
-                    runCatching {
-                        context.contentResolver.query(
-                            uri,
-                            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
-                            null,
-                            null,
-                            null
-                        )?.use { c ->
-                            if (c.moveToFirst()) {
-                                val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                                val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
-                                if (nameIdx >= 0) name = c.getString(nameIdx)
-                                if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
-                            }
-                        }
-                    }
-                    (name ?: uri.lastPathSegment ?: "import_mahasiswa.xlsx") to size
-                }
-                parsingFileName = displayName
-
-                if (reportedSizeBytes > ExcelStudentImportParser.MAX_XLSX_FILE_BYTES) {
-                    val mb = (reportedSizeBytes / (1024L * 1024L)).coerceAtLeast(1L)
-                    parseError = "Ukuran file '$displayName' terlalu besar ($mb MB). Batas maksimal file Excel adalah 15 MB."
-                    isParsingFile = false
-                    return@launch
-                }
-
-                if (displayName.endsWith(".xls", ignoreCase = true) && !displayName.endsWith(".xlsx", ignoreCase = true)) {
-                    parseError = "File '$displayName' menggunakan format .xls lama. Simpan ulang sebagai Excel Workbook (.xlsx) lalu pilih kembali."
-                    isParsingFile = false
-                    return@launch
-                }
-
-                val parseResult = withContext(Dispatchers.IO) {
-                    ensureActive()
-                    val bytes = context.contentResolver.openInputStream(uri)?.use { stream ->
-                        readStreamBounded(stream, ExcelStudentImportParser.MAX_XLSX_FILE_BYTES)
-                    } ?: return@withContext Result.failure<ExcelImportPreviewSummary>(
-                        IllegalStateException("Gagal membuka file '$displayName'. Pastikan file masih tersedia di penyimpanan perangkat.")
-                    )
-                    if (bytes.isEmpty()) {
-                        return@withContext Result.failure<ExcelImportPreviewSummary>(
-                            IllegalArgumentException("File '$displayName' kosong.")
-                        )
-                    }
-                    ensureActive()
-                    viewModel.parseExcelStudentImport(displayName, bytes)
-                }
-
-                parseResult.onSuccess { summary ->
-                    previewSummary = summary
-                    filterTab = "ALL"
-                    selectedSheetFilter = "ALL"
-                    importHistoricalAttendance = summary.hasWeeklyAttendance
-                    parseError = null
-                }.onFailure { err ->
-                    previewSummary = null
-                    parseError = err.message ?: "File Excel (.xlsx) tidak dapat dibaca."
-                }
-            } catch (_: CancellationException) {
-                parseError = "Pembacaan file Excel dibatalkan."
-            } catch (_: SecurityException) {
-                parseError = "Izin akses ke file ditolak oleh sistem Android. Pilih ulang file Excel dari penyimpanan lokal."
-            } catch (_: OutOfMemoryError) {
-                parseError = "Memori perangkat tidak mencukupi untuk file ini. Hapus gambar/baris kosong di Excel atau bagi per kelas."
-            } catch (t: Throwable) {
-                parseError = t.message?.takeIf { it.isNotBlank() }
-                    ?: "Terjadi kesalahan saat membaca file Excel (.xlsx). Pastikan file valid dan tidak rusak."
-            } finally {
-                isParsingFile = false
-            }
-        }
-    }
-
-    val saveTemplateLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        scope.launch {
-            val saved = withContext(Dispatchers.IO) {
-                runCatching {
-                    val templateBytes = ExcelStudentImportParser.buildBlankTemplateXlsx()
-                    context.contentResolver.openOutputStream(uri)?.use { out ->
-                        out.write(templateBytes)
-                        out.flush()
-                    } ?: error("Gagal membuka lokasi penyimpanan.")
-                }
-            }
-            saved.onSuccess {
-                viewModel.showToast("Template Excel (.xlsx) berhasil disimpan (sheet PJKR-3B, FARMASI-3, HES-3B).", ToastType.SUCCESS)
-            }.onFailure {
-                viewModel.showToast("Gagal menyimpan template Excel: ${it.message ?: "kesalahan penyimpanan"}.", ToastType.ERROR)
-            }
+    LaunchedEffect(summary?.fileName, summary?.rows?.size) {
+        if (summary != null) {
+            filterTab = "ALL"
+            selectedSheetFilter = "ALL"
+            importHistoricalAttendance = summary.hasWeeklyAttendance
         }
     }
 
     AlertDialog(
         onDismissRequest = {
-            activeParseJob?.cancel()
-            onDismiss()
+            if (!importState.isCommitting) {
+                onDismiss()
+            }
         },
         properties = DialogProperties(usePlatformDefaultWidth = false),
         modifier = Modifier
@@ -256,11 +140,24 @@ fun AdminExcelImportDialog(
                         .background(DarkCardBg, RoundedCornerShape(12.dp)),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Rounded.TableChart, contentDescription = null, tint = LimePrimary, modifier = Modifier.size(20.dp))
+                    Icon(
+                        Icons.Rounded.TableChart,
+                        contentDescription = null,
+                        tint = LimePrimary,
+                        modifier = Modifier.size(20.dp)
+                    )
                 }
                 Column {
-                    Text("Import Data Mahasiswa (.xlsx)", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold), color = InkText)
-                    Text("Multi-sheet • Deteksi Warna Merah (AFK) & Blok Hitam (Dilewati)", style = MaterialTheme.typography.labelSmall, color = InkSubtle)
+                    Text(
+                        text = "Import Data Mahasiswa (.xlsx)",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                        color = InkText
+                    )
+                    Text(
+                        text = "Multi-sheet • Deteksi Warna Merah (AFK) & Blok Hitam (Dilewati)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = InkSubtle
+                    )
                 }
             }
         },
@@ -279,52 +176,36 @@ fun AdminExcelImportDialog(
                     border = BorderStroke(1.dp, BorderMint),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
                         Text(
                             text = "Pilih file Excel (.xlsx, maks. 15 MB) dengan sheet kelas (contoh: PJKR-3B, FARMASI-3, HES-3B). Sistem membaca warna sel langsung: Blok Hitam dilewati total, Warna Merah masuk kategori AFK, warna lain diproses normal.",
                             style = MaterialTheme.typography.bodySmall,
                             color = InkMuted
                         )
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             Button(
-                                onClick = {
-                                    parseError = null
-                                    try {
-                                        openXlsxLauncher.launch(
-                                            arrayOf(
-                                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                                "application/octet-stream",
-                                                "*/*"
-                                            )
-                                        )
-                                    } catch (_: ActivityNotFoundException) {
-                                        try {
-                                            openXlsxLauncher.launch(arrayOf("*/*"))
-                                        } catch (_: Throwable) {
-                                            parseError = "Tidak ditemukan aplikasi pemilih file (File Manager) di perangkat Android ini."
-                                        }
-                                    } catch (t: Throwable) {
-                                        parseError = "Gagal membuka pemilih file: ${t.message ?: "kesalahan sistem"}."
-                                    }
-                                },
-                                enabled = !isParsingFile,
+                                onClick = onPickExcelFile,
+                                enabled = !isBusy,
                                 shape = RoundedCornerShape(999.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = DarkCardBg,
+                                    contentColor = LimePrimary
+                                ),
                                 modifier = Modifier.testTag("pick_excel_file_button")
                             ) {
                                 Icon(Icons.Rounded.UploadFile, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text(if (previewSummary == null) "Pilih File Excel (.xlsx)" else "Ganti File Excel")
+                                Text(if (summary == null) "Pilih File Excel (.xlsx)" else "Ganti File Excel")
                             }
                             OutlinedButton(
-                                onClick = {
-                                    try {
-                                        saveTemplateLauncher.launch("Template_Absensi_AzrilClas.xlsx")
-                                    } catch (_: Throwable) {
-                                        parseError = "Gagal membuka dialog penyimpanan template di perangkat ini."
-                                    }
-                                },
-                                enabled = !isParsingFile,
+                                onClick = onDownloadTemplate,
+                                enabled = !isBusy,
                                 shape = RoundedCornerShape(999.dp),
                                 modifier = Modifier.testTag("download_excel_template_button")
                             ) {
@@ -336,12 +217,16 @@ fun AdminExcelImportDialog(
                     }
                 }
 
-                if (isParsingFile) {
+                // Live Parsing Progress Card
+                if (importState.isParsingFile) {
+                    val pct = (importState.parseProgress.coerceIn(0f, 1f) * 100f).roundToInt()
                     Surface(
                         color = LightGreenSecondary.copy(alpha = 0.45f),
                         shape = RoundedCornerShape(16.dp),
                         border = BorderStroke(1.dp, BorderMint),
-                        modifier = Modifier.fillMaxWidth().testTag("excel_parsing_loading_card")
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("excel_parsing_loading_card")
                     ) {
                         Column(
                             modifier = Modifier.padding(14.dp),
@@ -352,25 +237,35 @@ fun AdminExcelImportDialog(
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = "Membaca file ${parsingFileName ?: "Excel"}...",
-                                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                                    color = InkText
-                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Membaca ${importState.parsingFileName ?: "Excel"} ($pct%)",
+                                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                        color = InkText
+                                    )
+                                    if (importState.parseStatusText.isNotBlank()) {
+                                        Text(
+                                            text = importState.parseStatusText,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = InkMuted
+                                        )
+                                    }
+                                }
                                 TextButton(
-                                    onClick = { activeParseJob?.cancel() },
+                                    onClick = onCancelActiveOperation,
                                     modifier = Modifier.testTag("cancel_excel_parse_button")
                                 ) {
                                     Text("Batalkan", color = Rose700, fontWeight = FontWeight.Bold)
                                 }
                             }
                             LinearProgressIndicator(
+                                progress = { importState.parseProgress.coerceIn(0.05f, 1f) },
                                 modifier = Modifier.fillMaxWidth(),
                                 color = DarkCardBg,
                                 trackColor = PureWhite
                             )
                             Text(
-                                text = "Memproses sheet, warna sel, dan validasi NIM di latar belakang tanpa membekukan aplikasi.",
+                                text = "Membaca langsung dari file secara streaming agar hemat memori perangkat Android.",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = InkMuted
                             )
@@ -378,12 +273,77 @@ fun AdminExcelImportDialog(
                     }
                 }
 
-                parseError?.let { err ->
+                // Live Supabase Commit Progress Card
+                if (importState.isCommitting) {
+                    val pct = (importState.commitProgress.coerceIn(0f, 1f) * 100f).roundToInt()
+                    Surface(
+                        color = DarkCardBg,
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("excel_committing_progress_card")
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.CloudUpload,
+                                        contentDescription = null,
+                                        tint = LimePrimary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Column {
+                                        Text(
+                                            text = "Menyimpan ke Database Supabase ($pct%)",
+                                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = PureWhite
+                                        )
+                                        if (importState.commitStatusText.isNotBlank()) {
+                                            Text(
+                                                text = importState.commitStatusText,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = PureWhite.copy(alpha = 0.78f)
+                                            )
+                                        }
+                                    }
+                                }
+                                TextButton(
+                                    onClick = onCancelActiveOperation,
+                                    modifier = Modifier.testTag("cancel_excel_commit_button")
+                                ) {
+                                    Text("Batalkan", color = LimePrimary, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                            LinearProgressIndicator(
+                                progress = { importState.commitProgress.coerceIn(0.05f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                                color = LimePrimary,
+                                trackColor = PureWhite.copy(alpha = 0.2f)
+                            )
+                        }
+                    }
+                }
+
+                // Inline Parse Error Banner (app never crashes or closes)
+                importState.parseError?.let { err ->
                     Surface(
                         color = Rose50,
                         shape = RoundedCornerShape(14.dp),
                         border = BorderStroke(1.dp, Rose600.copy(alpha = 0.3f)),
-                        modifier = Modifier.fillMaxWidth().testTag("excel_parse_error_banner")
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("excel_parse_error_banner")
                     ) {
                         Row(modifier = Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = Rose700, modifier = Modifier.size(18.dp))
@@ -392,7 +352,30 @@ fun AdminExcelImportDialog(
                     }
                 }
 
-                val summary = previewSummary
+                // Inline Commit Error Banner (keeps validated preview open so Admin can retry/fix)
+                importState.commitError?.let { err ->
+                    Surface(
+                        color = Rose50,
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, Rose600.copy(alpha = 0.35f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("excel_commit_error_banner")
+                    ) {
+                        Row(modifier = Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = Rose700, modifier = Modifier.size(18.dp))
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = "Gagal Menyimpan ke Supabase",
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = Rose700
+                                )
+                                Text(err, style = MaterialTheme.typography.bodySmall, color = Rose700)
+                            }
+                        }
+                    }
+                }
+
                 if (summary != null) {
                     // Sheet mapping chips
                     Surface(
@@ -462,7 +445,9 @@ fun AdminExcelImportDialog(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Row(
-                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
@@ -480,7 +465,7 @@ fun AdminExcelImportDialog(
                                 }
                                 Switch(
                                     checked = importHistoricalAttendance,
-                                    onCheckedChange = { importHistoricalAttendance = it },
+                                    onCheckedChange = { if (!isBusy) importHistoricalAttendance = it },
                                     modifier = Modifier.testTag("toggle_import_historical_attendance")
                                 )
                             }
@@ -496,7 +481,7 @@ fun AdminExcelImportDialog(
                         Row(modifier = Modifier.padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Icon(Icons.Rounded.Info, contentDescription = null, tint = LimeInk, modifier = Modifier.size(16.dp))
                             Text(
-                                text = "Setiap mahasiswa valid (${summary.totalImportableCount} orang) otomatis dibuatkan 1 akun dengan Username = NIM, Password awal = NIM, dan wajib mengganti password saat login pertama.",
+                                text = "Setiap mahasiswa valid (${summary.totalImportableCount} orang) otomatis dibuatkan 1 akun dengan Username = NIM, Password awal = NIM, dan disimpan permanen ke database Supabase.",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = InkMuted
                             )
@@ -523,7 +508,10 @@ fun AdminExcelImportDialog(
                         }
                     }
 
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
                         FilterChip(
                             selected = filterTab == "ALL",
                             onClick = { filterTab = "ALL" },
@@ -599,30 +587,37 @@ fun AdminExcelImportDialog(
             }
         },
         confirmButton = {
-            val summary = previewSummary
             Button(
                 onClick = { showConfirmDialog = true },
-                enabled = !isParsingFile && summary != null && summary.totalImportableCount > 0,
+                enabled = !isBusy && summary != null && summary.totalImportableCount > 0,
                 shape = RoundedCornerShape(999.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = LimePrimary, contentColor = InkText),
                 modifier = Modifier.testTag("confirm_excel_import_button")
             ) {
                 Text(
-                    if (summary != null) "Konfirmasi Import (${summary.totalImportableCount})" else "Konfirmasi Import",
+                    if (importState.isCommitting) {
+                        "Menyimpan..."
+                    } else if (summary != null) {
+                        "Konfirmasi Import (${summary.totalImportableCount})"
+                    } else {
+                        "Konfirmasi Import"
+                    },
                     fontWeight = FontWeight.Bold
                 )
             }
         },
         dismissButton = {
-            TextButton(onClick = {
-                activeParseJob?.cancel()
-                onDismiss()
-            }) { Text("Tutup") }
+            TextButton(
+                onClick = {
+                    if (isBusy) onCancelActiveOperation() else onDismiss()
+                }
+            ) {
+                Text(if (isBusy) "Batalkan" else "Tutup")
+            }
         }
     )
 
-    if (showConfirmDialog && previewSummary != null) {
-        val s = previewSummary!!
+    if (showConfirmDialog && summary != null) {
         AlertDialog(
             onDismissRequest = { showConfirmDialog = false },
             containerColor = PureWhite,
@@ -630,17 +625,33 @@ fun AdminExcelImportDialog(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        "Pastikan hasil preview sudah sesuai sebelum sistem membuat akun mahasiswa secara massal:",
+                        "Pastikan hasil preview sudah sesuai sebelum sistem menyimpan akun mahasiswa ke Supabase:",
                         style = MaterialTheme.typography.bodySmall,
                         color = Slate600
                     )
-                    Text("• Mahasiswa Normal siap diimpor: ${s.validNormalCount}", style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold), color = Emerald700)
-                    Text("• Mahasiswa AFK (Warna Merah): ${s.validAfkCount}", style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold), color = Rose700)
-                    Text("• Blok Hitam dilewati total: ${s.skippedBlackCount}", style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold), color = InkText)
-                    Text("• Duplikat / Tidak Valid / Sudah Ada: ${s.totalDuplicateOrInvalidAndExistingCount}", style = MaterialTheme.typography.bodySmall, color = Amber700)
+                    Text(
+                        "• Mahasiswa Normal siap diimpor: ${summary.validNormalCount}",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                        color = Emerald700
+                    )
+                    Text(
+                        "• Mahasiswa AFK (Warna Merah): ${summary.validAfkCount}",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                        color = Rose700
+                    )
+                    Text(
+                        "• Blok Hitam dilewati total: ${summary.skippedBlackCount}",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                        color = InkText
+                    )
+                    Text(
+                        "• Duplikat / Tidak Valid / Sudah Ada: ${summary.totalDuplicateOrInvalidAndExistingCount}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Amber700
+                    )
                     HorizontalDivider(color = BorderLight)
                     Text(
-                        text = if (importHistoricalAttendance && s.hasWeeklyAttendance) {
+                        text = if (importHistoricalAttendance && summary.hasWeeklyAttendance) {
                             "Riwayat absensi Minggu 1–8 akan disimpan sebagai data historis (tanpa pemberian XP otomatis)."
                         } else {
                             "Hanya data & akun mahasiswa yang akan diimpor (riwayat absensi tidak diimpor)."
@@ -653,9 +664,8 @@ fun AdminExcelImportDialog(
             confirmButton = {
                 Button(
                     onClick = {
-                        viewModel.commitExcelStudentImport(s, importHistoricalAttendance)
                         showConfirmDialog = false
-                        onDismiss()
+                        onCommitImport(summary, importHistoricalAttendance)
                     },
                     shape = RoundedCornerShape(999.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = DarkCardBg, contentColor = LimePrimary),
@@ -736,7 +746,11 @@ private fun PreviewStudentRowCard(row: ExcelImportPreviewRow) {
             }
             if (row.issues.isNotEmpty()) {
                 row.issues.forEach { issue ->
-                    Text("• $issue", style = MaterialTheme.typography.labelSmall, color = if (row.validationStatus == ExcelImportValidationStatus.SKIPPED_BLACK) InkText else Rose700)
+                    Text(
+                        "• $issue",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (row.validationStatus == ExcelImportValidationStatus.SKIPPED_BLACK) InkText else Rose700
+                    )
                 }
             }
             if (row.weeklyAttendance.isNotEmpty() && row.isImportable) {
@@ -749,24 +763,6 @@ private fun PreviewStudentRowCard(row: ExcelImportPreviewRow) {
             }
         }
     }
-}
-
-private fun readStreamBounded(input: InputStream, maxBytes: Long): ByteArray {
-    val out = ByteArrayOutputStream()
-    val buffer = ByteArray(16 * 1024)
-    var totalRead = 0L
-    while (true) {
-        val read = input.read(buffer)
-        if (read <= 0) break
-        totalRead += read
-        if (totalRead > maxBytes) {
-            throw IllegalArgumentException(
-                "Ukuran file melebihi batas maksimal 15 MB. Perkecil ukuran file Excel lalu coba lagi."
-            )
-        }
-        out.write(buffer, 0, read)
-    }
-    return out.toByteArray()
 }
 
 private data class Quintuple<A, B, C, D, E>(val first: A, val second: B, val third: C, val fourth: D, val fifth: E)
